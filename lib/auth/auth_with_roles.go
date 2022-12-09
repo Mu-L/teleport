@@ -3435,6 +3435,12 @@ func (a *ServerWithRoles) SetAuthPreference(ctx context.Context, newAuthPref typ
 		}
 	}
 
+	// Perform the modules-provided checks.
+	isAdmin := a.hasBuiltinRole(types.RoleAdmin)
+	if err := modules.ValidateAuthPreference(isAdmin, storedAuthPref, newAuthPref); err != nil {
+		return trace.Wrap(err)
+	}
+
 	return a.authServer.SetAuthPreference(ctx, newAuthPref)
 }
 
@@ -3512,6 +3518,12 @@ func (a *ServerWithRoles) SetClusterNetworkingConfig(ctx context.Context, newNet
 		return trace.AccessDenied("proxy peering is an enterprise-only feature")
 	}
 
+	// Perform the modules-provided checks.
+	isAdmin := a.hasBuiltinRole(types.RoleAdmin)
+	if err := modules.ValidateClusterNetworkingConfig(isAdmin, storedNetConfig, newNetConfig); err != nil {
+		return trace.Wrap(err)
+	}
+
 	return a.authServer.SetClusterNetworkingConfig(ctx, newNetConfig)
 }
 
@@ -3560,6 +3572,12 @@ func (a *ServerWithRoles) SetSessionRecordingConfig(ctx context.Context, newRecC
 		if err2 := a.action(apidefaults.Namespace, types.KindClusterConfig, verbsToReplaceResourceWithOrigin(storedRecConfig)...); err2 != nil {
 			return trace.Wrap(err)
 		}
+	}
+
+	// Perform the modules-provided checks.
+	isAdmin := a.hasBuiltinRole(types.RoleAdmin)
+	if err := modules.ValidateSessionRecordingConfig(isAdmin, storedRecConfig, newRecConfig); err != nil {
+		return trace.Wrap(err)
 	}
 
 	return a.authServer.SetSessionRecordingConfig(ctx, newRecConfig)
