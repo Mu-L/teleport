@@ -18,7 +18,7 @@ package azure
 
 import "strings"
 
-// NormailizeLocation converts a Azure location in various formats to the same
+// NormalizeLocation converts a Azure location in various formats to the same
 // simple format.
 //
 // This function assumes the input location is in one of the following formats:
@@ -30,7 +30,7 @@ import "strings"
 // -o table`. However, this CLI command only lists the locations for the
 // current active subscription so it may not show locations in other
 // parititions like Government or China.
-func NormailizeLocation(input string) string {
+func NormalizeLocation(input string) string {
 	if input == "" {
 		return input
 	}
@@ -61,15 +61,6 @@ func NormailizeLocation(input string) string {
 	// - To lower case.
 	replacer := strings.NewReplacer("(", "", ")", "", " ", "")
 	return strings.ToLower(replacer.Replace(input))
-}
-
-// GetLocationDisplayName returns the display name of the location.
-func GetLocationDisplayName(location string) string {
-	if displayName, found := locationsToDisplayNames[location]; found {
-		return displayName
-	}
-	// Return the original input if not found.
-	return location
 }
 
 var (

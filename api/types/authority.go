@@ -18,17 +18,17 @@ package types
 
 import (
 	"fmt"
+	"slices"
 	"time"
 
-	"github.com/gogo/protobuf/proto"
 	"github.com/gravitational/trace"
-	"golang.org/x/exp/slices"
 
 	"github.com/gravitational/teleport/api/constants"
+	"github.com/gravitational/teleport/api/utils"
 )
 
-// CertAuthority is a host or user certificate authority that
-// can check and if it has private key stored as well, sign it too
+// CertAuthority is a host or user certificate authority that can check and if
+// it has private key stored as well, sign it too.
 type CertAuthority interface {
 	// ResourceWithSecrets sets common resource properties
 	ResourceWithSecrets
@@ -108,7 +108,7 @@ func (ca *CertAuthorityV2) SetSubKind(s string) {
 
 // Clone returns a copy of the cert authority object.
 func (ca *CertAuthorityV2) Clone() CertAuthority {
-	return proto.Clone(ca).(*CertAuthorityV2)
+	return utils.CloneProtoMsg(ca)
 }
 
 // GetRotation returns rotation state.
@@ -144,14 +144,14 @@ func (ca *CertAuthorityV2) Expiry() time.Time {
 	return ca.Metadata.Expiry()
 }
 
-// GetResourceID returns resource ID
-func (ca *CertAuthorityV2) GetResourceID() int64 {
-	return ca.Metadata.ID
+// GetRevision returns the revision
+func (ca *CertAuthorityV2) GetRevision() string {
+	return ca.Metadata.GetRevision()
 }
 
-// SetResourceID sets resource ID
-func (ca *CertAuthorityV2) SetResourceID(id int64) {
-	ca.Metadata.ID = id
+// SetRevision sets the revision
+func (ca *CertAuthorityV2) SetRevision(rev string) {
+	ca.Metadata.SetRevision(rev)
 }
 
 // WithoutSecrets returns an instance of resource without secrets.
@@ -463,16 +463,20 @@ func (r *Rotation) String() string {
 	switch r.State {
 	case "", RotationStateStandby:
 		if r.LastRotated.IsZero() {
-			return "never updated"
+			return "standby (never rotated)"
 		}
-		return fmt.Sprintf("rotated %v", r.LastRotated.Format(constants.HumanDateFormatSeconds))
+		return fmt.Sprintf("standby (last rotated: %v)", r.LastRotated.Format(constants.HumanDateFormatSeconds))
 	case RotationStateInProgress:
-		return fmt.Sprintf("%v (mode: %v, started: %v, ending: %v)",
-			r.PhaseDescription(),
-			r.Mode,
-			r.Started.Format(constants.HumanDateFormatSeconds),
-			r.Started.Add(r.GracePeriod.Duration()).Format(constants.HumanDateFormatSeconds),
-		)
+		switch r.Mode {
+		case RotationModeManual:
+			return fmt.Sprintf("in progress (mode: manual, phase: %s)", r.Phase)
+		default:
+			return fmt.Sprintf("in progress (mode: automatic, phase: %s, started: %v, ending: %v)",
+				r.Phase,
+				r.Started.Format(constants.HumanDateFormatSeconds),
+				r.Started.Add(r.GracePeriod.Duration()).Format(constants.HumanDateFormatSeconds),
+			)
+		}
 	default:
 		return "unknown"
 	}
@@ -717,5 +721,40 @@ func (f *CertAuthorityFilter) FromMap(m map[string]string) {
 	for key, val := range m {
 		(*f)[CertAuthType(key)] = val
 	}
+}
 
+// Contains checks if the CA filter contains another CA filter as a subset.
+// Unlike other filters, a CA filter's scope becomes more broad as map keys
+// are added to it.
+// Therefore, to check if kind's filter contains the subset's filter,
+// we should check that the subset's keys are all present in kind and as
+// narrow or narrower.
+// A special case is when kind's filter is either empty or specifies all
+// authorities, in which case it is as broad as possible and subset's filter
+// is always contained within it.
+func (f CertAuthorityFilter) Contains(other CertAuthorityFilter) bool {
+	if len(f) == 0 {
+		// f has no filter, which is as broad as possible.
+		return true
+	}
+
+	if len(other) == 0 {
+		// f has a filter, but other does not.
+		// treat this as "contained" if f's filter is for all authorities.
+		for _, caType := range CertAuthTypes {
+			clusterName, ok := f[caType]
+			if !ok || clusterName != Wildcard {
+				return false
+			}
+		}
+		return true
+	}
+
+	for k, v := range other {
+		v2, ok := f[k]
+		if !ok || (v2 != Wildcard && v2 != v) {
+			return false
+		}
+	}
+	return true
 }

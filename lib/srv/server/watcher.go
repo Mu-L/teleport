@@ -1,76 +1,141 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-	http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package server
 
 import (
 	"context"
+	"log/slog"
 	"time"
 
 	"github.com/gravitational/trace"
-	log "github.com/sirupsen/logrus"
+
+	"github.com/gravitational/teleport/api/types"
 )
 
 // Instances contains information about discovered cloud instances from any provider.
 type Instances struct {
-	*EC2Instances
-	*AzureInstances
+	EC2   *EC2Instances
+	Azure *AzureInstances
+	GCP   *GCPInstances
 }
 
 // Fetcher fetches instances from a particular cloud provider.
 type Fetcher interface {
 	// GetInstances gets a list of cloud instances.
-	GetInstances(context.Context) ([]Instances, error)
+	GetInstances(ctx context.Context, rotation bool) ([]Instances, error)
+	// GetMatchingInstances finds Instances from the list of nodes
+	// that the fetcher matches.
+	GetMatchingInstances(nodes []types.Server, rotation bool) ([]Instances, error)
+	// GetDiscoveryConfigName returns the DiscoveryConfig name that created this fetcher.
+	// Empty for Fetchers created from `teleport.yaml/discovery_service.aws.<Matcher>` matchers.
+	GetDiscoveryConfigName() string
+	// IntegrationName identifies the integration name whose credentials were used to fetch the resources.
+	// Might be empty when the fetcher is using ambient credentials.
+	IntegrationName() string
+}
+
+// WithTriggerFetchC sets a poll trigger to manual start a resource polling.
+func WithTriggerFetchC(triggerFetchC <-chan struct{}) Option {
+	return func(w *Watcher) {
+		w.triggerFetchC = triggerFetchC
+	}
+}
+
+// WithPreFetchHookFn sets a function that gets called before each new iteration.
+func WithPreFetchHookFn(f func()) Option {
+	return func(w *Watcher) {
+		w.preFetchHookFn = f
+	}
 }
 
 // Watcher allows callers to discover cloud instances matching specified filters.
 type Watcher struct {
 	// InstancesC can be used to consume newly discovered instances.
-	InstancesC chan Instances
+	InstancesC     chan Instances
+	missedRotation <-chan []types.Server
 
-	fetchers      []Fetcher
-	fetchInterval time.Duration
-	ctx           context.Context
-	cancel        context.CancelFunc
+	fetchersFn     func() []Fetcher
+	pollInterval   time.Duration
+	triggerFetchC  <-chan struct{}
+	ctx            context.Context
+	cancel         context.CancelFunc
+	preFetchHookFn func()
+}
+
+func (w *Watcher) sendInstancesOrLogError(instancesColl []Instances, err error) {
+	if err != nil {
+		if trace.IsNotFound(err) {
+			return
+		}
+		slog.ErrorContext(context.Background(), "Failed to fetch instances", "error", err)
+		return
+	}
+	for _, inst := range instancesColl {
+		select {
+		case w.InstancesC <- inst:
+		case <-w.ctx.Done():
+		}
+	}
+}
+
+// fetchAndSubmit fetches the resources and submits them for processing.
+func (w *Watcher) fetchAndSubmit() {
+	if w.preFetchHookFn != nil {
+		w.preFetchHookFn()
+	}
+
+	for _, fetcher := range w.fetchersFn() {
+		w.sendInstancesOrLogError(fetcher.GetInstances(w.ctx, false))
+	}
 }
 
 // Run starts the watcher's main watch loop.
 func (w *Watcher) Run() {
-	ticker := time.NewTicker(w.fetchInterval)
-	defer ticker.Stop()
+	pollTimer := time.NewTimer(w.pollInterval)
+	defer pollTimer.Stop()
+
+	if w.triggerFetchC == nil {
+		w.triggerFetchC = make(<-chan struct{})
+	}
+
+	w.fetchAndSubmit()
+
 	for {
-		for _, fetcher := range w.fetchers {
-			instancesColl, err := fetcher.GetInstances(w.ctx)
-			if err != nil {
-				if trace.IsNotFound(err) {
-					continue
-				}
-				log.WithError(err).Error("Failed to fetch instances")
-				continue
-			}
-			for _, inst := range instancesColl {
-				select {
-				case w.InstancesC <- inst:
-				case <-w.ctx.Done():
-				}
-			}
-		}
 		select {
-		case <-ticker.C:
-			continue
+		case insts := <-w.missedRotation:
+			for _, fetcher := range w.fetchersFn() {
+				w.sendInstancesOrLogError(fetcher.GetMatchingInstances(insts, true))
+			}
+
+		case <-pollTimer.C:
+			w.fetchAndSubmit()
+			pollTimer.Reset(w.pollInterval)
+
+		case <-w.triggerFetchC:
+			w.fetchAndSubmit()
+
+			// stop and drain timer
+			if !pollTimer.Stop() {
+				<-pollTimer.C
+			}
+			pollTimer.Reset(w.pollInterval)
+
 		case <-w.ctx.Done():
 			return
 		}

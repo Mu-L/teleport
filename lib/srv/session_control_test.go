@@ -1,16 +1,20 @@
-// Copyright 2022 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package srv
 
@@ -21,6 +25,7 @@ import (
 
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/crypto/ssh"
 
@@ -31,6 +36,7 @@ import (
 	"github.com/gravitational/teleport/api/utils/keys"
 	"github.com/gravitational/teleport/lib/events"
 	"github.com/gravitational/teleport/lib/events/eventstest"
+	"github.com/gravitational/teleport/lib/modules"
 	"github.com/gravitational/teleport/lib/services"
 )
 
@@ -58,7 +64,7 @@ func (m mockAccessPoint) GetClusterName(opts ...services.MarshalOption) (types.C
 	return m.clusterName, nil
 }
 
-func (m mockAccessPoint) GetClusterNetworkingConfig(ctx context.Context, opts ...services.MarshalOption) (types.ClusterNetworkingConfig, error) {
+func (m mockAccessPoint) GetClusterNetworkingConfig(ctx context.Context) (types.ClusterNetworkingConfig, error) {
 	return m.netConfig, nil
 }
 
@@ -94,24 +100,80 @@ func (m mockAccessChecker) MaxConnections() int64 {
 	return m.maxConnections
 }
 
-func (m mockAccessChecker) PrivateKeyPolicy(defaultPolicy keys.PrivateKeyPolicy) keys.PrivateKeyPolicy {
-	return m.keyPolicy
+func (m mockAccessChecker) PrivateKeyPolicy(defaultPolicy keys.PrivateKeyPolicy) (keys.PrivateKeyPolicy, error) {
+	return m.keyPolicy, nil
 }
+
 func (m mockAccessChecker) RoleNames() []string {
 	return m.roleNames
 }
 
 func TestSessionController_AcquireSessionContext(t *testing.T) {
-	t.Parallel()
-
 	clock := clockwork.NewFakeClock()
-	emitter := &eventstest.MockEmitter{}
+	emitter := &eventstest.MockRecorderEmitter{}
+
+	minimalCfg := SessionControllerConfig{
+		Semaphores: mockSemaphores{},
+		AccessPoint: mockAccessPoint{
+			authPreference: &types.AuthPreferenceV2{
+				Spec: types.AuthPreferenceSpecV2{},
+			},
+			clusterName: &types.ClusterNameV2{
+				Spec: types.ClusterNameSpecV2{
+					ClusterName: "llama",
+				},
+			},
+		},
+		LockEnforcer: mockLockEnforcer{},
+		Emitter:      emitter,
+		Component:    teleport.ComponentNode,
+		ServerID:     "1234",
+	}
+
+	minimalIdentity := IdentityContext{
+		TeleportUser: "alpaca",
+		Login:        "alpaca",
+		Certificate: &ssh.Certificate{
+			KeyId: "alpaca",
+		},
+		AccessChecker: &mockAccessChecker{
+			keyPolicy: keys.PrivateKeyPolicyNone,
+		},
+	}
+
+	cfgWithDeviceMode := func(mode string) SessionControllerConfig {
+		cfg := minimalCfg
+		authPref, _ := cfg.AccessPoint.GetAuthPreference(context.Background())
+		authPref.(*types.AuthPreferenceV2).Spec.DeviceTrust = &types.DeviceTrust{
+			Mode: mode,
+		}
+		return cfg
+	}
+	identityWithDeviceExtensions := func() IdentityContext {
+		idCtx := minimalIdentity
+		idCtx.Certificate = &ssh.Certificate{
+			KeyId: "alpaca",
+			Permissions: ssh.Permissions{
+				Extensions: map[string]string{
+					teleport.CertExtensionDeviceID:           "deviceid1",
+					teleport.CertExtensionDeviceAssetTag:     "assettag1",
+					teleport.CertExtensionDeviceCredentialID: "credentialid1",
+				},
+			},
+		}
+		return idCtx
+	}
+	assertTrustedDeviceRequired := func(t *testing.T, _ context.Context, err error, _ *eventstest.MockRecorderEmitter) {
+		assert.ErrorContains(t, err, "device", "AcquireSessionContext returned an unexpected error")
+		assert.True(t, trace.IsAccessDenied(err), "AcquireSessionContext returned an error other than trace.AccessDeniedError: %T", err)
+	}
 
 	cases := []struct {
 		name      string
+		buildType string // defaults to modules.BuildOSS
 		cfg       SessionControllerConfig
 		identity  IdentityContext
-		assertion func(t *testing.T, ctx context.Context, err error, emitter *eventstest.MockEmitter)
+		assertion func(t *testing.T, ctx context.Context, err error, emitter *eventstest.MockRecorderEmitter)
 	}{
 		{
 			name: "proxy: access allowed",
@@ -146,7 +208,7 @@ func TestSessionController_AcquireSessionContext(t *testing.T) {
 					maxConnections: 1,
 				},
 			},
-			assertion: func(t *testing.T, ctx context.Context, err error, emitter *eventstest.MockEmitter) {
+			assertion: func(t *testing.T, ctx context.Context, err error, emitter *eventstest.MockRecorderEmitter) {
 				require.NoError(t, err)
 				require.NotNil(t, ctx)
 				require.Empty(t, emitter.Events())
@@ -197,7 +259,7 @@ func TestSessionController_AcquireSessionContext(t *testing.T) {
 					maxConnections: 1,
 				},
 			},
-			assertion: func(t *testing.T, ctx context.Context, err error, emitter *eventstest.MockEmitter) {
+			assertion: func(t *testing.T, ctx context.Context, err error, emitter *eventstest.MockRecorderEmitter) {
 				require.NoError(t, err)
 				require.NotNil(t, ctx)
 				require.Empty(t, emitter.Events())
@@ -238,7 +300,7 @@ func TestSessionController_AcquireSessionContext(t *testing.T) {
 					maxConnections: 1,
 				},
 			},
-			assertion: func(t *testing.T, ctx context.Context, err error, emitter *eventstest.MockEmitter) {
+			assertion: func(t *testing.T, ctx context.Context, err error, emitter *eventstest.MockRecorderEmitter) {
 				require.ErrorIs(t, err, trace.AccessDenied("lock in force"))
 				require.NotNil(t, ctx)
 				require.Len(t, emitter.Events(), 1)
@@ -284,7 +346,7 @@ func TestSessionController_AcquireSessionContext(t *testing.T) {
 					maxConnections: 1,
 				},
 			},
-			assertion: func(t *testing.T, ctx context.Context, err error, emitter *eventstest.MockEmitter) {
+			assertion: func(t *testing.T, ctx context.Context, err error, emitter *eventstest.MockRecorderEmitter) {
 				require.Error(t, err)
 				require.True(t, trace.IsBadParameter(err))
 				require.NotNil(t, ctx)
@@ -331,7 +393,7 @@ func TestSessionController_AcquireSessionContext(t *testing.T) {
 					maxConnections: 1,
 				},
 			},
-			assertion: func(t *testing.T, ctx context.Context, err error, emitter *eventstest.MockEmitter) {
+			assertion: func(t *testing.T, ctx context.Context, err error, emitter *eventstest.MockRecorderEmitter) {
 				require.Error(t, err)
 				require.True(t, trace.IsAccessDenied(err))
 				require.NotNil(t, ctx)
@@ -386,23 +448,51 @@ func TestSessionController_AcquireSessionContext(t *testing.T) {
 					maxConnections: 0,
 				},
 			},
-			assertion: func(t *testing.T, ctx context.Context, err error, emitter *eventstest.MockEmitter) {
+			assertion: func(t *testing.T, ctx context.Context, err error, emitter *eventstest.MockRecorderEmitter) {
 				require.NoError(t, err)
 				require.NotNil(t, ctx)
 				require.Empty(t, emitter.Events(), 0)
 			},
 		},
+		{
+			name:      "device extensions enforced for OSS",
+			cfg:       cfgWithDeviceMode(constants.DeviceTrustModeRequired),
+			identity:  minimalIdentity,
+			assertion: assertTrustedDeviceRequired,
+		},
+		{
+			name:      "device extensions enforced for Enterprise",
+			buildType: modules.BuildEnterprise,
+			cfg:       cfgWithDeviceMode(constants.DeviceTrustModeRequired),
+			identity:  minimalIdentity,
+			assertion: assertTrustedDeviceRequired,
+		},
+		{
+			name:      "device extensions valid for Enterprise",
+			buildType: modules.BuildEnterprise,
+			cfg:       cfgWithDeviceMode(constants.DeviceTrustModeRequired),
+			identity:  identityWithDeviceExtensions(),
+			assertion: func(t *testing.T, _ context.Context, err error, _ *eventstest.MockRecorderEmitter) {
+				assert.NoError(t, err, "AcquireSessionContext returned an unexpected error")
+			},
+		},
 	}
-
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
+			buildType := tt.buildType
+			if buildType == "" {
+				buildType = modules.BuildOSS
+			}
+			modules.SetTestModules(t, &modules.TestModules{
+				TestBuildType: buildType,
+			})
+
 			emitter.Reset()
 			ctrl, err := NewSessionController(tt.cfg)
-			require.NoError(t, err)
+			require.NoError(t, err, "NewSessionController failed")
 
 			ctx, err := ctrl.AcquireSessionContext(context.Background(), tt.identity, "127.0.0.1:1", "127.0.0.1:2")
 			tt.assertion(t, ctx, err, emitter)
-
 		})
 	}
 }

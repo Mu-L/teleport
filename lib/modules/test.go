@@ -1,18 +1,20 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package modules
 
@@ -21,6 +23,8 @@ import (
 	"crypto"
 	"testing"
 	"time"
+
+	"github.com/gravitational/trace"
 
 	"github.com/gravitational/teleport/api/utils/keys"
 )
@@ -37,10 +41,15 @@ type TestModules struct {
 	TestBuildType string
 	// TestFeatures is returned from the Features function.
 	TestFeatures Features
+	// FIPS allows tests to toggle fips behavior.
+	FIPS bool
 
 	defaultModules
 
-	MockAttestHardwareKey func(_ context.Context, _ interface{}, policy keys.PrivateKeyPolicy, _ *keys.AttestationStatement, _ crypto.PublicKey, _ time.Duration) (keys.PrivateKeyPolicy, error)
+	// MockAttestationData is fake attestation data to return
+	// during tests when hardware key support is enabled. This
+	// attestation data is shared by all logins when set.
+	MockAttestationData *keys.AttestationData
 }
 
 // SetTestModules sets the value returned from GetModules to testModules
@@ -59,9 +68,10 @@ type TestModules struct {
 //
 //	   // cleanup will revert module changes after test completes
 //	}
-func SetTestModules(t *testing.T, testModules *TestModules) {
+func SetTestModules(t *testing.T, testModules Modules) {
 	defaultModules := GetModules()
 	t.Cleanup(func() { SetModules(defaultModules) })
+	t.Setenv("TELEPORT_TEST_NOT_SAFE_FOR_PARALLEL", "true")
 	SetModules(testModules)
 }
 
@@ -72,7 +82,7 @@ func (m *TestModules) PrintVersion() {
 
 // IsBoringBinary checks if the binary was compiled with BoringCrypto.
 func (m *TestModules) IsBoringBinary() bool {
-	return m.defaultModules.IsBoringBinary()
+	return m.FIPS
 }
 
 // Features returns supported features.
@@ -85,10 +95,18 @@ func (m *TestModules) BuildType() string {
 	return m.TestBuildType
 }
 
+func (m *TestModules) IsEnterpriseBuild() bool {
+	return m.BuildType() == BuildEnterprise
+}
+
+func (m *TestModules) IsOSSBuild() bool {
+	return m.BuildType() != BuildEnterprise
+}
+
 // AttestHardwareKey attests a hardware key.
-func (m *TestModules) AttestHardwareKey(ctx context.Context, obj interface{}, policy keys.PrivateKeyPolicy, as *keys.AttestationStatement, pk crypto.PublicKey, d time.Duration) (keys.PrivateKeyPolicy, error) {
-	if m.MockAttestHardwareKey != nil {
-		return m.MockAttestHardwareKey(ctx, obj, policy, as, pk, d)
+func (m *TestModules) AttestHardwareKey(ctx context.Context, obj interface{}, as *keys.AttestationStatement, pk crypto.PublicKey, d time.Duration) (*keys.AttestationData, error) {
+	if m.MockAttestationData != nil {
+		return m.MockAttestationData, nil
 	}
-	return policy, nil
+	return nil, trace.NotFound("no attestation data for the given key")
 }

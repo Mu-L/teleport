@@ -1,36 +1,41 @@
-// Copyright 2022 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package tracing
 
 import (
 	"context"
 	"crypto/tls"
+	"log/slog"
 	"net"
 	"net/url"
 	"strings"
 	"time"
 
 	"github.com/gravitational/trace"
-	"github.com/sirupsen/logrus"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
-	semconv "go.opentelemetry.io/otel/semconv/v1.4.0"
+	semconv "go.opentelemetry.io/otel/semconv/v1.22.0"
 	oteltrace "go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/embedded"
 
 	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/api/observability/tracing"
@@ -68,7 +73,7 @@ type Config struct {
 	// DialTimeout is the timeout for dialing the exporter.
 	DialTimeout time.Duration
 	// Logger is the logger to use.
-	Logger logrus.FieldLogger
+	Logger *slog.Logger
 	// Client is the client to use to export traces. This takes precedence over creating a
 	// new client with the ExporterURL. Ownership of the client is transferred to the
 	// tracing provider. It should **NOT** be closed by the caller.
@@ -94,7 +99,7 @@ func (c *Config) CheckAndSetDefaults() error {
 	}
 
 	if c.Logger == nil {
-		c.Logger = logrus.WithField(trace.Component, teleport.ComponentTracing)
+		c.Logger = slog.With(teleport.ComponentKey, teleport.ComponentTracing)
 	}
 
 	if c.Client != nil {
@@ -140,6 +145,8 @@ func (c *Config) Endpoint() string {
 // Provider wraps the OpenTelemetry tracing provider to provide common tags for all tracers.
 type Provider struct {
 	provider *sdktrace.TracerProvider
+
+	embedded.TracerProvider
 }
 
 // Tracer returns a Tracer with the given name and options. If a Tracer for
@@ -194,14 +201,11 @@ func NewTraceProvider(ctx context.Context, cfg Config) (*Provider, error) {
 
 	res, err := resource.New(ctx,
 		resource.WithFromEnv(),
-		resource.WithProcessPID(),
 		resource.WithProcessExecutableName(),
-		resource.WithProcessExecutablePath(),
 		resource.WithProcessRuntimeName(),
 		resource.WithProcessRuntimeVersion(),
 		resource.WithProcessRuntimeDescription(),
 		resource.WithTelemetrySDK(),
-		resource.WithHost(),
 		resource.WithAttributes(attrs...),
 	)
 	if err != nil {
@@ -214,7 +218,7 @@ func NewTraceProvider(ctx context.Context, cfg Config) (*Provider, error) {
 	// override the global logging handled with one that uses the
 	// configured logger instead
 	otel.SetErrorHandler(otel.ErrorHandlerFunc(func(err error) {
-		cfg.Logger.WithError(err).Warnf("failed to export traces.")
+		cfg.Logger.WarnContext(ctx, "Failed to export traces", "error", err)
 	}))
 
 	// set global provider to our provider wrapper to have all tracers use the common TracerOptions
@@ -225,6 +229,7 @@ func NewTraceProvider(ctx context.Context, cfg Config) (*Provider, error) {
 			sdktrace.WithSpanProcessor(sdktrace.NewBatchSpanProcessor(exporter)),
 		),
 	}
+
 	otel.SetTracerProvider(provider)
 
 	return provider, nil

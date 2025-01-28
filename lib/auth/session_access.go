@@ -1,27 +1,29 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package auth
 
 import (
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 
-	"github.com/coreos/go-semver/semver"
 	"github.com/gravitational/trace"
 	"github.com/vulcand/predicate"
 
@@ -29,8 +31,6 @@ import (
 	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/utils"
 )
-
-var MinSupportedModeratedSessionsVersion = semver.New(utils.VersionBeforeAlpha("9.0.0"))
 
 // SessionAccessEvaluator takes a set of policies
 // and uses rules to evaluate them to determine when a session may start
@@ -162,7 +162,7 @@ func (e *SessionAccessEvaluator) matchesJoin(allow *types.SessionJoinPolicy) boo
 
 	for _, allowRole := range allow.Roles {
 		// GlobToRegexp makes sure this is always a valid regexp.
-		expr := regexp.MustCompile(utils.GlobToRegexp(allowRole))
+		expr := regexp.MustCompile("^" + utils.GlobToRegexp(allowRole) + "$")
 
 		for _, policySet := range e.policySets {
 			if expr.MatchString(policySet.Name) {
@@ -182,13 +182,15 @@ func (e *SessionAccessEvaluator) matchesKind(allow []string) bool {
 	return false
 }
 
-func HasV5Role(roles []types.Role) bool {
+// RoleSupportsModeratedSessions checks if the role version is higher or equal to
+// V5 - V5 is the version where ModeratedSession support was introduced.
+func RoleSupportsModeratedSessions(roles []types.Role) bool {
 	for _, role := range roles {
-		if role.GetVersion() == types.V5 {
+		switch role.GetVersion() {
+		case types.V5, types.V6, types.V7:
 			return true
 		}
 	}
-
 	return false
 }
 
@@ -196,7 +198,7 @@ func HasV5Role(roles []types.Role) bool {
 // If the list is empty, the user doesn't have access to join the session at all.
 func (e *SessionAccessEvaluator) CanJoin(user SessionAccessContext) []types.SessionParticipantMode {
 	// If we don't support session access controls, return the default mode set that was supported prior to Moderated Sessions.
-	if !HasV5Role(user.Roles) {
+	if !RoleSupportsModeratedSessions(user.Roles) {
 		return preAccessControlsModes(e.kind)
 	}
 
@@ -207,14 +209,14 @@ func (e *SessionAccessEvaluator) CanJoin(user SessionAccessContext) []types.Sess
 
 	var modes []types.SessionParticipantMode
 
-	// Loop over every allow policy attached the participant and check it's applicability.
+	// Loop over every allow policy attached the participant and check its applicability.
 	// This code serves to merge the permissions of all applicable join policies.
 	for _, allowPolicy := range getAllowPolicies(user) {
 		// If the policy is applicable and allows joining the session, add the allowed modes to the list of modes.
 		if e.matchesJoin(allowPolicy) {
 			for _, modeString := range allowPolicy.Modes {
 				mode := types.SessionParticipantMode(modeString)
-				if !SliceContainsMode(modes, mode) {
+				if !slices.Contains(modes, mode) {
 					modes = append(modes, mode)
 				}
 			}
@@ -224,21 +226,12 @@ func (e *SessionAccessEvaluator) CanJoin(user SessionAccessContext) []types.Sess
 	return modes
 }
 
-func SliceContainsMode(s []types.SessionParticipantMode, e types.SessionParticipantMode) bool {
-	for _, a := range s {
-		if a == e {
-			return true
-		}
-	}
-	return false
-}
-
-// PolicyOptions is a set of settings for the session determined by the matched require policy.
+// PolicyOptions is a set of settings for the session determined by the matched required policy.
 type PolicyOptions struct {
-	TerminateOnLeave bool
+	OnLeaveAction types.OnSessionLeaveAction
 }
 
-// Generate a pretty-printed string of precise requirements for session start suitable for user display.
+// PrettyRequirementsList generates a pretty-printed string of precise requirements for session start suitable for user display.
 func (e *SessionAccessEvaluator) PrettyRequirementsList() string {
 	s := new(strings.Builder)
 	s.WriteString("require all:")
@@ -273,7 +266,7 @@ func (e *SessionAccessEvaluator) extractApplicablePolicies(set *types.SessionTra
 
 // FulfilledFor checks if a given session may run with a list of participants.
 func (e *SessionAccessEvaluator) FulfilledFor(participants []SessionAccessContext) (bool, PolicyOptions, error) {
-	options := PolicyOptions{TerminateOnLeave: true}
+	var options PolicyOptions
 
 	// Check every policy set to check if it's fulfilled.
 	// We need every policy set to match to allow the session.
@@ -282,6 +275,17 @@ policySetLoop:
 		policies := e.extractApplicablePolicies(policySet)
 		if len(policies) == 0 {
 			continue
+		}
+
+		if options.OnLeaveAction != types.OnSessionLeaveTerminate {
+			terminateOnLeave := types.OnSessionLeavePause
+			for _, p := range policies {
+				if p.OnLeave != string(types.OnSessionLeavePause) {
+					terminateOnLeave = types.OnSessionLeaveTerminate
+					break
+				}
+			}
+			options = PolicyOptions{OnLeaveAction: terminateOnLeave}
 		}
 
 		// Check every require policy to see if it's fulfilled.
@@ -297,7 +301,7 @@ policySetLoop:
 
 			// Check every participant against the policy.
 			for _, participant := range participants {
-				if !SliceContainsMode(requireModes, participant.Mode) {
+				if !slices.Contains(requireModes, participant.Mode) {
 					continue
 				}
 
@@ -307,10 +311,10 @@ policySetLoop:
 					// Evaluate the filter in the require policy against the participant and allow policy.
 					matchesPredicate, err := e.matchesPredicate(&participant, requirePolicy, allowPolicy)
 					if err != nil {
-						return false, PolicyOptions{}, trace.Wrap(err)
+						return false, options, trace.Wrap(err)
 					}
 
-					// If the the filter matches the participant and the allow policy matches the session
+					// If the filter matches the participant and the allow policy matches the session
 					// we conclude that the participant matches against the require policy.
 					if matchesPredicate && e.matchesJoin(allowPolicy) {
 						left--
@@ -320,13 +324,6 @@ policySetLoop:
 
 				// If we've matched enough participants against the require policy, we can allow the session.
 				if left <= 0 {
-					switch requirePolicy.OnLeave {
-					case types.OnSessionLeaveTerminate:
-					case types.OnSessionLeavePause:
-						options.TerminateOnLeave = false
-					default:
-					}
-
 					// We matched at least one require policy within the set. Continue ahead.
 					continue policySetLoop
 				}

@@ -1,28 +1,31 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package secrets
 
 import (
 	"context"
+	"errors"
+	"maps"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/arn"
 	"github.com/aws/aws-sdk-go/aws/awserr"
-	"github.com/aws/aws-sdk-go/service/kms"
 	"github.com/aws/aws-sdk-go/service/secretsmanager"
 	"github.com/aws/aws-sdk-go/service/secretsmanager/secretsmanageriface"
 	"github.com/google/uuid"
@@ -40,6 +43,8 @@ type AWSSecretsManagerConfig struct {
 	KMSKeyID string `yaml:"kms_key_id,omitempty"`
 	// Client is the AWS API client for Secrets Manager.
 	Client secretsmanageriface.SecretsManagerAPI
+	// ClusterName is the name of the Teleport cluster (for tagging purpose).
+	ClusterName string
 }
 
 // CheckAndSetDefaults validates the config and sets defaults.
@@ -49,6 +54,9 @@ func (c *AWSSecretsManagerConfig) CheckAndSetDefaults() error {
 	}
 	if c.Client == nil {
 		return trace.BadParameter("missing client")
+	}
+	if c.ClusterName == "" {
+		return trace.BadParameter("missing cluster name")
 	}
 	return nil
 }
@@ -84,12 +92,7 @@ func (s *AWSSecretsManager) CreateOrUpdate(ctx context.Context, key string, valu
 		SecretBinary:       []byte(value),
 
 		// Add tags to make it is easier to search Teleport resources.
-		Tags: []*secretsmanager.Tag{
-			{
-				Key:   aws.String(libaws.TagKeyTeleportCreated),
-				Value: aws.String(libaws.TagValueTrue),
-			},
-		},
+		Tags: s.makeTags(),
 	}
 	if s.cfg.KMSKeyID != "" {
 		input.KmsKeyId = aws.String(s.cfg.KMSKeyID)
@@ -113,6 +116,19 @@ func (s *AWSSecretsManager) CreateOrUpdate(ctx context.Context, key string, valu
 		}
 	}
 	return nil
+}
+
+func (s *AWSSecretsManager) makeTags() []*secretsmanager.Tag {
+	return []*secretsmanager.Tag{
+		{
+			Key:   aws.String(libaws.TagKeyTeleportCreated),
+			Value: aws.String(libaws.TagValueTrue),
+		},
+		{
+			Key:   aws.String(libaws.TagKeyTeleportCluster),
+			Value: aws.String(s.cfg.ClusterName),
+		},
+	}
 }
 
 // Delete deletes the secret for the provided path. Implements Secrets.
@@ -210,6 +226,10 @@ func (s *AWSSecretsManager) update(ctx context.Context, key string) error {
 		return trace.Wrap(convertSecretsManagerError(err))
 	}
 
+	if err := s.maybeUpdateTags(ctx, secret); err != nil {
+		return trace.Wrap(err)
+	}
+
 	configKMSKeyID := s.cfg.KMSKeyID
 	if aws.StringValue(secret.KmsKeyId) == configKMSKeyID {
 		return nil
@@ -231,6 +251,18 @@ func (s *AWSSecretsManager) update(ctx context.Context, key string) error {
 	_, err = s.cfg.Client.UpdateSecretWithContext(ctx, &secretsmanager.UpdateSecretInput{
 		SecretId: secretID,
 		KmsKeyId: aws.String(configKMSKeyID),
+	})
+	return trace.Wrap(convertSecretsManagerError(err))
+}
+
+func (s *AWSSecretsManager) maybeUpdateTags(ctx context.Context, secert *secretsmanager.DescribeSecretOutput) error {
+	wantTags := s.makeTags()
+	if maps.Equal(libaws.TagsToLabels(wantTags), libaws.TagsToLabels(secert.Tags)) {
+		return nil
+	}
+	_, err := s.cfg.Client.TagResource(&secretsmanager.TagResourceInput{
+		SecretId: secert.ARN,
+		Tags:     wantTags,
 	})
 	return trace.Wrap(convertSecretsManagerError(err))
 }
@@ -257,7 +289,7 @@ func defaultKMSKeyID(secretARN string) (string, error) {
 	// arn:aws:kms:us-east-1:1234567890:alias/aws/secretsmanager
 	arn := arn.ARN{
 		Partition: parsed.Partition,
-		Service:   kms.ServiceName,
+		Service:   "kms",
 		Region:    parsed.Region,
 		AccountID: parsed.AccountID,
 		Resource:  "alias/aws/secretsmanager",
@@ -272,8 +304,8 @@ func convertSecretsManagerError(err error) error {
 		return nil
 	}
 
-	awsError, ok := err.(awserr.Error)
-	if !ok {
+	var awsError awserr.Error
+	if !errors.As(err, &awsError) {
 		return trace.Wrap(err)
 	}
 

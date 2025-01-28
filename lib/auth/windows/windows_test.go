@@ -1,16 +1,20 @@
-// Copyright 2022 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package windows
 
@@ -18,6 +22,7 @@ import (
 	"context"
 	"crypto/x509"
 	"encoding/asn1"
+	"os"
 	"testing"
 	"time"
 
@@ -25,7 +30,13 @@ import (
 
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/auth"
+	"github.com/gravitational/teleport/lib/modules"
 )
+
+func TestMain(m *testing.M) {
+	modules.SetInsecureTestMode(true)
+	os.Exit(m.Run())
+}
 
 // TestGenerateCredentials verifies that the smartcard certificates generated
 // by Teleport meet the requirements for Windows logon.
@@ -63,42 +74,115 @@ func TestGenerateCredentials(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	certb, keyb, err := GenerateCredentials(ctx, user, domain, CertTTL, clusterName, ldapConfig, client)
-	require.NoError(t, err)
-	require.NotNil(t, certb)
-	require.NotNil(t, keyb)
+	testSid := "S-1-5-21-1329593140-2634913955-1900852804-500"
 
-	cert, err := x509.ParseCertificate(certb)
-	require.NoError(t, err)
-	require.NotNil(t, cert)
-
-	require.Equal(t, user, cert.Subject.CommonName)
-	require.Contains(t, cert.CRLDistributionPoints,
-		`ldap:///CN=test,CN=Teleport,CN=CDP,CN=Public Key Services,CN=Services,CN=Configuration,DC=test,DC=example,DC=com?certificateRevocationList?base?objectClass=cRLDistributionPoint`)
-
-	foundKeyUsage := false
-	foundAltName := false
-	for _, extension := range cert.Extensions {
-		switch {
-		case extension.Id.Equal(EnhancedKeyUsageExtensionOID):
-			foundKeyUsage = true
-			var oids []asn1.ObjectIdentifier
-			_, err = asn1.Unmarshal(extension.Value, &oids)
+	for _, test := range []struct {
+		name               string
+		activeDirectorySID string
+	}{
+		{
+			name:               "no ad sid",
+			activeDirectorySID: "",
+		},
+		{
+			name:               "with ad sid",
+			activeDirectorySID: testSid,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			certb, keyb, err := GenerateWindowsDesktopCredentials(ctx, &GenerateCredentialsRequest{
+				Username:           user,
+				Domain:             domain,
+				TTL:                CertTTL,
+				ClusterName:        clusterName,
+				ActiveDirectorySID: test.activeDirectorySID,
+				LDAPConfig:         ldapConfig,
+				AuthClient:         client,
+			})
 			require.NoError(t, err)
-			require.Len(t, oids, 2)
-			require.Contains(t, oids, ClientAuthenticationOID)
-			require.Contains(t, oids, SmartcardLogonOID)
+			require.NotNil(t, certb)
+			require.NotNil(t, keyb)
 
-		case extension.Id.Equal(SubjectAltNameExtensionOID):
-			foundAltName = true
-			var san SubjectAltName
-			_, err = asn1.Unmarshal(extension.Value, &san)
+			cert, err := x509.ParseCertificate(certb)
 			require.NoError(t, err)
+			require.NotNil(t, cert)
 
-			require.Equal(t, san.OtherName.OID, UPNOtherNameOID)
-			require.Equal(t, san.OtherName.Value.Value, user+"@"+domain)
-		}
+			require.Equal(t, user, cert.Subject.CommonName)
+			require.Contains(t, cert.CRLDistributionPoints,
+				`ldap:///CN=test,CN=Teleport,CN=CDP,CN=Public Key Services,CN=Services,CN=Configuration,DC=test,DC=example,DC=com?certificateRevocationList?base?objectClass=cRLDistributionPoint`)
+
+			foundKeyUsage := false
+			foundAltName := false
+			foundAdUserMapping := false
+			for _, extension := range cert.Extensions {
+				switch {
+				case extension.Id.Equal(EnhancedKeyUsageExtensionOID):
+					foundKeyUsage = true
+					var oids []asn1.ObjectIdentifier
+					_, err = asn1.Unmarshal(extension.Value, &oids)
+					require.NoError(t, err)
+					require.Len(t, oids, 2)
+					require.Contains(t, oids, ClientAuthenticationOID)
+					require.Contains(t, oids, SmartcardLogonOID)
+				case extension.Id.Equal(SubjectAltNameExtensionOID):
+					foundAltName = true
+					var san SubjectAltName[upn]
+					_, err = asn1.Unmarshal(extension.Value, &san)
+					require.NoError(t, err)
+					require.Equal(t, UPNOtherNameOID, san.OtherName.OID)
+					require.Equal(t, user+"@"+domain, san.OtherName.Value.Value)
+				case extension.Id.Equal(ADUserMappingExtensionOID):
+					foundAdUserMapping = true
+					var adUserMapping SubjectAltName[adSid]
+					_, err = asn1.Unmarshal(extension.Value, &adUserMapping)
+					require.NoError(t, err)
+					require.Equal(t, ADUserMappingInternalOID, adUserMapping.OtherName.OID)
+					require.Equal(t, []byte(testSid), adUserMapping.OtherName.Value.Value)
+
+				}
+			}
+			require.True(t, foundKeyUsage)
+			require.True(t, foundAltName)
+			require.Equal(t, test.activeDirectorySID != "", foundAdUserMapping)
+		})
 	}
-	require.True(t, foundKeyUsage)
-	require.True(t, foundAltName)
+}
+
+func TestCRLDN(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		clusterName string
+		crlDN       string
+		caType      types.CertAuthType
+	}{
+		{
+			name:        "test cluster name",
+			clusterName: "test",
+			crlDN:       "CN=test,CN=Teleport,CN=CDP,CN=Public Key Services,CN=Services,CN=Configuration,DC=test,DC=goteleport,DC=com",
+		},
+		{
+			name:        "full cluster name",
+			clusterName: "cluster.goteleport.com",
+			crlDN:       "CN=cluster.goteleport.com,CN=Teleport,CN=CDP,CN=Public Key Services,CN=Services,CN=Configuration,DC=test,DC=goteleport,DC=com",
+		},
+		{
+			name:        "database CA",
+			clusterName: "cluster.goteleport.com",
+			caType:      types.DatabaseClientCA,
+			crlDN:       "CN=cluster.goteleport.com,CN=TeleportDB,CN=CDP,CN=Public Key Services,CN=Services,CN=Configuration,DC=test,DC=goteleport,DC=com",
+		},
+		{
+			name:        "user CA",
+			clusterName: "cluster.goteleport.com",
+			caType:      types.UserCA,
+			crlDN:       "CN=cluster.goteleport.com,CN=Teleport,CN=CDP,CN=Public Key Services,CN=Services,CN=Configuration,DC=test,DC=goteleport,DC=com",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := LDAPConfig{
+				Domain: "test.goteleport.com",
+			}
+			require.Equal(t, test.crlDN, crlDN(test.clusterName, cfg, test.caType))
+		})
+	}
 }

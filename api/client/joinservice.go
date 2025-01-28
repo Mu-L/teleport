@@ -22,6 +22,7 @@ import (
 	"github.com/gravitational/trace"
 
 	"github.com/gravitational/teleport/api/client/proto"
+	"github.com/gravitational/teleport/api/types"
 )
 
 // JoinServiceClient is a client for the JoinService, which runs on both the
@@ -38,10 +39,21 @@ func NewJoinServiceClient(grpcClient proto.JoinServiceClient) *JoinServiceClient
 	}
 }
 
-// RegisterChallengeResponseFunc is a function type meant to be passed to
-// RegisterUsingIAMMethod. It must return a *types.RegisterUsingTokenRequest for
-// a given challenge, or an error.
-type RegisterChallengeResponseFunc func(challenge string) (*proto.RegisterUsingIAMMethodRequest, error)
+// RegisterIAMChallengeResponseFunc is a function type meant to be passed to
+// RegisterUsingIAMMethod. It must return a *proto.RegisterUsingIAMMethodRequest
+// for a given challenge, or an error.
+type RegisterIAMChallengeResponseFunc func(challenge string) (*proto.RegisterUsingIAMMethodRequest, error)
+
+// RegisterAzureChallengeResponseFunc is a function type meant to be passed to
+// RegisterUsingAzureMethod. It must return a
+// *proto.RegisterUsingAzureMethodRequest for a given challenge, or an error.
+type RegisterAzureChallengeResponseFunc func(challenge string) (*proto.RegisterUsingAzureMethodRequest, error)
+
+// RegisterTPMChallengeResponseFunc is a function type meant to be passed to
+// RegisterUsingTPMMethod. It must return a
+// *proto.RegisterUsingTPMMethodChallengeResponse for a given challenge, or an
+// error.
+type RegisterTPMChallengeResponseFunc func(challenge *proto.TPMEncryptedCredential) (*proto.RegisterUsingTPMMethodChallengeResponse, error)
 
 // RegisterUsingIAMMethod registers the caller using the IAM join method and
 // returns signed certs to join the cluster.
@@ -49,7 +61,7 @@ type RegisterChallengeResponseFunc func(challenge string) (*proto.RegisterUsingI
 // The caller must provide a ChallengeResponseFunc which returns a
 // *types.RegisterUsingTokenRequest with a signed sts:GetCallerIdentity request
 // including the challenge as a signed header.
-func (c *JoinServiceClient) RegisterUsingIAMMethod(ctx context.Context, challengeResponse RegisterChallengeResponseFunc) (*proto.Certs, error) {
+func (c *JoinServiceClient) RegisterUsingIAMMethod(ctx context.Context, challengeResponse RegisterIAMChallengeResponseFunc) (*proto.Certs, error) {
 	// Make sure the gRPC stream is closed when this returns
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -83,4 +95,119 @@ func (c *JoinServiceClient) RegisterUsingIAMMethod(ctx context.Context, challeng
 		return nil, trace.Wrap(err)
 	}
 	return certsResp.Certs, nil
+}
+
+// RegisterUsingAzureMethod registers the caller using the Azure join method and
+// returns signed certs to join the cluster.
+//
+// The caller must provide a ChallengeResponseFunc which returns a
+// *proto.RegisterUsingAzureMethodRequest with a signed attested data document
+// including the challenge as a nonce.
+func (c *JoinServiceClient) RegisterUsingAzureMethod(ctx context.Context, challengeResponse RegisterAzureChallengeResponseFunc) (*proto.Certs, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	azureJoinClient, err := c.grpcClient.RegisterUsingAzureMethod(ctx)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	challenge, err := azureJoinClient.Recv()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	req, err := challengeResponse(challenge.Challenge)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	if err := azureJoinClient.Send(req); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	certsResp, err := azureJoinClient.Recv()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	return certsResp.Certs, nil
+}
+
+// RegisterUsingTPMMethod registers the caller using the TPM join method and
+// returns signed certs to join the cluster. The caller must provide a
+// ChallengeResponseFunc which returns a *proto.RegisterUsingTPMMethodRequest
+// for a given challenge, or an error.
+func (c *JoinServiceClient) RegisterUsingTPMMethod(
+	ctx context.Context,
+	initReq *proto.RegisterUsingTPMMethodInitialRequest,
+	solveChallenge RegisterTPMChallengeResponseFunc,
+) (*proto.Certs, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	stream, err := c.grpcClient.RegisterUsingTPMMethod(ctx)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	defer stream.CloseSend()
+
+	err = stream.Send(&proto.RegisterUsingTPMMethodRequest{
+		Payload: &proto.RegisterUsingTPMMethodRequest_Init{
+			Init: initReq,
+		},
+	})
+	if err != nil {
+		return nil, trace.Wrap(err, "sending initial request")
+	}
+
+	res, err := stream.Recv()
+	if err != nil {
+		return nil, trace.Wrap(err, "receiving challenge")
+	}
+
+	challenge := res.GetChallengeRequest()
+	if challenge == nil {
+		return nil, trace.BadParameter(
+			"expected ChallengeRequest payload, got %T",
+			res.Payload,
+		)
+	}
+
+	solution, err := solveChallenge(challenge)
+	if err != nil {
+		return nil, trace.Wrap(err, "solving challenge")
+	}
+
+	err = stream.Send(&proto.RegisterUsingTPMMethodRequest{
+		Payload: &proto.RegisterUsingTPMMethodRequest_ChallengeResponse{
+			ChallengeResponse: solution,
+		},
+	})
+	if err != nil {
+		return nil, trace.Wrap(err, "sending solution")
+	}
+
+	res, err = stream.Recv()
+	if err != nil {
+		return nil, trace.Wrap(err, "receiving certs")
+	}
+	certs := res.GetCerts()
+	if certs == nil {
+		return nil, trace.BadParameter(
+			"expected Certs payload, got %T",
+			res.Payload,
+		)
+	}
+
+	return certs, nil
+}
+
+// RegisterUsingToken registers the caller using a token and returns signed
+// certs.
+// This is used where a more specific RPC has not been introduced for the join
+// method.
+func (c *JoinServiceClient) RegisterUsingToken(
+	ctx context.Context, req *types.RegisterUsingTokenRequest,
+) (*proto.Certs, error) {
+	return c.grpcClient.RegisterUsingToken(ctx, req)
 }

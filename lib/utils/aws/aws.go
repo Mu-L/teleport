@@ -1,39 +1,46 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package aws
 
 import (
 	"bytes"
 	"context"
-	"io"
+	"crypto/sha1"
+	"encoding/hex"
+	"fmt"
+	"log/slog"
 	"net/http"
 	"net/textproto"
 	"sort"
 	"strings"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws/arn"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/arn"
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	v4 "github.com/aws/aws-sdk-go/aws/signer/v4"
 	"github.com/gravitational/trace"
 
-	"github.com/gravitational/teleport"
 	apievents "github.com/gravitational/teleport/api/types/events"
+	apiawsutils "github.com/gravitational/teleport/api/utils/aws"
 	"github.com/gravitational/teleport/lib/utils"
+	"github.com/gravitational/teleport/lib/utils/aws/migration"
 )
 
 const (
@@ -55,14 +62,22 @@ const (
 	credentialAuthHeaderElem   = "Credential"
 	signedHeaderAuthHeaderElem = "SignedHeaders"
 	signatureAuthHeaderElem    = "Signature"
-	// TargetHeader is a header containing the API target.
+
+	// AmzTargetHeader is a header containing the API target.
 	// Format: target_version.operation
 	// Example: DynamoDB_20120810.Scan
-	TargetHeader = "X-Amz-Target"
+	AmzTargetHeader = "X-Amz-Target"
 	// AmzJSON1_0 is an AWS Content-Type header that indicates the media type is JSON.
 	AmzJSON1_0 = "application/x-amz-json-1.0"
 	// AmzJSON1_1 is an AWS Content-Type header that indicates the media type is JSON.
 	AmzJSON1_1 = "application/x-amz-json-1.1"
+
+	// MaxRoleSessionNameLength is the maximum length of the role session name
+	// used by the AssumeRole call.
+	// https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_iam-quotas.html
+	MaxRoleSessionNameLength = 64
+
+	iamServiceName = "iam"
 )
 
 // SigV4 contains parsed content of the AWS Authorization header.
@@ -82,24 +97,33 @@ type SigV4 struct {
 }
 
 // ParseSigV4 AWS SigV4 credentials string sections.
-// AWS SigV4 header example:
-// Authorization: AWS4-HMAC-SHA256
-// Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request,
+// AWS SigV4 header example below adds newlines for readability only - the real
+// header must be a single continuous string with commas (and optional spaces)
+// between the Credential, SignedHeaders, and Signature:
+// Authorization: AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request,
 // SignedHeaders=host;range;x-amz-date,
 // Signature=fe5f80f77d5fa3beca038a248ff027d0445342fe2855ddc963176630326f1024
 func ParseSigV4(header string) (*SigV4, error) {
 	if header == "" {
 		return nil, trace.BadParameter("empty AWS SigV4 header")
 	}
-	sectionParts := strings.Split(header, " ")
+	if !strings.HasPrefix(header, AmazonSigV4AuthorizationPrefix+" ") {
+		return nil, trace.BadParameter("missing AWS SigV4 authorization algorithm")
+	}
+	header = strings.TrimPrefix(header, AmazonSigV4AuthorizationPrefix+" ")
+
+	components := strings.Split(header, ",")
+	if len(components) != 3 {
+		return nil, trace.BadParameter("expected AWS SigV4 Authorization header with 3 comma-separated components but got %d", len(components))
+	}
 
 	m := make(map[string]string)
-	for _, v := range sectionParts {
-		kv := strings.Split(v, "=")
+	for _, v := range components {
+		kv := strings.Split(strings.Trim(v, " "), "=")
 		if len(kv) != 2 {
 			continue
 		}
-		m[kv[0]] = strings.TrimSuffix(kv[1], ",")
+		m[kv[0]] = kv[1]
 	}
 
 	authParts := strings.Split(m[credentialAuthHeaderElem], "/")
@@ -135,37 +159,9 @@ func IsSignedByAWSSigV4(r *http.Request) bool {
 	return strings.HasPrefix(r.Header.Get(AuthorizationHeader), AmazonSigV4AuthorizationPrefix)
 }
 
-// GetAndReplaceReqBody returns the request and replace the drained body reader with io.NopCloser
-// allowing for further body processing by http transport.
-func GetAndReplaceReqBody(req *http.Request) ([]byte, error) {
-	if req.Body == nil || req.Body == http.NoBody {
-		return []byte{}, nil
-	}
-	// req.Body is closed during tryDrainBody call.
-	payload, err := tryDrainBody(req.Body)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	// Replace the drained body with io.NopCloser reader allowing for further request processing by HTTP transport.
-	req.Body = io.NopCloser(bytes.NewReader(payload))
-	return payload, nil
-}
-
-// tryDrainBody tries to drain and close the body, returning the read bytes.
-// It may fail to completely drain the body if the size of the body exceeds MaxHTTPRequestSize.
-func tryDrainBody(b io.ReadCloser) (payload []byte, err error) {
-	defer func() {
-		if closeErr := b.Close(); closeErr != nil {
-			err = trace.NewAggregate(err, closeErr)
-		}
-	}()
-	payload, err = utils.ReadAtMost(b, teleport.MaxHTTPRequestSize)
-	if err != nil {
-		err = trace.Wrap(err)
-		return
-	}
-	return
+// VerifyAWSSignatureV2 is a temporary AWS SDK migration helper.
+func VerifyAWSSignatureV2(req *http.Request, provider aws.CredentialsProvider) error {
+	return VerifyAWSSignature(req, migration.NewCredentialsAdapter(provider))
 }
 
 // VerifyAWSSignature verifies the request signature ensuring that the request originates from tsh aws command execution
@@ -187,9 +183,19 @@ func VerifyAWSSignature(req *http.Request, credentials *credentials.Credentials)
 		return trace.AccessDenied("AccessKeyID does not match")
 	}
 
+	// Skip signature verification if the incoming request includes the
+	// "User-Agent" header when making the signature. AWS Go SDK explicitly
+	// skips the "User-Agent" header so it will always produce a different
+	// signature. Only AccessKeyID is verified above in this case.
+	for _, signedHeader := range sigV4.SignedHeaders {
+		if strings.EqualFold(signedHeader, "User-Agent") {
+			return nil
+		}
+	}
+
 	// Read the request body and replace the body ready with a new reader that will allow reading the body again
 	// by HTTP Transport.
-	payload, err := GetAndReplaceReqBody(req)
+	payload, err := utils.GetAndReplaceRequestBody(req)
 	if err != nil {
 		return trace.Wrap(err)
 	}
@@ -225,6 +231,11 @@ func VerifyAWSSignature(req *http.Request, credentials *credentials.Credentials)
 	return nil
 }
 
+// NewSignerV2 is a temporary AWS SDK migration helper.
+func NewSignerV2(provider aws.CredentialsProvider, signingServiceName string) *v4.Signer {
+	return NewSigner(migration.NewCredentialsAdapter(provider), signingServiceName)
+}
+
 // NewSigner creates a new V4 signer.
 func NewSigner(credentials *credentials.Credentials, signingServiceName string) *v4.Signer {
 	options := func(s *v4.Signer) {
@@ -239,27 +250,38 @@ func NewSigner(credentials *credentials.Credentials, signingServiceName string) 
 	return v4.NewSigner(credentials, options)
 }
 
-// filterHeaders removes request headers that are not in the headers list.
-func filterHeaders(r *http.Request, headers []string) {
+// filterHeaders removes request headers that are not in the headers list and returns the removed header keys.
+func filterHeaders(r *http.Request, headers []string) []string {
+	keep := make(map[string]struct{})
+	for _, key := range headers {
+		keep[textproto.CanonicalMIMEHeaderKey(key)] = struct{}{}
+	}
+
+	var removed []string
 	out := make(http.Header)
-	for _, v := range headers {
-		ck := textproto.CanonicalMIMEHeaderKey(v)
-		val, ok := r.Header[ck]
-		if ok {
-			out[ck] = val
+	for key, vals := range r.Header {
+		if _, ok := keep[textproto.CanonicalMIMEHeaderKey(key)]; ok {
+			out[key] = vals
+			continue
 		}
+		removed = append(removed, key)
 	}
 	r.Header = out
+	return removed
 }
 
 // FilterAWSRoles returns role ARNs from the provided list that belong to the
 // specified AWS account ID.
 //
-// If AWS account ID is empty, all roles are returned.
+// If AWS account ID is empty, all valid AWS IAM roles are returned.
 func FilterAWSRoles(arns []string, accountID string) (result Roles) {
 	for _, roleARN := range arns {
-		parsed, err := arn.Parse(roleARN)
-		if err != nil || (accountID != "" && parsed.AccountID != accountID) {
+		parsed, err := ParseRoleARN(roleARN)
+		if err != nil {
+			slog.WarnContext(context.Background(), "Skipping invalid AWS role ARN.", "error", err)
+			continue
+		}
+		if accountID != "" && parsed.AccountID != accountID {
 			continue
 		}
 
@@ -270,14 +292,11 @@ func FilterAWSRoles(arns []string, accountID string) (result Roles) {
 		// arn:aws:iam::1234567890:role/EC2FullAccess      (display: EC2FullAccess)
 		// arn:aws:iam::1234567890:role/path/to/customrole (display: customrole)
 		parts := strings.Split(parsed.Resource, "/")
-		numParts := len(parts)
-		if numParts < 2 || parts[0] != "role" {
-			continue
-		}
 		result = append(result, Role{
-			Name:    strings.Join(parts[1:], "/"),
-			Display: parts[numParts-1],
-			ARN:     roleARN,
+			Name:      strings.Join(parts[1:], "/"),
+			Display:   parts[len(parts)-1],
+			ARN:       roleARN,
+			AccountID: parsed.AccountID,
 		})
 	}
 	return result
@@ -291,6 +310,8 @@ type Role struct {
 	Display string `json:"display"`
 	// ARN is the full role ARN.
 	ARN string `json:"arn"`
+	// AccountID is the AWS Account ID this role refers to.
+	AccountID string `json:"accountId"`
 }
 
 // Roles is a slice of roles.
@@ -339,7 +360,7 @@ func UnmarshalRequestBody(req *http.Request) (*apievents.Struct, error) {
 	if !isJSON(contentType) {
 		return nil, trace.BadParameter("invalid JSON request Content-Type: %q", contentType)
 	}
-	jsonBody, err := GetAndReplaceReqBody(req)
+	jsonBody, err := utils.GetAndReplaceRequestBody(req)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -359,4 +380,163 @@ func isJSON(contentType string) bool {
 	default:
 		return false
 	}
+}
+
+// BuildRoleARN constructs a string AWS ARN from a username, region, and account ID.
+// If username is an AWS ARN, this function checks that the ARN is an AWS IAM Role ARN
+// in the correct partition and account.
+func BuildRoleARN(username, region, accountID string) (string, error) {
+	partition := apiawsutils.GetPartitionFromRegion(region)
+	if arn.IsARN(username) {
+		// sanity check the given username role ARN.
+		parsed, err := ParseRoleARN(username)
+		if err != nil {
+			return "", trace.Wrap(err)
+		}
+		// don't check for empty accountID - callers do not always pass an account ID,
+		// and it's only absolutely required if we need to build the role ARN below.
+		if err := CheckARNPartitionAndAccount(parsed, partition, accountID); err != nil {
+			return "", trace.Wrap(err)
+		}
+		return username, nil
+	}
+	resource := username
+	if !IsPartialRoleARN(resource) {
+		resource = fmt.Sprintf("role/%s", username)
+	}
+	roleARN := arn.ARN{
+		Partition: partition,
+		Service:   iamServiceName,
+		AccountID: accountID,
+		Resource:  resource,
+	}
+	if err := apiawsutils.CheckRoleARN(roleARN.String()); err != nil {
+		return "", trace.Wrap(err)
+	}
+	return roleARN.String(), nil
+}
+
+// ValidateRoleARNAndExtractRoleName validates the role ARN and extracts the
+// short role name from it.
+func ValidateRoleARNAndExtractRoleName(roleARN, wantPartition, wantAccountID string) (string, error) {
+	role, err := ParseRoleARN(roleARN)
+	if err != nil {
+		return "", trace.Wrap(err)
+	}
+	if err := CheckARNPartitionAndAccount(role, wantPartition, wantAccountID); err != nil {
+		return "", trace.Wrap(err)
+	}
+	return strings.TrimPrefix(role.Resource, "role/"), nil
+}
+
+// ParseRoleARN parses an AWS ARN and checks that the ARN is
+// for an IAM Role resource.
+func ParseRoleARN(roleARN string) (*arn.ARN, error) {
+	role, err := arn.Parse(roleARN)
+	if err != nil {
+		return nil, trace.BadParameter("invalid AWS ARN: %v", err)
+	}
+	if err := checkRoleARN(&role); err != nil {
+		return nil, trace.Wrap(err)
+	}
+	return &role, nil
+}
+
+// checkRoleARN returns whether a parsed ARN is for an IAM Role resource.
+// Example role ARN: arn:aws:iam::123456789012:role/some-role-name
+func checkRoleARN(parsed *arn.ARN) error {
+	parts := strings.Split(parsed.Resource, "/")
+	if parts[0] != "role" || parsed.Service != iamServiceName {
+		return trace.BadParameter("%q is not an AWS IAM role ARN", parsed)
+	}
+	if len(parts) < 2 || len(parts[len(parts)-1]) == 0 {
+		return trace.BadParameter("%q is missing AWS IAM role name", parsed)
+	}
+	if err := apiawsutils.IsValidAccountID(parsed.AccountID); err != nil {
+		return trace.BadParameter("%q invalid account ID: %v", parsed, err)
+	}
+	return nil
+}
+
+// CheckARNPartitionAndAccount checks an AWS ARN against an expected AWS partition and account ID.
+// An empty expected AWS partition or account ID is not checked.
+func CheckARNPartitionAndAccount(ARN *arn.ARN, wantPartition, wantAccountID string) error {
+	if ARN.Partition != wantPartition && wantPartition != "" {
+		return trace.BadParameter("expected AWS partition %q but got %q", wantPartition, ARN.Partition)
+	}
+	if ARN.AccountID != wantAccountID && wantAccountID != "" {
+		return trace.BadParameter("expected AWS account ID %q but got %q", wantAccountID, ARN.AccountID)
+	}
+	return nil
+}
+
+// IsRoleARN returns true if the provided string is a AWS role ARN.
+func IsRoleARN(roleARN string) bool {
+	if _, err := ParseRoleARN(roleARN); err == nil {
+		return true
+	}
+
+	return IsPartialRoleARN(roleARN)
+}
+
+// IsPartialRoleARN returns true if the provided role ARN only contains the
+// resource name.
+func IsPartialRoleARN(roleARN string) bool {
+	return strings.HasPrefix(roleARN, "role/")
+}
+
+// IsUserARN returns true if the provided string is a AWS user ARN.
+func IsUserARN(userARN string) bool {
+	resourceName := userARN
+	if parsed, err := arn.Parse(userARN); err == nil {
+		resourceName = parsed.Resource
+	}
+
+	return strings.HasPrefix(resourceName, "user/")
+}
+
+// PolicyARN returns the ARN representation of an AWS IAM Policy.
+func PolicyARN(partition, accountID, policy string) string {
+	return iamResourceARN(partition, accountID, "policy", policy)
+}
+
+// RoleARN returns the ARN representation of an AWS IAM Role.
+func RoleARN(partition, accountID, role string) string {
+	return iamResourceARN(partition, accountID, "role", role)
+}
+
+func iamResourceARN(partition, accountID, resourceType, resourceName string) string {
+	return arn.ARN{
+		Partition: partition,
+		Service:   "iam",
+		AccountID: accountID,
+		Resource:  fmt.Sprintf("%s/%s", resourceType, resourceName),
+	}.String()
+}
+
+// MaybeHashRoleSessionName truncates the role session name and adds a hash
+// when the original role session name is greater than AWS character limit
+// (64).
+func MaybeHashRoleSessionName(roleSessionName string) (ret string) {
+	if len(roleSessionName) <= MaxRoleSessionNameLength {
+		return roleSessionName
+	}
+
+	const hashLen = 16
+	hash := sha1.New()
+	hash.Write([]byte(roleSessionName))
+	hex := hex.EncodeToString(hash.Sum(nil))[:hashLen]
+
+	// "1" for the delimiter.
+	keepPrefixIndex := MaxRoleSessionNameLength - len(hex) - 1
+
+	// Sanity check. This should never happen since hash length and
+	// MaxRoleSessionNameLength are both constant.
+	if keepPrefixIndex < 0 {
+		keepPrefixIndex = 0
+	}
+
+	ret = fmt.Sprintf("%s-%s", roleSessionName[:keepPrefixIndex], hex)
+	slog.DebugContext(context.Background(), "AWS role session name is too long. Using a hash instead.", "hashed", ret, "original", roleSessionName)
+	return ret
 }

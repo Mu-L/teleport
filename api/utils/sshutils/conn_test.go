@@ -17,10 +17,8 @@ limitations under the License.
 package sshutils
 
 import (
+	"crypto/ed25519"
 	"crypto/rand"
-	"crypto/rsa"
-	"crypto/x509"
-	"encoding/pem"
 	"net"
 	"testing"
 	"time"
@@ -64,19 +62,11 @@ func (s *server) Stop() error {
 }
 
 func generateSigner(t *testing.T) ssh.Signer {
-	private, err := rsa.GenerateKey(rand.Reader, 2048)
+	_, private, err := ed25519.GenerateKey(rand.Reader)
 	require.NoError(t, err)
-
-	block := &pem.Block{
-		Type:  "RSA PRIVATE KEY",
-		Bytes: x509.MarshalPKCS1PrivateKey(private),
-	}
-
-	privatePEM := pem.EncodeToMemory(block)
-	signer, err := ssh.ParsePrivateKey(privatePEM)
+	sshSigner, err := ssh.NewSignerFromSigner(private)
 	require.NoError(t, err)
-
-	return signer
+	return sshSigner
 }
 
 func (s *server) GetClient(t *testing.T) (ssh.Conn, <-chan ssh.NewChannel, <-chan *ssh.Request) {
@@ -133,7 +123,7 @@ func TestTransportError(t *testing.T) {
 	t.Cleanup(func() { require.Error(t, sconn1.Close()) })
 
 	channel := <-nc
-	require.Equal(t, channel.ChannelType(), constants.ChanTransport)
+	require.Equal(t, constants.ChanTransport, channel.ChannelType())
 
 	sconn1.Close()
 	err := timeoutErrC(t, handlerErrC, time.Second*5)
@@ -143,7 +133,7 @@ func TestTransportError(t *testing.T) {
 	t.Cleanup(func() { require.NoError(t, sconn2.Close()) })
 
 	channel = <-nc
-	require.Equal(t, channel.ChannelType(), constants.ChanTransport)
+	require.Equal(t, constants.ChanTransport, channel.ChannelType())
 
 	err = channel.Reject(ssh.ConnectionFailed, "test reject")
 	require.NoError(t, err)

@@ -16,12 +16,10 @@ package ssh
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/rand"
-	"crypto/rsa"
 	"crypto/subtle"
-	"crypto/x509"
 	"encoding/json"
-	"encoding/pem"
 	"errors"
 	"net"
 	"testing"
@@ -73,19 +71,11 @@ func (s *server) Stop() error {
 }
 
 func generateSigner(t *testing.T) ssh.Signer {
-	private, err := rsa.GenerateKey(rand.Reader, 2048)
+	_, private, err := ed25519.GenerateKey(rand.Reader)
 	require.NoError(t, err)
-
-	block := &pem.Block{
-		Type:  "RSA PRIVATE KEY",
-		Bytes: x509.MarshalPKCS1PrivateKey(private),
-	}
-
-	privatePEM := pem.EncodeToMemory(block)
-	signer, err := ssh.ParsePrivateKey(privatePEM)
+	sshSigner, err := ssh.NewSignerFromSigner(private)
 	require.NoError(t, err)
-
-	return signer
+	return sshSigner
 }
 
 func (s *server) GetClient(t *testing.T) (ssh.Conn, <-chan ssh.NewChannel, <-chan *ssh.Request) {
@@ -101,16 +91,21 @@ func (s *server) GetClient(t *testing.T) (ssh.Conn, <-chan ssh.NewChannel, <-cha
 	return sconn, nc, r
 }
 
-func newServer(t *testing.T, handler func(*ssh.ServerConn, <-chan ssh.NewChannel, <-chan *ssh.Request)) *server {
+func newServer(t *testing.T, tracingCap tracingCapability, handler func(*ssh.ServerConn, <-chan ssh.NewChannel, <-chan *ssh.Request)) *server {
 	listener, err := net.Listen("tcp", "localhost:0")
 	require.NoError(t, err)
 
 	cSigner := generateSigner(t)
 	hSigner := generateSigner(t)
 
+	version := "SSH-2.0-Teleport"
+	if tracingCap != tracingSupported {
+		version = "SSH-2.0"
+	}
+
 	config := &ssh.ServerConfig{
 		NoClientAuth:  true,
-		ServerVersion: "SSH-2.0-Teleport",
+		ServerVersion: version,
 	}
 	config.AddHostKey(hSigner)
 
@@ -157,10 +152,6 @@ func (h handler) handle(sconn *ssh.ServerConn, chans <-chan ssh.NewChannel, reqs
 
 func (h handler) requestHandler(req *ssh.Request) {
 	switch {
-	case req.Type == TracingChannel && h.tracingSupported == tracingSupported:
-		if err := req.Reply(true, nil); err != nil {
-			h.errChan <- err
-		}
 	case req.Type == "test":
 		defer func() {
 			if req.WantReply {
@@ -170,26 +161,6 @@ func (h handler) requestHandler(req *ssh.Request) {
 			}
 		}()
 
-		switch h.tracingSupported {
-		case tracingUnsupported:
-			if subtle.ConstantTimeCompare(req.Payload, []byte(testPayload)) != 1 {
-				h.errChan <- errors.New("payload mismatch")
-			}
-		case tracingSupported:
-			var envelope Envelope
-			if err := json.Unmarshal(req.Payload, &envelope); err != nil {
-				h.errChan <- trace.Wrap(err, "failed to unmarshal envelope")
-				return
-			}
-			if len(envelope.PropagationContext) <= 0 {
-				h.errChan <- errors.New("empty propagation context")
-				return
-			}
-			if subtle.ConstantTimeCompare(envelope.Payload, []byte(testPayload)) != 1 {
-				h.errChan <- errors.New("payload mismatch")
-				return
-			}
-		}
 	default:
 		if err := req.Reply(false, nil); err != nil {
 			h.errChan <- err
@@ -199,16 +170,6 @@ func (h handler) requestHandler(req *ssh.Request) {
 
 func (h handler) channelHandler(ch ssh.NewChannel) {
 	switch ch.ChannelType() {
-	case TracingChannel:
-		switch h.tracingSupported {
-		case tracingUnsupported:
-			if err := ch.Reject(ssh.UnknownChannelType, "unknown channel type"); err != nil {
-				h.errChan <- trace.Wrap(err, "failed to reject channel")
-			}
-		case tracingSupported:
-			ch.Accept()
-			return
-		}
 	case "session":
 		switch h.tracingSupported {
 		case tracingUnsupported:
@@ -339,7 +300,7 @@ func TestClient(t *testing.T) {
 				ctx:              ctx,
 			}
 
-			srv := newServer(t, handler.handle)
+			srv := newServer(t, tt.tracingSupported, handler.handle)
 			go srv.Run(errChan)
 
 			tp := sdktrace.NewTracerProvider()
@@ -351,7 +312,7 @@ func TestClient(t *testing.T) {
 				tracing.WithTracerProvider(tp),
 				tracing.WithTextMapPropagator(propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{})),
 			)
-			require.Equal(t, handler.tracingSupported, client.capability)
+			require.Equal(t, tt.tracingSupported, client.capability)
 
 			ctx, span := tp.Tracer("test").Start(context.Background(), "test")
 			ok, resp, err := client.SendRequest(ctx, "test", true, []byte("test"))

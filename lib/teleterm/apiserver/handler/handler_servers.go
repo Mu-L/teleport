@@ -1,43 +1,32 @@
-// Copyright 2021 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package handler
 
 import (
 	"context"
-	"sort"
 
 	"github.com/gravitational/trace"
 
-	api "github.com/gravitational/teleport/lib/teleterm/api/protogen/golang/v1"
+	api "github.com/gravitational/teleport/gen/proto/go/teleport/lib/teleterm/v1"
 	"github.com/gravitational/teleport/lib/teleterm/clusters"
+	"github.com/gravitational/teleport/lib/ui"
 )
-
-// GetAllServers returns a full list of nodes without pagination or sorting.
-func (s *Handler) GetAllServers(ctx context.Context, req *api.GetAllServersRequest) (*api.GetAllServersResponse, error) {
-	servers, err := s.DaemonService.GetAllServers(ctx, req.ClusterUri)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	response := &api.GetAllServersResponse{}
-	for _, srv := range servers {
-		response.Servers = append(response.Servers, newAPIServer(srv))
-	}
-
-	return response, nil
-}
 
 // GetServers accepts parameterized input to enable searching, sorting, and pagination
 func (s *Handler) GetServers(ctx context.Context, req *api.GetServersRequest) (*api.GetServersResponse, error) {
@@ -58,24 +47,11 @@ func (s *Handler) GetServers(ctx context.Context, req *api.GetServersRequest) (*
 }
 
 func newAPIServer(server clusters.Server) *api.Server {
-	apiLabels := APILabels{}
 	serverLabels := server.GetStaticLabels()
-	for name, value := range serverLabels {
-		apiLabels = append(apiLabels, &api.Label{
-			Name:  name,
-			Value: value,
-		})
-	}
-
 	serverCmdLabels := server.GetCmdLabels()
-	for name, cmd := range serverCmdLabels {
-		apiLabels = append(apiLabels, &api.Label{
-			Name:  name,
-			Value: cmd.GetResult(),
-		})
-	}
-
-	sort.Sort(apiLabels)
+	apiLabels := makeAPILabels(
+		ui.MakeLabelsWithoutInternalPrefixes(serverLabels, ui.TransformCommandLabels(serverCmdLabels)),
+	)
 
 	return &api.Server{
 		Uri:      server.URI.String(),
@@ -83,6 +59,7 @@ func newAPIServer(server clusters.Server) *api.Server {
 		Name:     server.GetName(),
 		Hostname: server.GetHostname(),
 		Addr:     server.GetAddr(),
+		SubKind:  server.GetSubKind(),
 		Labels:   apiLabels,
 	}
 }

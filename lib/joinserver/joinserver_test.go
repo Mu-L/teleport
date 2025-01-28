@@ -1,23 +1,26 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package joinserver
 
 import (
 	"context"
+	"errors"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -26,6 +29,7 @@ import (
 
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -33,22 +37,60 @@ import (
 
 	"github.com/gravitational/teleport/api/client"
 	"github.com/gravitational/teleport/api/client/proto"
-	"github.com/gravitational/teleport/lib/utils"
+	"github.com/gravitational/teleport/api/types"
+	"github.com/gravitational/teleport/api/utils/grpc/interceptors"
 )
 
 type mockJoinServiceClient struct {
-	sendChallenge        string
-	returnCerts          *proto.Certs
-	returnError          error
-	gotChallengeResponse *proto.RegisterUsingIAMMethodRequest
+	sendChallenge             string
+	returnCerts               *proto.Certs
+	returnError               error
+	gotIAMChallengeResponse   *proto.RegisterUsingIAMMethodRequest
+	gotAzureChallengeResponse *proto.RegisterUsingAzureMethodRequest
+	gotTPMChallengeResponse   *proto.RegisterUsingTPMMethodChallengeResponse
+	gotTPMInitReq             *proto.RegisterUsingTPMMethodInitialRequest
+	gotRegisterUsingTokenReq  *types.RegisterUsingTokenRequest
 }
 
-func (c *mockJoinServiceClient) RegisterUsingIAMMethod(ctx context.Context, challengeResponse client.RegisterChallengeResponseFunc) (*proto.Certs, error) {
+func (c *mockJoinServiceClient) RegisterUsingIAMMethod(ctx context.Context, challengeResponse client.RegisterIAMChallengeResponseFunc) (*proto.Certs, error) {
 	resp, err := challengeResponse(c.sendChallenge)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	c.gotChallengeResponse = resp
+	c.gotIAMChallengeResponse = resp
+	return c.returnCerts, c.returnError
+}
+
+func (c *mockJoinServiceClient) RegisterUsingAzureMethod(ctx context.Context, challengeResponse client.RegisterAzureChallengeResponseFunc) (*proto.Certs, error) {
+	resp, err := challengeResponse(c.sendChallenge)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	c.gotAzureChallengeResponse = resp
+	return c.returnCerts, c.returnError
+}
+
+func (c *mockJoinServiceClient) RegisterUsingTPMMethod(
+	ctx context.Context,
+	initReq *proto.RegisterUsingTPMMethodInitialRequest,
+	challengeResponse client.RegisterTPMChallengeResponseFunc,
+) (*proto.Certs, error) {
+	c.gotTPMInitReq = initReq
+	resp, err := challengeResponse(&proto.TPMEncryptedCredential{
+		Secret: []byte(c.sendChallenge),
+	})
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	c.gotTPMChallengeResponse = resp
+	return c.returnCerts, c.returnError
+}
+
+func (c *mockJoinServiceClient) RegisterUsingToken(
+	ctx context.Context,
+	req *types.RegisterUsingTokenRequest,
+) (*proto.Certs, error) {
+	c.gotRegisterUsingTokenReq = req
 	return c.returnCerts, c.returnError
 }
 
@@ -63,8 +105,8 @@ func ConnectionCountingStreamInterceptor(count *atomic.Int32) grpc.StreamServerI
 func newGRPCServer(t *testing.T, opts ...grpc.ServerOption) (*grpc.Server, *bufconn.Listener) {
 	lis := bufconn.Listen(1024)
 	opts = append(opts,
-		grpc.ChainUnaryInterceptor(utils.GRPCServerUnaryErrorInterceptor),
-		grpc.ChainStreamInterceptor(utils.GRPCServerStreamErrorInterceptor),
+		grpc.ChainUnaryInterceptor(interceptors.GRPCServerUnaryErrorInterceptor),
+		grpc.ChainStreamInterceptor(interceptors.GRPCServerStreamErrorInterceptor),
 	)
 	s := grpc.NewServer(opts...)
 	return s, lis
@@ -161,16 +203,18 @@ func TestJoinServiceGRPCServer_RegisterUsingIAMMethod(t *testing.T) {
 		certs                *proto.Certs
 	}{
 		{
-			desc:              "pass case",
-			challenge:         "foo",
-			challengeResponse: &proto.RegisterUsingIAMMethodRequest{StsIdentityRequest: []byte("bar")},
-			certs:             &proto.Certs{SSH: []byte("baz")},
+			desc:      "pass case",
+			challenge: "foo",
+			challengeResponse: &proto.RegisterUsingIAMMethodRequest{StsIdentityRequest: []byte("bar"),
+				RegisterUsingTokenRequest: &types.RegisterUsingTokenRequest{}},
+			certs: &proto.Certs{SSH: []byte("baz")},
 		},
 		{
-			desc:              "auth error",
-			challenge:         "foo",
-			challengeResponse: &proto.RegisterUsingIAMMethodRequest{StsIdentityRequest: []byte("bar")},
-			authErr:           trace.AccessDenied("test auth error"),
+			desc:      "auth error",
+			challenge: "foo",
+			challengeResponse: &proto.RegisterUsingIAMMethodRequest{StsIdentityRequest: []byte("bar"),
+				RegisterUsingTokenRequest: &types.RegisterUsingTokenRequest{}},
+			authErr: trace.AccessDenied("test auth error"),
 		},
 		{
 			desc:                 "challenge response error",
@@ -211,8 +255,277 @@ func TestJoinServiceGRPCServer_RegisterUsingIAMMethod(t *testing.T) {
 					require.NoError(t, err)
 					// client should get the certs from auth
 					require.Equal(t, tc.certs, certs)
-					// auth should get the challenge response from client
-					require.Equal(t, tc.challengeResponse, testPack.mockAuthServer.gotChallengeResponse)
+					// auth should get the challenge response from client with remote addr set to connection src addr
+					expectedResponse := tc.challengeResponse
+					expectedResponse.RegisterUsingTokenRequest.RemoteAddr = "bufconn"
+					require.Equal(t, expectedResponse, testPack.mockAuthServer.gotIAMChallengeResponse)
+				})
+			}
+		})
+	}
+}
+
+func TestJoinServiceGRPCServer_RegisterUsingAzureMethod(t *testing.T) {
+	t.Parallel()
+	testPack := newTestPack(t)
+
+	testCases := []struct {
+		desc                 string
+		challenge            string
+		challengeResponse    *proto.RegisterUsingAzureMethodRequest
+		challengeResponseErr error
+		authErr              error
+		certs                *proto.Certs
+	}{
+		{
+			desc:      "pass case",
+			challenge: "foo",
+			challengeResponse: &proto.RegisterUsingAzureMethodRequest{AttestedData: []byte("bar"), AccessToken: "baz",
+				RegisterUsingTokenRequest: &types.RegisterUsingTokenRequest{}},
+			certs: &proto.Certs{SSH: []byte("qux")},
+		},
+		{
+			desc:      "auth error",
+			challenge: "foo",
+			challengeResponse: &proto.RegisterUsingAzureMethodRequest{AttestedData: []byte("bar"), AccessToken: "baz",
+				RegisterUsingTokenRequest: &types.RegisterUsingTokenRequest{}},
+			authErr: trace.AccessDenied("test auth error"),
+		},
+		{
+			desc:                 "challenge response error",
+			challenge:            "foo",
+			challengeResponseErr: trace.BadParameter("test challenge error"),
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.desc, func(t *testing.T) {
+			testPack.mockAuthServer.sendChallenge = tc.challenge
+			testPack.mockAuthServer.returnCerts = tc.certs
+			testPack.mockAuthServer.returnError = tc.authErr
+			challengeResponder := func(challenge string) (*proto.RegisterUsingAzureMethodRequest, error) {
+				require.Equal(t, tc.challenge, challenge)
+				return tc.challengeResponse, tc.challengeResponseErr
+			}
+
+			for suffix, clt := range map[string]*client.JoinServiceClient{
+				"_auth":  testPack.authClient,
+				"_proxy": testPack.proxyClient,
+			} {
+				t.Run(tc.desc+suffix, func(t *testing.T) {
+					certs, err := clt.RegisterUsingAzureMethod(context.Background(), challengeResponder)
+					if tc.challengeResponseErr != nil {
+						require.Equal(t, tc.challengeResponseErr, err)
+						return
+					}
+					if tc.authErr != nil {
+						require.Contains(t, err.Error(), tc.authErr.Error())
+						return
+					}
+					require.NoError(t, err)
+					require.Equal(t, tc.certs, certs)
+					expectedResponse := tc.challengeResponse
+					expectedResponse.RegisterUsingTokenRequest.RemoteAddr = "bufconn"
+					require.Equal(t, expectedResponse, testPack.mockAuthServer.gotAzureChallengeResponse)
+				})
+			}
+		})
+	}
+}
+
+func TestJoinServiceGRPCServer_RegisterUsingToken(t *testing.T) {
+	t.Parallel()
+	testPack := newTestPack(t)
+
+	testCases := []struct {
+		desc    string
+		req     *types.RegisterUsingTokenRequest
+		wantReq *types.RegisterUsingTokenRequest
+		authErr string
+		certs   *proto.Certs
+	}{
+		{
+			desc: "unauthenticated pass case",
+			req: &types.RegisterUsingTokenRequest{
+				Token: "xyzzy",
+			},
+			wantReq: &types.RegisterUsingTokenRequest{
+				Token:      "xyzzy",
+				RemoteAddr: "bufconn",
+			},
+			certs: &proto.Certs{SSH: []byte("qux")},
+		},
+		{
+			desc: "unauthenticated - faked metadata ignored",
+			req: &types.RegisterUsingTokenRequest{
+				Token:         "xyzzy",
+				RemoteAddr:    "mauahahh",
+				BotInstanceID: "123-456",
+				BotGeneration: 1337,
+			},
+			wantReq: &types.RegisterUsingTokenRequest{
+				Token:      "xyzzy",
+				RemoteAddr: "bufconn",
+			},
+			certs: &proto.Certs{SSH: []byte("qux")},
+		},
+		{
+			desc: "auth error",
+			req: &types.RegisterUsingTokenRequest{
+				Token: "xyzzy",
+			},
+			wantReq: &types.RegisterUsingTokenRequest{
+				Token:      "xyzzy",
+				RemoteAddr: "bufconn",
+			},
+			authErr: "test auth error",
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.desc, func(t *testing.T) {
+			testPack.mockAuthServer.returnCerts = tc.certs
+			if tc.authErr != "" {
+				testPack.mockAuthServer.returnError = errors.New(tc.authErr)
+			}
+
+			for suffix, clt := range map[string]*client.JoinServiceClient{
+				"_auth":  testPack.authClient,
+				"_proxy": testPack.proxyClient,
+			} {
+				t.Run(tc.desc+suffix, func(t *testing.T) {
+					certs, err := clt.RegisterUsingToken(
+						context.Background(),
+						tc.req,
+					)
+					if tc.authErr != "" {
+						require.ErrorContains(t, err, tc.authErr, "authErr mismatch")
+						return
+					}
+					if assert.NoError(t, err) {
+						assert.Equal(t, tc.certs, certs)
+					}
+					assert.Equal(
+						t,
+						tc.wantReq,
+						testPack.mockAuthServer.gotRegisterUsingTokenReq,
+					)
+				})
+			}
+		})
+	}
+}
+
+func TestJoinServiceGRPCServer_RegisterUsingTPMMethod(t *testing.T) {
+	t.Parallel()
+	testPack := newTestPack(t)
+
+	testCases := []struct {
+		desc                 string
+		challenge            string
+		initReq              *proto.RegisterUsingTPMMethodInitialRequest
+		challengeResponse    *proto.RegisterUsingTPMMethodChallengeResponse
+		challengeResponseErr error
+		authErr              string
+		certs                *proto.Certs
+	}{
+		{
+			desc: "pass case",
+			initReq: &proto.RegisterUsingTPMMethodInitialRequest{
+				Ek: &proto.RegisterUsingTPMMethodInitialRequest_EkKey{
+					EkKey: []byte("llama"),
+				},
+				JoinRequest: &types.RegisterUsingTokenRequest{
+					Token: "xyzzy",
+				},
+			},
+			challenge: "foo",
+			challengeResponse: &proto.RegisterUsingTPMMethodChallengeResponse{
+				Solution: []byte("bar"),
+			},
+			certs: &proto.Certs{SSH: []byte("qux")},
+		},
+		{
+			desc: "auth error",
+			initReq: &proto.RegisterUsingTPMMethodInitialRequest{
+				Ek: &proto.RegisterUsingTPMMethodInitialRequest_EkKey{
+					EkKey: []byte("llama"),
+				},
+				JoinRequest: &types.RegisterUsingTokenRequest{
+					Token: "xyzzy",
+				},
+			},
+			challenge: "foo",
+			challengeResponse: &proto.RegisterUsingTPMMethodChallengeResponse{
+				Solution: []byte("bar"),
+			},
+			authErr: "test auth error",
+		},
+		{
+			desc: "challenge response error",
+			initReq: &proto.RegisterUsingTPMMethodInitialRequest{
+				Ek: &proto.RegisterUsingTPMMethodInitialRequest_EkKey{
+					EkKey: []byte("llama"),
+				},
+				JoinRequest: &types.RegisterUsingTokenRequest{
+					Token: "xyzzy",
+				},
+			},
+			challenge:            "foo",
+			challengeResponseErr: trace.BadParameter("test challenge error"),
+		},
+		{
+			desc: "missing join request",
+			initReq: &proto.RegisterUsingTPMMethodInitialRequest{
+				Ek: &proto.RegisterUsingTPMMethodInitialRequest_EkKey{
+					EkKey: []byte("llama"),
+				},
+				JoinRequest: nil,
+			},
+			challenge: "foo",
+			authErr:   "expected JoinRequest in RegisterUsingTPMMethodRequest_Init, got nil",
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.desc, func(t *testing.T) {
+			testPack.mockAuthServer.sendChallenge = tc.challenge
+			testPack.mockAuthServer.returnCerts = tc.certs
+			if tc.authErr != "" {
+				testPack.mockAuthServer.returnError = errors.New(tc.authErr)
+			}
+			challengeResponder := func(
+				challenge *proto.TPMEncryptedCredential,
+			) (*proto.RegisterUsingTPMMethodChallengeResponse, error) {
+				assert.Equal(t, &proto.TPMEncryptedCredential{
+					Secret: []byte(tc.challenge),
+				}, challenge)
+				return tc.challengeResponse, tc.challengeResponseErr
+			}
+
+			for suffix, clt := range map[string]*client.JoinServiceClient{
+				"_auth":  testPack.authClient,
+				"_proxy": testPack.proxyClient,
+			} {
+				t.Run(tc.desc+suffix, func(t *testing.T) {
+					certs, err := clt.RegisterUsingTPMMethod(
+						context.Background(), tc.initReq, challengeResponder,
+					)
+					if tc.challengeResponseErr != nil {
+						require.ErrorIs(t, err, tc.challengeResponseErr)
+						return
+					}
+					if tc.authErr != "" {
+						require.ErrorContains(t, err, tc.authErr, "authErr mismatch")
+						return
+					}
+					if assert.NoError(t, err) {
+						assert.Equal(t, tc.certs, certs)
+					}
+					expectedInitReq := tc.initReq
+					expectedInitReq.JoinRequest.RemoteAddr = "bufconn"
+					assert.Equal(
+						t,
+						expectedInitReq,
+						testPack.mockAuthServer.gotTPMInitReq,
+					)
 				})
 			}
 		})

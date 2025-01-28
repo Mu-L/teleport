@@ -1,18 +1,20 @@
 /*
-Copyright 2015-2018 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package srv
 
@@ -29,8 +31,27 @@ import (
 	"github.com/gravitational/teleport"
 	apievents "github.com/gravitational/teleport/api/types/events"
 	"github.com/gravitational/teleport/lib/events"
+	"github.com/gravitational/teleport/lib/modules"
 	"github.com/gravitational/teleport/lib/sshutils"
+	"github.com/gravitational/teleport/lib/utils"
 )
+
+// TestMain will re-execute Teleport to run a command if "exec" is passed to
+// it as an argument. Otherwise, it will run tests as normal.
+func TestMain(m *testing.M) {
+	utils.InitLoggerForTests()
+	modules.SetInsecureTestMode(true)
+	// If the test is re-executing itself, execute the command that comes over
+	// the pipe.
+	if IsReexec() {
+		RunAndExit(os.Args[1])
+		return
+	}
+
+	// Otherwise run tests as normal.
+	code := m.Run()
+	os.Exit(code)
+}
 
 // TestEmitExecAuditEvent make sure the full command and exit code for a
 // command is always recorded.
@@ -43,24 +64,25 @@ func TestEmitExecAuditEvent(t *testing.T) {
 	rec, ok := scx.session.recorder.(*mockRecorder)
 	require.True(t, ok)
 
+	scx.GetServer().TargetMetadata()
+
 	expectedUsr, err := user.Current()
 	require.NoError(t, err)
-	expectedHostname, err := os.Hostname()
-	if err != nil {
-		expectedHostname = "localhost"
-	}
+	expectedHostname := "testHost"
+
 	expectedMeta := apievents.UserMetadata{
 		User:                 "teleportUser",
 		Login:                expectedUsr.Username,
 		Impersonator:         "",
 		AWSRoleARN:           "",
 		AccessRequests:       []string(nil),
+		UserKind:             apievents.UserKind_USER_KIND_HUMAN,
 		XXX_NoUnkeyedLiteral: struct{}{},
 		XXX_unrecognized:     []uint8(nil),
 		XXX_sizecache:        0,
 	}
 
-	var tests = []struct {
+	tests := []struct {
 		inCommand  string
 		inError    error
 		outCommand string
@@ -94,7 +116,8 @@ func TestEmitExecAuditEvent(t *testing.T) {
 		require.Equal(t, tt.outCommand, execEvent.Command)
 		require.Equal(t, tt.outCode, execEvent.ExitCode)
 		require.Equal(t, expectedMeta, execEvent.UserMetadata)
-		require.Equal(t, "testHostUUID", execEvent.ServerID)
+		require.Equal(t, "123", execEvent.ServerID)
+		require.Equal(t, "abc", execEvent.ForwardedBy)
 		require.Equal(t, expectedHostname, execEvent.ServerHostname)
 		require.Equal(t, "testNamespace", execEvent.ServerNamespace)
 		require.Equal(t, "xxx", execEvent.SessionID)
@@ -122,10 +145,12 @@ func newExecServerContext(t *testing.T, srv Server) *ServerContext {
 	require.NoError(t, err)
 	term.SetTermType("xterm")
 
+	rec := &mockRecorder{done: false}
 	scx.session = &session{
 		id:       "xxx",
 		term:     term,
-		recorder: &mockRecorder{done: false},
+		emitter:  rec,
+		recorder: rec,
 	}
 	err = scx.SetSSHRequest(&ssh.Request{Type: sshutils.ExecRequest})
 	require.NoError(t, err)

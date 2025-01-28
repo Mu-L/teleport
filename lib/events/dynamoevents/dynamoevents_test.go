@@ -1,25 +1,30 @@
 /*
-Copyright 2018 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package dynamoevents
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"strconv"
@@ -27,16 +32,21 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/google/go-cmp/cmp"
 	"github.com/google/uuid"
+	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/gravitational/teleport"
-	apidefaults "github.com/gravitational/teleport/api/defaults"
 	"github.com/gravitational/teleport/api/types"
 	apievents "github.com/gravitational/teleport/api/types/events"
 	"github.com/gravitational/teleport/lib/events"
 	"github.com/gravitational/teleport/lib/events/test"
+	"github.com/gravitational/teleport/lib/modules"
+	"github.com/gravitational/teleport/lib/session"
 	"github.com/gravitational/teleport/lib/utils"
 )
 
@@ -57,14 +67,14 @@ func setupDynamoContext(t *testing.T) *dynamoContext {
 	if ok, _ := strconv.ParseBool(testEnabled); !ok {
 		t.Skip("Skipping AWS-dependent test suite.")
 	}
-
-	fakeClock := clockwork.NewFakeClock()
+	fakeClock := clockwork.NewFakeClockAt(time.Now().UTC())
 
 	log, err := New(context.Background(), Config{
-		Region:       "eu-north-1",
-		Tablename:    fmt.Sprintf("teleport-test-%v", uuid.New().String()),
-		Clock:        fakeClock,
-		UIDGenerator: utils.NewFakeUID(),
+		Tablename:          fmt.Sprintf("teleport-test-%v", uuid.New().String()),
+		Clock:              fakeClock,
+		UIDGenerator:       utils.NewFakeUID(),
+		ReadCapacityUnits:  100,
+		WriteCapacityUnits: 100,
 	})
 	require.NoError(t, err)
 
@@ -110,7 +120,33 @@ func TestSessionEventsCRUD(t *testing.T) {
 func TestSearchSessionEvensBySessionID(t *testing.T) {
 	tt := setupDynamoContext(t)
 
-	tt.suite.SearchSessionEvensBySessionID(t)
+	tt.suite.SearchSessionEventsBySessionID(t)
+}
+
+// TestCheckpointOutsideOfWindow tests if [Log] doesn't panic
+// if checkpoint date is outside of the window [fromUTC,toUTC].
+func TestCheckpointOutsideOfWindow(t *testing.T) {
+	tt := &Log{}
+
+	key := checkpointKey{
+		Date: "2022-10-02",
+	}
+	keyB, err := json.Marshal(key)
+	require.NoError(t, err)
+
+	results, nextKey, err := tt.SearchEvents(
+		context.Background(),
+		events.SearchEventsRequest{
+			From:     time.Date(2021, 10, 10, 0, 0, 0, 0, time.UTC),
+			To:       time.Date(2021, 11, 10, 0, 0, 0, 0, time.UTC),
+			Limit:    100,
+			StartKey: string(keyB),
+			Order:    types.EventOrderAscending,
+		},
+	)
+	require.NoError(t, err)
+	require.Empty(t, results)
+	require.Empty(t, nextKey)
 }
 
 func TestSizeBreak(t *testing.T) {
@@ -135,20 +171,19 @@ func TestSizeBreak(t *testing.T) {
 	}
 
 	var checkpoint string
-	events := make([]apievents.AuditEvent, 0)
-
+	gotEvents := make([]apievents.AuditEvent, 0)
+	ctx := context.Background()
 	for {
-		fetched, lCheckpoint, err := tt.log.SearchEvents(
-			tt.suite.Clock.Now().UTC().Add(-time.Hour),
-			tt.suite.Clock.Now().UTC().Add(time.Hour),
-			apidefaults.Namespace,
-			nil,
-			eventCount,
-			types.EventOrderDescending,
-			checkpoint)
+		fetched, lCheckpoint, err := tt.log.SearchEvents(ctx, events.SearchEventsRequest{
+			From:     tt.suite.Clock.Now().UTC().Add(-time.Hour),
+			To:       tt.suite.Clock.Now().UTC().Add(time.Hour),
+			Limit:    eventCount,
+			Order:    types.EventOrderDescending,
+			StartKey: checkpoint,
+		})
 		require.NoError(t, err)
 		checkpoint = lCheckpoint
-		events = append(events, fetched...)
+		gotEvents = append(gotEvents, fetched...)
 
 		if checkpoint == "" {
 			break
@@ -157,7 +192,7 @@ func TestSizeBreak(t *testing.T) {
 
 	lastTime := tt.suite.Clock.Now().UTC().Add(time.Hour)
 
-	for _, event := range events {
+	for _, event := range gotEvents {
 		require.True(t, event.GetTime().Before(lastTime))
 		lastTime = event.GetTime()
 	}
@@ -202,7 +237,8 @@ func TestLargeTableRetrieve(t *testing.T) {
 			UserMetadata: apievents.UserMetadata{User: "bob"},
 			Metadata: apievents.Metadata{
 				Type: events.UserLoginEvent,
-				Time: tt.suite.Clock.Now().UTC()},
+				Time: tt.suite.Clock.Now().UTC(),
+			},
 		})
 		require.NoError(t, err)
 	}
@@ -211,17 +247,15 @@ func TestLargeTableRetrieve(t *testing.T) {
 		history []apievents.AuditEvent
 		err     error
 	)
+	ctx := context.Background()
 	for i := 0; i < dynamoDBLargeQueryRetries; i++ {
 		time.Sleep(tt.suite.QueryDelay)
 
-		history, _, err = tt.suite.Log.SearchEvents(
-			tt.suite.Clock.Now().Add(-1*time.Hour),
-			tt.suite.Clock.Now().Add(time.Hour),
-			apidefaults.Namespace,
-			nil,
-			0,
-			types.EventOrderAscending,
-			"")
+		history, _, err = tt.suite.Log.SearchEvents(ctx, events.SearchEventsRequest{
+			From:  tt.suite.Clock.Now().Add(-1 * time.Hour),
+			To:    tt.suite.Clock.Now().Add(time.Hour),
+			Order: types.EventOrderAscending,
+		})
 		require.NoError(t, err)
 
 		if len(history) == eventCount {
@@ -262,10 +296,10 @@ func TestEmitAuditEventForLargeEvents(t *testing.T) {
 	tt := setupDynamoContext(t)
 
 	ctx := context.Background()
-	now := tt.suite.Clock.Now()
+	now := tt.suite.Clock.Now().UTC()
 	dbQueryEvent := &apievents.DatabaseSessionQuery{
 		Metadata: apievents.Metadata{
-			Time: tt.suite.Clock.Now(),
+			Time: tt.suite.Clock.Now().UTC(),
 			Type: events.DatabaseSessionQueryEvent,
 		},
 		DatabaseQuery: strings.Repeat("A", maxItemSize),
@@ -273,26 +307,39 @@ func TestEmitAuditEventForLargeEvents(t *testing.T) {
 	err := tt.suite.Log.EmitAuditEvent(ctx, dbQueryEvent)
 	require.NoError(t, err)
 
-	result, _, err := tt.suite.Log.SearchEvents(
-		now.Add(-1*time.Hour),
-		now.Add(time.Hour),
-		apidefaults.Namespace,
-		[]string{events.DatabaseSessionQueryEvent},
-		0, types.EventOrderAscending,
-		"",
-	)
-	require.NoError(t, err)
-	require.Len(t, result, 1)
+	require.EventuallyWithT(t, func(t *assert.CollectT) {
+		result, _, err := tt.suite.Log.SearchEvents(ctx, events.SearchEventsRequest{
+			From:       now.Add(-1 * time.Hour),
+			To:         now.Add(time.Hour),
+			EventTypes: []string{events.DatabaseSessionQueryEvent},
+			Order:      types.EventOrderAscending,
+		})
+		assert.NoError(t, err)
+		assert.Len(t, result, 1)
+	}, 10*time.Second, 500*time.Millisecond)
 
-	appReqEvent := &apievents.AppSessionRequest{
-		Metadata: apievents.Metadata{
-			Time: tt.suite.Clock.Now(),
-			Type: events.AppSessionRequestEvent,
+	appReqEvent := &testAuditEvent{
+		AppSessionRequest: apievents.AppSessionRequest{
+			Metadata: apievents.Metadata{
+				Time: tt.suite.Clock.Now().UTC(),
+				Type: events.AppSessionRequestEvent,
+			},
+			Path: strings.Repeat("A", maxItemSize),
 		},
-		Path: strings.Repeat("A", maxItemSize),
 	}
 	err = tt.suite.Log.EmitAuditEvent(ctx, appReqEvent)
-	require.NoError(t, err)
+	require.ErrorContains(t, err, "ValidationException: Item size has exceeded the maximum allowed size")
+}
+
+// testAuditEvent wraps an existing AuditEvent, but overrides
+// the TrimToMaxSize to be a noop so that functionality can
+// be tested if an event exceeds the size limits.
+type testAuditEvent struct {
+	apievents.AppSessionRequest
+}
+
+func (t *testAuditEvent) TrimToMaxSize(maxSizeBytes int) apievents.AuditEvent {
+	return t
 }
 
 func TestConfig_SetFromURL(t *testing.T) {
@@ -347,7 +394,6 @@ func TestConfig_SetFromURL(t *testing.T) {
 
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
-
 			uri, err := url.Parse(tt.url)
 			require.NoError(t, err)
 			require.NoError(t, tt.cfg.SetFromURL(uri))
@@ -357,12 +403,282 @@ func TestConfig_SetFromURL(t *testing.T) {
 	}
 }
 
-var letterRunes = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+func TestConfig_CheckAndSetDefaults(t *testing.T) {
+	zero := types.NewDuration(0)
+	hour := types.NewDuration(time.Hour)
+
+	tests := []struct {
+		name        string
+		config      *Config
+		assertionFn func(t *testing.T, cfg *Config, err error)
+	}{
+		{
+			name:   "table name required",
+			config: &Config{},
+			assertionFn: func(t *testing.T, cfg *Config, err error) {
+				require.True(t, trace.IsBadParameter(err), "expected a bad parameter error, got %T", err)
+			},
+		},
+		{
+			name: "nil retention period uses default",
+			config: &Config{
+				Tablename:       "test",
+				RetentionPeriod: nil,
+			},
+			assertionFn: func(t *testing.T, cfg *Config, err error) {
+				require.NoError(t, err)
+				require.Equal(t, DefaultRetentionPeriod.Duration(), cfg.RetentionPeriod.Duration())
+			},
+		},
+		{
+			name: "zero retention period uses default",
+			config: &Config{
+				Tablename:       "test",
+				RetentionPeriod: &zero,
+			},
+			assertionFn: func(t *testing.T, cfg *Config, err error) {
+				require.NoError(t, err)
+				require.Equal(t, DefaultRetentionPeriod.Duration(), cfg.RetentionPeriod.Duration())
+			},
+		},
+		{
+			name: "supplied retention period is used",
+			config: &Config{
+				Tablename:       "test",
+				RetentionPeriod: &hour,
+			},
+			assertionFn: func(t *testing.T, cfg *Config, err error) {
+				require.NoError(t, err)
+				require.Equal(t, hour.Duration(), cfg.RetentionPeriod.Duration())
+			},
+		},
+		{
+			name:   "zero capacity uses defaults",
+			config: &Config{Tablename: "test"},
+			assertionFn: func(t *testing.T, cfg *Config, err error) {
+				require.NoError(t, err)
+				require.Equal(t, int64(DefaultReadCapacityUnits), cfg.ReadCapacityUnits)
+				require.Equal(t, int64(DefaultWriteCapacityUnits), cfg.WriteCapacityUnits)
+			},
+		},
+		{
+			name: "supplied capacity is used",
+			config: &Config{
+				Tablename:          "test",
+				ReadCapacityUnits:  1,
+				WriteCapacityUnits: 7,
+			},
+			assertionFn: func(t *testing.T, cfg *Config, err error) {
+				require.NoError(t, err)
+				require.Equal(t, int64(1), cfg.ReadCapacityUnits)
+				require.Equal(t, int64(7), cfg.WriteCapacityUnits)
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := test.config.CheckAndSetDefaults()
+			test.assertionFn(t, test.config, err)
+		})
+	}
+}
+
+// TestEmitSessionEventsSameIndex given events that share the same session ID
+// and index, the emit should succeed.
+func TestEmitSessionEventsSameIndex(t *testing.T) {
+	ctx := context.Background()
+	tt := setupDynamoContext(t)
+	sessionID := session.NewID()
+
+	require.NoError(t, tt.log.EmitAuditEvent(ctx, generateEvent(sessionID, 0, "")))
+	require.NoError(t, tt.log.EmitAuditEvent(ctx, generateEvent(sessionID, 1, "")))
+	require.NoError(t, tt.log.EmitAuditEvent(ctx, generateEvent(sessionID, 1, "")))
+}
+
+// TestSearchEventsLimitEndOfDay tests if the search events function can handle
+// moving the cursor to the next day when the limit is reached exactly at the
+// end of the day.
+// This only works if tests run against a real DynamoDB instance.
+func TestSearchEventsLimitEndOfDay(t *testing.T) {
+
+	ctx := context.Background()
+	tt := setupDynamoContext(t)
+	blob := "data"
+	const eventCount int = 10
+
+	// create events for two days
+	for dayDiff := 0; dayDiff < 2; dayDiff++ {
+		for i := 0; i < eventCount; i++ {
+			err := tt.suite.Log.EmitAuditEvent(ctx, &apievents.UserLogin{
+				Method:       events.LoginMethodSAML,
+				Status:       apievents.Status{Success: true},
+				UserMetadata: apievents.UserMetadata{User: "bob"},
+				Metadata: apievents.Metadata{
+					Type: events.UserLoginEvent,
+					Time: tt.suite.Clock.Now().UTC().Add(time.Hour*24*time.Duration(dayDiff) + time.Second*time.Duration(i)),
+				},
+				IdentityAttributes: apievents.MustEncodeMap(map[string]interface{}{"test.data": blob}),
+			})
+			require.NoError(t, err)
+		}
+	}
+
+	windowStart := time.Date(
+		tt.suite.Clock.Now().UTC().Year(),
+		tt.suite.Clock.Now().UTC().Month(),
+		tt.suite.Clock.Now().UTC().Day(),
+		0, /* hour */
+		0, /* minute */
+		0, /* second */
+		0, /* nanosecond */
+		time.UTC)
+	windowEnd := windowStart.Add(time.Hour * 24)
+
+	data, err := json.Marshal(checkpointKey{
+		Date: windowStart.Format("2006-01-02"),
+	})
+	require.NoError(t, err)
+	checkpoint := string(data)
+
+	var gotEvents []apievents.AuditEvent
+	for {
+		fetched, lCheckpoint, err := tt.log.SearchEvents(ctx, events.SearchEventsRequest{
+			From:     windowStart,
+			To:       windowEnd,
+			Limit:    eventCount,
+			Order:    types.EventOrderAscending,
+			StartKey: checkpoint,
+		})
+		require.NoError(t, err)
+		checkpoint = lCheckpoint
+		gotEvents = append(gotEvents, fetched...)
+
+		if checkpoint == "" {
+			break
+		}
+	}
+
+	require.Len(t, gotEvents, eventCount)
+	lastTime := tt.suite.Clock.Now().UTC().Add(-time.Hour)
+
+	for _, event := range gotEvents {
+		require.True(t, event.GetTime().After(lastTime))
+		lastTime = event.GetTime()
+	}
+}
+
+// TestValidationErrorsHandling given events that return validation
+// errors (large event size and already exists), the emit should handle them
+// and succeed on emitting the event when it does support trimming.
+func TestValidationErrorsHandling(t *testing.T) {
+	ctx := context.Background()
+	tt := setupDynamoContext(t)
+	sessionID := session.NewID()
+	largeQuery := strings.Repeat("A", maxItemSize)
+
+	// First write should only trigger the large event size
+	require.NoError(t, tt.log.EmitAuditEvent(ctx, generateEvent(sessionID, 0, largeQuery)))
+	// Second should trigger both errors.
+	require.NoError(t, tt.log.EmitAuditEvent(ctx, generateEvent(sessionID, 0, largeQuery)))
+}
+
+func generateEvent(sessionID session.ID, index int64, query string) apievents.AuditEvent {
+	return &apievents.DatabaseSessionQuery{
+		Metadata: apievents.Metadata{
+			Type:        events.DatabaseSessionQueryEvent,
+			ClusterName: "root",
+			Index:       index,
+		},
+		SessionMetadata: apievents.SessionMetadata{
+			SessionID: sessionID.String(),
+		},
+		DatabaseQuery: query,
+	}
+}
 
 func randStringAlpha(n int) string {
-	b := make([]rune, n)
+	const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+	b := make([]byte, n)
 	for i := range b {
-		b[i] = letterRunes[rand.Intn(len(letterRunes))]
+		b[i] = letters[rand.N(len(letters))]
 	}
 	return string(b)
+}
+
+func TestEndpoints(t *testing.T) {
+	tests := []struct {
+		name string
+		fips bool
+	}{
+		{
+			name: "fips",
+			fips: true,
+		},
+		{
+			name: "without fips",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+
+			fips := types.ClusterAuditConfigSpecV2_FIPS_DISABLED
+			if tt.fips {
+				fips = types.ClusterAuditConfigSpecV2_FIPS_ENABLED
+				modules.SetTestModules(t, &modules.TestModules{
+					FIPS: true,
+				})
+			}
+
+			mux := http.NewServeMux()
+			mux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusTeapot)
+			}))
+
+			server := httptest.NewServer(mux)
+			t.Cleanup(server.Close)
+
+			b, err := New(context.Background(), Config{
+				Region:       "us-west-1",
+				Tablename:    "teleport-test",
+				UIDGenerator: utils.NewFakeUID(),
+				// The prefix is intentionally removed to validate that a scheme
+				// is applied automatically. This validates backwards compatible behavior
+				// with existing configurations and the behavior change from aws-sdk-go to aws-sdk-go-v2.
+				Endpoint:        strings.TrimPrefix(server.URL, "http://"),
+				Insecure:        true,
+				UseFIPSEndpoint: fips,
+				CredentialsProvider: aws.CredentialsProviderFunc(func(ctx context.Context) (aws.Credentials, error) {
+					return aws.Credentials{}, nil
+				}),
+			})
+			// FIPS mode should fail because it is a violation to enable FIPS
+			// while also setting a custom endpoint.
+			if tt.fips {
+				assert.Error(t, err)
+				require.ErrorContains(t, err, "FIPS")
+				return
+			}
+
+			assert.Error(t, err)
+			assert.Nil(t, b)
+			require.ErrorContains(t, err, fmt.Sprintf("StatusCode: %d", http.StatusTeapot))
+		})
+	}
+}
+
+func TestStartKeyBackCompat(t *testing.T) {
+	const (
+		oldStartKey = `{"date":"2023-04-27","iterator":{"CreatedAt":{"B":null,"BOOL":null,"BS":null,"L":null,"M":null,"N":"1682583778","NS":null,"NULL":null,"S":null,"SS":null},"CreatedAtDate":{"B":null,"BOOL":null,"BS":null,"L":null,"M":null,"N":null,"NS":null,"NULL":null,"S":"2023-04-27","SS":null},"EventIndex":{"B":null,"BOOL":null,"BS":null,"L":null,"M":null,"N":"0","NS":null,"NULL":null,"S":null,"SS":null},"SessionID":{"B":null,"BOOL":null,"BS":null,"L":null,"M":null,"N":null,"NS":null,"NULL":null,"S":"4bc51fd7-4f0c-47ee-b9a5-da621fbdbabb","SS":null}}}`
+		newStartKey = `{"date":"2023-04-27","iterator":"{\"CreatedAt\":1682583778,\"CreatedAtDate\":\"2023-04-27\",\"EventIndex\":0,\"SessionID\":\"4bc51fd7-4f0c-47ee-b9a5-da621fbdbabb\"}"}`
+	)
+
+	oldCP, err := getCheckpointFromStartKey(oldStartKey)
+	require.NoError(t, err)
+
+	newCP, err := getCheckpointFromStartKey(newStartKey)
+	require.NoError(t, err)
+
+	require.Empty(t, cmp.Diff(oldCP, newCP))
 }

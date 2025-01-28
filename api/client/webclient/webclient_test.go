@@ -22,11 +22,16 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"slices"
+	"strings"
 	"testing"
+	"time"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/stretchr/testify/require"
 
 	"github.com/gravitational/teleport/api/defaults"
+	apihelpers "github.com/gravitational/teleport/api/testhelpers"
 )
 
 func newPingHandler(path string) http.Handler {
@@ -101,6 +106,55 @@ func TestPlainHttpFallback(t *testing.T) {
 				err = testCase.actionUnderTest(nonLoopbackSvr.Listener.Addr().String(), true /* insecure */)
 				require.Error(t, err)
 			})
+		})
+	}
+}
+
+func TestPingError(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		desc        string
+		writeBody   func(t *testing.T, w http.ResponseWriter)
+		errContains string
+	}{
+		{
+			desc: "unsuccessful response",
+			writeBody: func(t *testing.T, w http.ResponseWriter) {
+				err := json.NewEncoder(w).Encode(PingErrorResponse{Error: PingError{Message: "lorem ipsum"}})
+				require.NoError(t, err)
+			},
+			errContains: "lorem ipsum",
+		},
+		{
+			desc: "mangled response",
+			writeBody: func(t *testing.T, w http.ResponseWriter) {
+				_, err := w.Write([]byte("mangled lorem ipsum"))
+				require.NoError(t, err)
+			},
+			errContains: "invalid character",
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.desc, func(t *testing.T) {
+			handler := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				if req.RequestURI != "/webapi/ping" {
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusInternalServerError)
+				testCase.writeBody(t, w)
+			})
+			httpSvr := httptest.NewServer(handler)
+			defer httpSvr.Close()
+			proxyAddr := httpSvr.Listener.Addr().String()
+
+			_, err := Ping(
+				&Config{Context: context.Background(), ProxyAddr: proxyAddr, Insecure: true})
+			require.ErrorContains(t, err, testCase.errContains)
 		})
 	}
 }
@@ -320,36 +374,62 @@ func TestParse(t *testing.T) {
 	}
 }
 
-func TestNewWebClientRespectHTTPProxy(t *testing.T) {
-	t.Setenv("HTTPS_PROXY", "fakeproxy.example.com:9999")
-	client, err := newWebClient(&Config{
-		Context:   context.Background(),
-		ProxyAddr: "localhost:3080",
-	})
-	require.NoError(t, err)
-	//nolint:bodyclose // resp should be nil, so there will be no body to close.
-	resp, err := client.Get("https://fakedomain.example.com")
-	// Client should try to proxy through nonexistent server at localhost.
-	require.Error(t, err, "GET unexpectedly succeeded: %+v", resp)
-	require.Contains(t, err.Error(), "proxyconnect")
-	require.Contains(t, err.Error(), "lookup fakeproxy.example.com")
-	require.Contains(t, err.Error(), "no such host")
-}
+func TestNewWebClientHTTPProxy(t *testing.T) {
+	proxyHandler := &apihelpers.ProxyHandler{}
+	proxyServer := httptest.NewServer(proxyHandler)
+	t.Cleanup(proxyServer.Close)
 
-func TestNewWebClientNoProxy(t *testing.T) {
-	t.Setenv("HTTPS_PROXY", "fakeproxy.example.com:9999")
-	t.Setenv("NO_PROXY", "fakedomain.example.com")
-	client, err := newWebClient(&Config{
-		Context:   context.Background(),
-		ProxyAddr: "localhost:3080",
-	})
+	localIP, err := apihelpers.GetLocalIP()
 	require.NoError(t, err)
-	//nolint:bodyclose // resp should be nil, so there will be no body to close.
-	resp, err := client.Get("https://fakedomain.example.com")
-	require.Error(t, err, "GET unexpectedly succeeded: %+v", resp)
-	require.NotContains(t, err.Error(), "proxyconnect")
-	require.Contains(t, err.Error(), "lookup fakedomain.example.com")
-	require.Contains(t, err.Error(), "no such host")
+	server := apihelpers.MakeTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("hello"))
+	}), apihelpers.WithTestServerAddress(localIP))
+	_, serverPort, err := net.SplitHostPort(server.Listener.Addr().String())
+	require.NoError(t, err)
+	serverAddr := net.JoinHostPort(localIP, serverPort)
+	tests := []struct {
+		name               string
+		env                map[string]string
+		expectedProxyCount int
+	}{
+		{
+			name: "use http proxy",
+			env: map[string]string{
+				"HTTPS_PROXY": proxyServer.URL,
+			},
+			expectedProxyCount: 1,
+		},
+		{
+			name: "ignore proxy when no_proxy is set",
+			env: map[string]string{
+				"HTTPS_PROXY": proxyServer.URL,
+				"NO_PROXY":    "*",
+			},
+			expectedProxyCount: 0,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Cleanup(proxyHandler.Reset)
+			for k, v := range tc.env {
+				t.Setenv(k, v)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			t.Cleanup(cancel)
+			client, err := newWebClient(&Config{
+				Context:   ctx,
+				ProxyAddr: "localhost:3080", // addr doesn't matter, it won't be used
+				Insecure:  true,
+			})
+			require.NoError(t, err)
+
+			resp, err := client.Get("https://" + serverAddr)
+			require.NoError(t, err)
+			require.NoError(t, resp.Body.Close())
+			require.Equal(t, tc.expectedProxyCount, proxyHandler.Count())
+		})
+	}
 }
 
 func TestSSHProxyHostPort(t *testing.T) {
@@ -441,4 +521,63 @@ func TestSSHProxyHostPort(t *testing.T) {
 			require.Equal(t, test.outPort, port)
 		})
 	}
+}
+
+// TestWebClientClosesIdleConnections verifies that all http connections
+// are closed when the http.Client created by newWebClient is no longer
+// being used.
+func TestWebClientClosesIdleConnections(t *testing.T) {
+	expectedResponse := &PingResponse{
+		Proxy: ProxySettings{
+			TLSRoutingEnabled: true,
+		},
+		ServerVersion:    "1.2.3",
+		MinClientVersion: "0.1.2",
+		ClusterName:      "test",
+	}
+
+	expectedStates := []string{
+		http.StateNew.String(), http.StateActive.String(), http.StateClosed.String(), // the https request will fail and cause us to fallback to http
+		http.StateNew.String(), http.StateActive.String(), http.StateIdle.String(), http.StateClosed.String(), // the http request should be processed and closed
+	}
+
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/webapi/find":
+			json.NewEncoder(w).Encode(expectedResponse)
+		default:
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+
+	stateChange := make(chan string, len(expectedStates))
+	srv.Config.ConnState = func(conn net.Conn, state http.ConnState) {
+		stateChange <- state.String()
+	}
+
+	srv.Start()
+	t.Cleanup(srv.Close)
+
+	resp, err := Find(&Config{
+		Context:   context.Background(),
+		ProxyAddr: strings.TrimPrefix(srv.URL, "http://"),
+		Insecure:  true,
+	})
+	require.NoError(t, err)
+	require.Empty(t, cmp.Diff(expectedResponse, resp))
+
+	var got []string
+	for i := range expectedStates {
+		select {
+		case state := <-stateChange:
+			got = append(got, state)
+		case <-time.After(3 * time.Second):
+			t.Fatalf("timeout waiting for expected connection state %d", i)
+		}
+	}
+
+	slices.Sort(expectedStates)
+	slices.Sort(got)
+
+	require.Equal(t, expectedStates, got)
 }
