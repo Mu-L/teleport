@@ -18,10 +18,11 @@ package client
 
 import (
 	"context"
+	"io"
 	"testing"
 	"time"
 
-	"github.com/gravitational/trace"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/gravitational/teleport/api/client/proto"
@@ -32,7 +33,7 @@ import (
 // keep accidental breakage of the pipe abstraction from showing up in an obscure
 // way inside the tests that rely upon it.
 func TestInventoryControlStreamPipe(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.TODO())
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	upstream, downstream := InventoryControlStreamPipe()
@@ -100,5 +101,5 @@ func TestInventoryControlStreamPipe(t *testing.T) {
 		t.Fatal("timeout waiting for close")
 	}
 
-	require.True(t, trace.IsEOF(downstream.Error()))
+	assert.ErrorIs(t, downstream.Error(), io.EOF)
 }

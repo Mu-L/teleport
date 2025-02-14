@@ -1,18 +1,20 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package local
 
@@ -38,7 +40,7 @@ func NewKubernetesService(backend backend.Backend) *KubernetesService {
 
 // GetKubernetesClusters returns all kubernetes cluster resources.
 func (s *KubernetesService) GetKubernetesClusters(ctx context.Context) ([]types.KubeCluster, error) {
-	startKey := backend.Key(kubernetesPrefix)
+	startKey := backend.ExactKey(kubernetesPrefix)
 	result, err := s.GetRange(ctx, startKey, backend.RangeEnd(startKey), backend.NoLimit)
 	if err != nil {
 		return nil, trace.Wrap(err)
@@ -46,7 +48,7 @@ func (s *KubernetesService) GetKubernetesClusters(ctx context.Context) ([]types.
 	kubeClusters := make([]types.KubeCluster, len(result.Items))
 	for i, item := range result.Items {
 		cluster, err := services.UnmarshalKubeCluster(item.Value,
-			services.WithResourceID(item.ID), services.WithExpires(item.Expires))
+			services.WithExpires(item.Expires), services.WithRevision(item.Revision))
 		if err != nil {
 			return nil, trace.Wrap(err)
 		}
@@ -57,7 +59,7 @@ func (s *KubernetesService) GetKubernetesClusters(ctx context.Context) ([]types.
 
 // GetKubernetesCluster returns the specified kubernetes cluster resource.
 func (s *KubernetesService) GetKubernetesCluster(ctx context.Context, name string) (types.KubeCluster, error) {
-	item, err := s.Get(ctx, backend.Key(kubernetesPrefix, name))
+	item, err := s.Get(ctx, backend.NewKey(kubernetesPrefix, name))
 	if err != nil {
 		if trace.IsNotFound(err) {
 			return nil, trace.NotFound("kubernetes cluster %q doesn't exist", name)
@@ -65,7 +67,7 @@ func (s *KubernetesService) GetKubernetesCluster(ctx context.Context, name strin
 		return nil, trace.Wrap(err)
 	}
 	cluster, err := services.UnmarshalKubeCluster(item.Value,
-		services.WithResourceID(item.ID), services.WithExpires(item.Expires))
+		services.WithExpires(item.Expires), services.WithRevision(item.Revision))
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -74,7 +76,7 @@ func (s *KubernetesService) GetKubernetesCluster(ctx context.Context, name strin
 
 // CreateKubernetesCluster creates a new kubernetes cluster resource.
 func (s *KubernetesService) CreateKubernetesCluster(ctx context.Context, cluster types.KubeCluster) error {
-	if err := cluster.CheckAndSetDefaults(); err != nil {
+	if err := services.CheckAndSetDefaults(cluster); err != nil {
 		return trace.Wrap(err)
 	}
 	value, err := services.MarshalKubeCluster(cluster)
@@ -82,12 +84,15 @@ func (s *KubernetesService) CreateKubernetesCluster(ctx context.Context, cluster
 		return trace.Wrap(err)
 	}
 	item := backend.Item{
-		Key:     backend.Key(kubernetesPrefix, cluster.GetName()),
+		Key:     backend.NewKey(kubernetesPrefix, cluster.GetName()),
 		Value:   value,
 		Expires: cluster.Expiry(),
-		ID:      cluster.GetResourceID(),
 	}
 	_, err = s.Create(ctx, item)
+	if trace.IsAlreadyExists(err) {
+		return trace.AlreadyExists("kubernetes cluster %q already exists", cluster.GetName())
+	}
+
 	if err != nil {
 		return trace.Wrap(err)
 	}
@@ -96,20 +101,24 @@ func (s *KubernetesService) CreateKubernetesCluster(ctx context.Context, cluster
 
 // UpdateKubernetesCluster updates an existing kubernetes cluster resource.
 func (s *KubernetesService) UpdateKubernetesCluster(ctx context.Context, cluster types.KubeCluster) error {
-	if err := cluster.CheckAndSetDefaults(); err != nil {
+	if err := services.CheckAndSetDefaults(cluster); err != nil {
 		return trace.Wrap(err)
 	}
+	rev := cluster.GetRevision()
 	value, err := services.MarshalKubeCluster(cluster)
 	if err != nil {
 		return trace.Wrap(err)
 	}
 	item := backend.Item{
-		Key:     backend.Key(kubernetesPrefix, cluster.GetName()),
-		Value:   value,
-		Expires: cluster.Expiry(),
-		ID:      cluster.GetResourceID(),
+		Key:      backend.NewKey(kubernetesPrefix, cluster.GetName()),
+		Value:    value,
+		Expires:  cluster.Expiry(),
+		Revision: rev,
 	}
 	_, err = s.Update(ctx, item)
+	if trace.IsNotFound(err) {
+		return trace.NotFound("kubernetes cluster %q doesn't exist", cluster.GetName())
+	}
 	if err != nil {
 		return trace.Wrap(err)
 	}
@@ -118,7 +127,7 @@ func (s *KubernetesService) UpdateKubernetesCluster(ctx context.Context, cluster
 
 // DeleteKubernetesCluster removes the specified kubernetes cluster resource.
 func (s *KubernetesService) DeleteKubernetesCluster(ctx context.Context, name string) error {
-	err := s.Delete(ctx, backend.Key(kubernetesPrefix, name))
+	err := s.Delete(ctx, backend.NewKey(kubernetesPrefix, name))
 	if err != nil {
 		if trace.IsNotFound(err) {
 			return trace.NotFound("kubernetes cluster %q doesn't exist", name)
@@ -130,7 +139,7 @@ func (s *KubernetesService) DeleteKubernetesCluster(ctx context.Context, name st
 
 // DeleteAllKubernetesClusters removes all kubernetes cluster resources.
 func (s *KubernetesService) DeleteAllKubernetesClusters(ctx context.Context) error {
-	startKey := backend.Key(kubernetesPrefix)
+	startKey := backend.ExactKey(kubernetesPrefix)
 	err := s.DeleteRange(ctx, startKey, backend.RangeEnd(startKey))
 	if err != nil {
 		return trace.Wrap(err)

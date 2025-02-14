@@ -1,121 +1,143 @@
 /*
-Copyright 2016-2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package utils
 
 import (
 	"bytes"
+	"context"
 	"crypto/x509"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
-	stdlog "log"
-	"math"
+	"log/slog"
 	"os"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"unicode"
 
-	"github.com/gravitational/kingpin"
+	"github.com/alecthomas/kingpin/v2"
 	"github.com/gravitational/trace"
-	"github.com/sirupsen/logrus"
+	"golang.org/x/term"
 
 	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/api/constants"
 	"github.com/gravitational/teleport/api/types"
+	logutils "github.com/gravitational/teleport/lib/utils/log"
 )
 
+// LoggingPurpose specifies which kind of application logging is
+// to be configured for.
 type LoggingPurpose int
 
 const (
+	// LoggingForDaemon configures logging for non-user interactive applications (teleport, tbot, tsh deamon).
 	LoggingForDaemon LoggingPurpose = iota
+	// LoggingForCLI configures logging for user face utilities (tctl, tsh).
 	LoggingForCLI
 )
 
-// InitLogger configures the global logger for a given purpose / verbosity level
-func InitLogger(purpose LoggingPurpose, level logrus.Level, verbose ...bool) {
-	logrus.StandardLogger().ReplaceHooks(make(logrus.LevelHooks))
-	logrus.SetLevel(level)
-	switch purpose {
-	case LoggingForCLI:
-		// If debug logging was asked for on the CLI, then write logs to stderr.
-		// Otherwise, discard all logs.
-		if level == logrus.DebugLevel {
-			logrus.SetFormatter(NewDefaultTextFormatter(trace.IsTerminal(os.Stderr)))
-			logrus.SetOutput(os.Stderr)
-		} else {
-			logrus.SetOutput(io.Discard)
-		}
-	case LoggingForDaemon:
-		logrus.SetFormatter(NewDefaultTextFormatter(trace.IsTerminal(os.Stderr)))
-		logrus.SetOutput(os.Stderr)
+// LoggingFormat defines the possible logging output formats.
+type LoggingFormat = string
+
+const (
+	// LogFormatJSON configures logs to be emitted in json.
+	LogFormatJSON LoggingFormat = "json"
+	// LogFormatText configures logs to be emitted in a human readable text format.
+	LogFormatText LoggingFormat = "text"
+)
+
+type logOpts struct {
+	format LoggingFormat
+}
+
+// LoggerOption enables customizing the global logger.
+type LoggerOption func(opts *logOpts)
+
+// WithLogFormat initializes the default logger with the provided format.
+func WithLogFormat(format LoggingFormat) LoggerOption {
+	return func(opts *logOpts) {
+		opts.format = format
 	}
 }
+
+// IsTerminal checks whether writer is a terminal
+func IsTerminal(w io.Writer) bool {
+	switch v := w.(type) {
+	case *os.File:
+		return term.IsTerminal(int(v.Fd()))
+	default:
+		return false
+	}
+}
+
+// InitLogger configures the global logger for a given purpose / verbosity level
+func InitLogger(purpose LoggingPurpose, level slog.Level, opts ...LoggerOption) {
+	var o logOpts
+
+	for _, opt := range opts {
+		opt(&o)
+	}
+
+	// If debug or trace logging is not enabled for CLIs,
+	// then discard all log output.
+	if purpose == LoggingForCLI && level > slog.LevelDebug {
+		slog.SetDefault(slog.New(logutils.DiscardHandler{}))
+		return
+	}
+
+	logutils.Initialize(logutils.Config{
+		Severity:     level.String(),
+		Format:       o.format,
+		EnableColors: IsTerminal(os.Stderr),
+	})
+}
+
+var initTestLoggerOnce = sync.Once{}
 
 // InitLoggerForTests initializes the standard logger for tests.
 func InitLoggerForTests() {
-	// Parse flags to check testing.Verbose().
-	flag.Parse()
+	initTestLoggerOnce.Do(func() {
+		if !flag.Parsed() {
+			// Parse flags to check testing.Verbose().
+			flag.Parse()
+		}
 
-	logger := logrus.StandardLogger()
-	logger.ReplaceHooks(make(logrus.LevelHooks))
-	logrus.SetFormatter(NewTestJSONFormatter())
-	logger.SetLevel(logrus.DebugLevel)
-	logger.SetOutput(os.Stderr)
-	if testing.Verbose() {
-		return
-	}
-	logger.SetLevel(logrus.WarnLevel)
-	logger.SetOutput(io.Discard)
+		if !testing.Verbose() {
+			slog.SetDefault(slog.New(logutils.DiscardHandler{}))
+			return
+		}
+
+		logutils.Initialize(logutils.Config{
+			Severity: slog.LevelDebug.String(),
+			Format:   LogFormatJSON,
+		})
+	})
 }
 
-// NewLoggerForTests creates a new logger for test environment
-func NewLoggerForTests() *logrus.Logger {
-	logger := logrus.New()
-	logger.ReplaceHooks(make(logrus.LevelHooks))
-	logger.SetFormatter(NewTestJSONFormatter())
-	logger.SetLevel(logrus.DebugLevel)
-	logger.SetOutput(os.Stderr)
-	return logger
-}
-
-// WrapLogger wraps an existing logger entry and returns
-// an value satisfying the Logger interface
-func WrapLogger(logger *logrus.Entry) Logger {
-	return &logWrapper{Entry: logger}
-}
-
-// NewLogger creates a new empty logger
-func NewLogger() *logrus.Logger {
-	logger := logrus.New()
-	logger.SetFormatter(NewDefaultTextFormatter(trace.IsTerminal(os.Stderr)))
-	return logger
-}
-
-// Logger describes a logger value
-type Logger interface {
-	logrus.FieldLogger
-	// GetLevel specifies the level at which this logger
-	// value is logging
-	GetLevel() logrus.Level
-	// SetLevel sets the logger's level to the specified value
-	SetLevel(level logrus.Level)
+// NewSlogLoggerForTests creates a new slog logger for test environments.
+func NewSlogLoggerForTests() *slog.Logger {
+	InitLoggerForTests()
+	return slog.Default()
 }
 
 // FatalError is for CLI front-ends: it detects gravitational/trace debugging
@@ -136,7 +158,7 @@ func GetIterations() int {
 	if err != nil {
 		panic(err)
 	}
-	logrus.Debugf("Starting tests with %v iterations.", iter)
+	slog.DebugContext(context.Background(), "Running tests multiple times due to presence of ITERATIONS environment variable", "iterations", iter)
 	return iter
 }
 
@@ -147,7 +169,7 @@ func UserMessageFromError(err error) string {
 	if err == nil {
 		return ""
 	}
-	if logrus.GetLevel() == logrus.DebugLevel {
+	if slog.Default().Enabled(context.Background(), slog.LevelDebug) {
 		return trace.DebugReport(err)
 	}
 	var buf bytes.Buffer
@@ -168,19 +190,13 @@ func UserMessageFromError(err error) string {
 // The error message is escaped if necessary. A newline is added if the error text
 // does not end with a newline.
 func FormatErrorWithNewline(err error) string {
-	message := formatError(err)
+	var buf bytes.Buffer
+	formatErrorWriter(err, &buf)
+	message := buf.String()
 	if !strings.HasSuffix(message, "\n") {
 		message = message + "\n"
 	}
 	return message
-}
-
-// formatError returns user friendly error message from error.
-// The error message is escaped if necessary
-func formatError(err error) string {
-	var buf bytes.Buffer
-	formatErrorWriter(err, &buf)
-	return buf.String()
 }
 
 // formatErrorWriter formats the specified error into the provided writer.
@@ -193,22 +209,15 @@ func formatErrorWriter(err error, w io.Writer) {
 		fmt.Fprintln(w, certErr)
 		return
 	}
-	// If the error is a trace error, check if it has a user message embedded in
-	// it, if it does, print it, otherwise escape and print the original error.
-	if traceErr, ok := err.(*trace.TraceErr); ok {
-		for _, message := range traceErr.Messages {
-			fmt.Fprintln(w, AllowNewlines(message))
-		}
-		fmt.Fprintln(w, AllowNewlines(trace.Unwrap(traceErr).Error()))
+
+	msg := trace.UserMessage(err)
+	// Error can be of type trace.proxyError where error message didn't get captured.
+	if msg == "" {
+		fmt.Fprintln(w, "please check Teleport's log for more details")
 		return
 	}
-	strErr := err.Error()
-	// Error can be of type trace.proxyError where error message didn't get captured.
-	if strErr == "" {
-		fmt.Fprintln(w, "please check Teleport's log for more details")
-	} else {
-		fmt.Fprintln(w, AllowNewlines(err.Error()))
-	}
+
+	fmt.Fprintln(w, AllowWhitespace(msg))
 }
 
 func formatCertError(err error) string {
@@ -243,7 +252,7 @@ func formatCertError(err error) string {
 	}
 
 	var certInvalidErr x509.CertificateInvalidError
-	if errors.As(err, &x509.CertificateInvalidError{}) {
+	if errors.As(err, &certInvalidErr) {
 		return fmt.Sprintf(`WARNING:
 
   The certificate presented by the proxy is invalid: %v.
@@ -275,21 +284,6 @@ const (
 // Color formats the string in a terminal escape color
 func Color(color int, v interface{}) string {
 	return fmt.Sprintf("\x1b[%dm%v\x1b[0m", color, v)
-}
-
-// Consolef prints the same message to a 'ui console' (if defined) and also to
-// the logger with INFO priority
-func Consolef(w io.Writer, log logrus.FieldLogger, component, msg string, params ...interface{}) {
-	msg = fmt.Sprintf(msg, params...)
-	log.Info(msg)
-	if w != nil {
-		component := strings.ToUpper(component)
-		// 13 is the length of "[KUBERNETES]", which is the longest component
-		// name prefix we have *today*. Use a Max function here to avoid
-		// negative spacing, in case we add longer component names.
-		spacing := int(math.Max(float64(12-len(component)), 0))
-		fmt.Fprintf(w, "[%v]%v %v\n", strings.ToUpper(component), strings.Repeat(" ", spacing), msg)
-	}
 }
 
 // InitCLIParser configures kingpin command line args parser with
@@ -324,25 +318,38 @@ func createUsageTemplate(opts ...func(*usageTemplateOptions)) string {
 // pre-parsing the arguments then applying any changes to the usage template if
 // necessary.
 func UpdateAppUsageTemplate(app *kingpin.Application, args []string) {
-	// If ParseContext fails, kingpin will not show usage so there is no need
-	// to update anything here. See app.Parse for more details.
-	context, err := app.ParseContext(args)
-	if err != nil {
-		return
-	}
-
 	app.UsageTemplate(createUsageTemplate(
-		withCommandPrintfWidth(app, context),
+		withCommandPrintfWidth(app, args),
 	))
 }
 
-// withCommandPrintfWidth returns an usage template option that
+// withCommandPrintfWidth returns a usage template option that
 // updates command printf width if longer than default.
-func withCommandPrintfWidth(app *kingpin.Application, context *kingpin.ParseContext) func(*usageTemplateOptions) {
+func withCommandPrintfWidth(app *kingpin.Application, args []string) func(*usageTemplateOptions) {
 	return func(opt *usageTemplateOptions) {
 		var commands []*kingpin.CmdModel
-		if context.SelectedCommand != nil {
-			commands = context.SelectedCommand.Model().FlattenedCommands()
+
+		// When selected command is "help", skip the "help" arg
+		// so the intended command is selected for calculation.
+		if len(args) > 0 && args[0] == "help" {
+			args = args[1:]
+		}
+
+		appContext, err := app.ParseContext(args)
+		switch {
+		case appContext == nil:
+			slog.WarnContext(context.Background(), "No application context found")
+			return
+
+		// Note that ParseContext may return the current selected command that's
+		// causing the error. We should continue in those cases when appContext is
+		// not nil.
+		case err != nil:
+			slog.InfoContext(context.Background(), "Error parsing application context", "error", err)
+		}
+
+		if appContext.SelectedCommand != nil {
+			commands = appContext.SelectedCommand.Model().FlattenedCommands()
 		} else {
 			commands = app.Model().FlattenedCommands()
 		}
@@ -374,60 +381,47 @@ func EscapeControl(s string) string {
 	return s
 }
 
-// AllowNewlines escapes all ANSI escape sequences except newlines from string and returns a
-// string that is safe to print on the CLI. This is to ensure that malicious
-// servers can not hide output. For more details, see:
+// isAllowedWhitespace is a helper function for cli output escaping that returns
+// true if a given rune is a whitespace character and allowed to be unescaped.
+func isAllowedWhitespace(r rune) bool {
+	switch r {
+	case '\n', '\t', '\v':
+		// newlines, tabs, vertical tabs are allowed whitespace.
+		return true
+	}
+	return false
+}
+
+// AllowWhitespace escapes all ANSI escape sequences except some whitespace
+// characters (\n \t \v) from string and returns a string that is safe to
+// print on the CLI. This is to ensure that malicious servers can not hide
+// output. For more details, see:
 //   - https://sintonen.fi/advisories/scp-client-multiple-vulnerabilities.txt
-func AllowNewlines(s string) string {
-	if !strings.Contains(s, "\n") {
-		return EscapeControl(s)
+func AllowWhitespace(s string) string {
+	// loop over string searching for part to escape followed by allowed char.
+	// example: `\tabc\ndef\t\n`
+	// 1. part: ""    sep: "\t"
+	// 2. part: "abc" sep: "\n"
+	// 3. part: "def" sep: "\t"
+	// 4. part: ""    sep: "\n"
+	var sb strings.Builder
+	// note that increment also happens at bottom of loop because we can
+	// safely jump to place where allowedWhitespace was found.
+	for i := 0; i < len(s); i++ {
+		sepIdx := strings.IndexFunc(s[i:], isAllowedWhitespace)
+		if sepIdx == -1 {
+			// infalliable call, ignore error.
+			_, _ = sb.WriteString(EscapeControl(s[i:]))
+			// no separators remain.
+			break
+		}
+		part := EscapeControl(s[i : i+sepIdx])
+		_, _ = sb.WriteString(part)
+		sep := s[i+sepIdx]
+		_ = sb.WriteByte(sep)
+		i += sepIdx
 	}
-	parts := strings.Split(s, "\n")
-	for i, part := range parts {
-		parts[i] = EscapeControl(part)
-	}
-	return strings.Join(parts, "\n")
-}
-
-// NewStdlogger creates a new stdlib logger that uses the specified leveled logger
-// for output and the given component as a logging prefix.
-func NewStdlogger(logger LeveledOutputFunc, component string) *stdlog.Logger {
-	return stdlog.New(&stdlogAdapter{
-		log: logger,
-	}, component, stdlog.LstdFlags)
-}
-
-// Write writes the specified buffer p to the underlying leveled logger.
-// Implements io.Writer
-func (r *stdlogAdapter) Write(p []byte) (n int, err error) {
-	r.log(string(p))
-	return len(p), nil
-}
-
-// stdlogAdapter is an io.Writer that writes into an instance
-// of logrus.Logger
-type stdlogAdapter struct {
-	log LeveledOutputFunc
-}
-
-// LeveledOutputFunc describes a function that emits given
-// arguments at a specific level to an underlying logger
-type LeveledOutputFunc func(args ...interface{})
-
-// GetLevel returns the level of the underlying logger
-func (r *logWrapper) GetLevel() logrus.Level {
-	return r.Entry.Logger.GetLevel()
-}
-
-// SetLevel sets the logging level to the given value
-func (r *logWrapper) SetLevel(level logrus.Level) {
-	r.Entry.Logger.SetLevel(level)
-}
-
-// logWrapper wraps a log entry.
-// Implements Logger
-type logWrapper struct {
-	*logrus.Entry
+	return sb.String()
 }
 
 // needsQuoting returns true if any non-printable characters are found.
@@ -452,60 +446,60 @@ const defaultCommandPrintfWidth = 12
 
 // defaultUsageTemplate is a fmt format that defines the usage template with
 // compactly formatted commands. Should be only used in createUsageTemplate.
-const defaultUsageTemplate = `{{define "FormatCommand"}}\
-{{if .FlagSummary}} {{.FlagSummary}}{{end}}\
-{{range .Args}} {{if not .Required}}[{{end}}<{{.Name}}>{{if .Value|IsCumulative}}...{{end}}{{if not .Required}}]{{end}}{{end}}\
-{{end}}\
+const defaultUsageTemplate = `{{define "FormatCommand" -}}
+{{if .FlagSummary}} {{.FlagSummary}}{{end -}}
+{{range .Args}} {{if not .Required}}[{{end}}<{{.Name}}>{{if .Value|IsCumulative}}...{{end}}{{if not .Required}}]{{end}}{{end -}}
+{{end -}}
 
-{{define "FormatCommands"}}\
-{{range .FlattenedCommands}}\
-{{if not .Hidden}}\
-  {{.FullCommand | printf "%%-%ds"}}{{if .Default}} (Default){{end}} {{ .Help }}
-{{end}}\
-{{end}}\
-{{end}}\
+{{define "FormatCommands" -}}
+{{range .FlattenedCommands -}}
+{{if not .Hidden -}}
+{{"  "}}{{.FullCommand | printf "%%-%ds"}}{{if .Default}} (Default){{end}} {{ .Help }}
+{{end -}}
+{{end -}}
+{{end -}}
 
-{{define "FormatUsage"}}\
+{{define "FormatUsage" -}}
 {{template "FormatCommand" .}}{{if .Commands}} <command> [<args> ...]{{end}}
 {{if .Help}}
-{{.Help|Wrap 0}}\
-{{end}}\
+{{.Help|Wrap 0 -}}
+{{end -}}
 
-{{end}}\
+{{end -}}
 
-{{if .Context.SelectedCommand}}\
+{{if .Context.SelectedCommand -}}
 usage: {{.App.Name}} {{.Context.SelectedCommand}}{{template "FormatUsage" .Context.SelectedCommand}}
-{{else}}\
+{{else -}}
 Usage: {{.App.Name}}{{template "FormatUsage" .App}}
-{{end}}\
-{{if .Context.Flags}}\
+{{end -}}
+{{if .Context.Flags -}}
 Flags:
 {{.Context.Flags|FlagsToTwoColumnsCompact|FormatTwoColumns}}
-{{end}}\
-{{if .Context.Args}}\
+{{end -}}
+{{if .Context.Args -}}
 Args:
 {{.Context.Args|ArgsToTwoColumns|FormatTwoColumns}}
-{{end}}\
-{{if .Context.SelectedCommand}}\
+{{end -}}
+{{if .Context.SelectedCommand -}}
 
-{{ if .Context.SelectedCommand.Commands}}\
+{{ if .Context.SelectedCommand.Commands -}}
 Commands:
-{{if .Context.SelectedCommand.Commands}}\
+{{if .Context.SelectedCommand.Commands -}}
 {{template "FormatCommands" .Context.SelectedCommand}}
-{{end}}\
-{{end}}\
+{{end -}}
+{{end -}}
 
-{{else if .App.Commands}}\
+{{else if .App.Commands -}}
 Commands:
 {{template "FormatCommands" .App}}
 Try '{{.App.Name}} help [command]' to get help for a given command.
-{{end}}\
+{{end -}}
 
-{{ if .Context.SelectedCommand }}\
+{{ if .Context.SelectedCommand  -}}
 Aliases:
-{{ range .Context.SelectedCommand.Aliases}}\
+{{ range .Context.SelectedCommand.Aliases -}}
 {{ . }}
-{{end}}\
+{{end -}}
 {{end}}
 `
 
@@ -520,7 +514,7 @@ type PredicateError struct {
 }
 
 func (p PredicateError) Error() string {
-	return fmt.Sprintf("%s\nCheck syntax at https://goteleport.com/docs/setup/reference/predicate-language/#resource-filtering", p.Err.Error())
+	return fmt.Sprintf("%s\nCheck syntax at https://goteleport.com/docs/reference/predicate-language/#resource-filtering", p.Err.Error())
 }
 
 // FormatAlert formats and colors the alert message if possible.

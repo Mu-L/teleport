@@ -1,35 +1,36 @@
 /*
-Copyright 2015-2019 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package utils
 
 import (
 	"bytes"
-	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/gravitational/trace"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/gravitational/teleport/api/utils/keys"
 	"github.com/gravitational/teleport/lib/fixtures"
 	"github.com/gravitational/teleport/lib/utils/cert"
 )
@@ -39,62 +40,16 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-func TestHostUUIDIdempotent(t *testing.T) {
-	t.Parallel()
-
-	// call twice, get same result
-	dir := t.TempDir()
-	id, err := ReadOrMakeHostUUID(dir)
-	require.Len(t, id, 36)
-	require.NoError(t, err)
-	uuidCopy, err := ReadOrMakeHostUUID(dir)
-	require.NoError(t, err)
-	require.Equal(t, id, uuidCopy)
-}
-
-func TestHostUUIDBadLocation(t *testing.T) {
-	t.Parallel()
-
-	// call with a read-only dir, make sure to get an error
-	id, err := ReadOrMakeHostUUID("/bad-location")
-	require.Equal(t, id, "")
-	require.Error(t, err)
-	require.Regexp(t, "^.*no such file or directory.*$", err.Error())
-}
-
-func TestHostUUIDIgnoreWhitespace(t *testing.T) {
-	t.Parallel()
-
-	// newlines are getting ignored
-	dir := t.TempDir()
-	id := fmt.Sprintf("%s\n", uuid.NewString())
-	err := os.WriteFile(filepath.Join(dir, HostUUIDFile), []byte(id), 0666)
-	require.NoError(t, err)
-	out, err := ReadHostUUID(dir)
-	require.NoError(t, err)
-	require.Equal(t, strings.TrimSpace(id), out)
-}
-
-func TestHostUUIDRegenerateEmpty(t *testing.T) {
-	t.Parallel()
-
-	// empty UUID in file is regenerated
-	dir := t.TempDir()
-	err := os.WriteFile(filepath.Join(dir, HostUUIDFile), nil, 0666)
-	require.NoError(t, err)
-	out, err := ReadOrMakeHostUUID(dir)
-	require.NoError(t, err)
-	require.Len(t, out, 36)
-}
-
 func TestSelfSignedCert(t *testing.T) {
 	t.Parallel()
 
-	creds, err := cert.GenerateSelfSignedCert([]string{"example.com"})
+	creds, err := cert.GenerateSelfSignedCert([]string{"example.com"}, nil)
 	require.NoError(t, err)
-	require.NotNil(t, creds)
-	require.Equal(t, 4, len(creds.PublicKey)/100)
-	require.Equal(t, 16, len(creds.PrivateKey)/100)
+	signer, err := keys.ParsePrivateKey(creds.PrivateKey)
+	require.NoError(t, err)
+	pub, err := keys.ParsePublicKey(creds.PublicKey)
+	require.NoError(t, err)
+	require.Equal(t, signer.Public(), pub)
 }
 
 func TestRandomDuration(t *testing.T) {
@@ -104,8 +59,8 @@ func TestRandomDuration(t *testing.T) {
 	expectedMax := time.Second * 10
 	for i := 0; i < 50; i++ {
 		dur := RandomDuration(expectedMax)
-		require.True(t, dur >= expectedMin)
-		require.True(t, dur < expectedMax)
+		require.GreaterOrEqual(t, dur, expectedMin)
+		require.Less(t, dur, expectedMax)
 	}
 }
 
@@ -131,8 +86,8 @@ func TestRemoveFromSlice(t *testing.T) {
 	}
 }
 
-// TestVersions tests versions compatibility checking
-func TestVersions(t *testing.T) {
+// TestMinVersions tests versions compatibility checking
+func TestMinVersions(t *testing.T) {
 	t.Parallel()
 
 	type tc struct {
@@ -147,7 +102,8 @@ func TestVersions(t *testing.T) {
 	}
 	for _, testCase := range successTestCases {
 		t.Run(testCase.info, func(t *testing.T) {
-			require.NoError(t, CheckVersion(testCase.client, testCase.minClient))
+			require.NoError(t, CheckMinVersion(testCase.client, testCase.minClient))
+			assert.True(t, MeetsMinVersion(testCase.client, testCase.minClient), "MeetsMinVersion expected to succeed")
 		})
 	}
 
@@ -157,7 +113,41 @@ func TestVersions(t *testing.T) {
 	}
 	for _, testCase := range failTestCases {
 		t.Run(testCase.info, func(t *testing.T) {
-			fixtures.AssertBadParameter(t, CheckVersion(testCase.client, testCase.minClient))
+			fixtures.AssertBadParameter(t, CheckMinVersion(testCase.client, testCase.minClient))
+			assert.False(t, MeetsMinVersion(testCase.client, testCase.minClient), "MeetsMinVersion expected to fail")
+		})
+	}
+}
+
+// TestMaxVersions tests versions compatibility checking
+func TestMaxVersions(t *testing.T) {
+	t.Parallel()
+
+	type tc struct {
+		info      string
+		client    string
+		maxClient string
+	}
+	successTestCases := []tc{
+		{info: "client same as max version", client: "1.0.0", maxClient: "1.0.0"},
+		{info: "client older than max version", client: "1.1.0", maxClient: "1.2.0"},
+		{info: "pre-releases clients are ok", client: "1.0.0-alpha.1", maxClient: "1.0.0"},
+	}
+	for _, testCase := range successTestCases {
+		t.Run(testCase.info, func(t *testing.T) {
+			require.NoError(t, CheckMaxVersion(testCase.client, testCase.maxClient))
+			assert.True(t, MeetsMaxVersion(testCase.client, testCase.maxClient), "MeetsMinVersion expected to succeed")
+		})
+	}
+
+	failTestCases := []tc{
+		{info: "client newer than max version", client: "1.3.0", maxClient: "1.1.0"},
+		{info: "newer pre-releases are no ok", client: "1.1.0", maxClient: "1.1.0-alpha.1"},
+	}
+	for _, testCase := range failTestCases {
+		t.Run(testCase.info, func(t *testing.T) {
+			fixtures.AssertBadParameter(t, CheckMaxVersion(testCase.client, testCase.maxClient))
+			assert.False(t, MeetsMaxVersion(testCase.client, testCase.maxClient), "MeetsMinVersion expected to fail")
 		})
 	}
 }
@@ -176,6 +166,7 @@ func TestClickableURL(t *testing.T) {
 		{info: "unspecified IPV4", in: "http://0.0.0.0:5050/howdy", out: "http://127.0.0.1:5050/howdy"},
 		{info: "specified IPV4", in: "http://192.168.1.1:5050/howdy", out: "http://192.168.1.1:5050/howdy"},
 		{info: "specified IPV6", in: "http://[2001:0db8:85a3:0000:0000:8a2e:0370:7334]:5050/howdy", out: "http://[2001:0db8:85a3:0000:0000:8a2e:0370:7334]:5050/howdy"},
+		{info: "hostname", in: "http://example.com:3000/howdy", out: "http://example.com:3000/howdy"},
 	}
 	for _, testCase := range testCases {
 		t.Run(testCase.info, func(t *testing.T) {
@@ -280,6 +271,16 @@ func TestIsValidHostname(t *testing.T) {
 			assert:   require.True,
 		},
 		{
+			name:     "only lower case works",
+			hostname: "only-lower-case-works",
+			assert:   require.True,
+		},
+		{
+			name:     "mixed upper case fails",
+			hostname: "mixed-UPPER-CASE-fails",
+			assert:   require.False,
+		},
+		{
 			name:     "one component",
 			hostname: "example",
 			assert:   require.True,
@@ -341,21 +342,21 @@ func TestReplaceRegexp(t *testing.T) {
 			expr:    "value",
 			replace: "value",
 			in:      "val",
-			err:     trace.NotFound(""),
+			err:     ErrReplaceRegexNotFound,
 		},
 		{
 			comment: "empty value is no match",
 			expr:    "",
 			replace: "value",
 			in:      "value",
-			err:     trace.NotFound(""),
+			err:     ErrReplaceRegexNotFound,
 		},
 		{
 			comment: "bad regexp results in bad parameter error",
 			expr:    "^(($",
 			replace: "value",
 			in:      "val",
-			err:     trace.BadParameter(""),
+			err:     &trace.BadParameterError{Message: "error parsing regexp: missing closing ): `^(($`"},
 		},
 		{
 			comment: "full match is supported",
@@ -414,7 +415,7 @@ func TestReplaceRegexp(t *testing.T) {
 				require.NoError(t, err)
 				require.Equal(t, testCase.out, out)
 			} else {
-				require.IsType(t, testCase.err, err)
+				require.ErrorIs(t, err, testCase.err)
 			}
 		})
 	}
@@ -552,47 +553,8 @@ func TestStringsSet(t *testing.T) {
 	t.Parallel()
 
 	out := StringsSet(nil)
-	require.Len(t, out, 0)
+	require.Empty(t, out)
 	require.NotNil(t, out)
-}
-
-// TestRepeatReader tests repeat reader
-func TestRepeatReader(t *testing.T) {
-	t.Parallel()
-
-	type tc struct {
-		name     string
-		repeat   byte
-		count    int
-		expected string
-	}
-	tcs := []tc{
-		{
-			name:     "repeat once",
-			repeat:   byte('a'),
-			count:    1,
-			expected: "a",
-		},
-		{
-			name:     "repeat zero times",
-			repeat:   byte('a'),
-			count:    0,
-			expected: "",
-		},
-		{
-			name:     "repeat multiple times",
-			repeat:   byte('a'),
-			count:    3,
-			expected: "aaa",
-		},
-	}
-	for _, tc := range tcs {
-		t.Run(tc.name, func(t *testing.T) {
-			data, err := io.ReadAll(NewRepeatReader(tc.repeat, tc.count))
-			require.NoError(t, err)
-			require.Equal(t, tc.expected, string(data))
-		})
-	}
 }
 
 func TestReadAtMost(t *testing.T) {
@@ -615,6 +577,56 @@ func TestReadAtMost(t *testing.T) {
 			data, err := ReadAtMost(r, tc.limit)
 			require.Equal(t, []byte(tc.data), data)
 			require.ErrorIs(t, err, tc.err)
+		})
+	}
+}
+
+func TestByteCount(t *testing.T) {
+	tt := []struct {
+		name     string
+		size     int64
+		expected string
+	}{
+		{
+			name:     "1 byte",
+			size:     1,
+			expected: "1 B",
+		},
+		{
+			name:     "2 byte2",
+			size:     2,
+			expected: "2 B",
+		},
+		{
+			name:     "1kb",
+			size:     1000,
+			expected: "1.0 kB",
+		},
+		{
+			name:     "1mb",
+			size:     1000_000,
+			expected: "1.0 MB",
+		},
+		{
+			name:     "1gb",
+			size:     1000_000_000,
+			expected: "1.0 GB",
+		},
+		{
+			name:     "1tb",
+			size:     1000_000_000_000,
+			expected: "1.0 TB",
+		},
+		{
+			name:     "1.6 kb",
+			size:     1600,
+			expected: "1.6 kB",
+		},
+	}
+
+	for _, tc := range tt {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.expected, ByteCount(tc.size))
 		})
 	}
 }

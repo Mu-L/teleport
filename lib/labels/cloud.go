@@ -1,32 +1,38 @@
 /*
-Copyright 2022 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-	http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
 package labels
 
 import (
+	"cmp"
 	"context"
 	"fmt"
+	"log/slog"
+	"maps"
 	"sync"
 	"time"
 
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
-	"github.com/sirupsen/logrus"
 
+	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/api/types"
-	"github.com/gravitational/teleport/lib/cloud"
+	"github.com/gravitational/teleport/lib/cloud/imds"
 )
 
 const (
@@ -36,6 +42,9 @@ const (
 	// AzureLabelNamespace is used as the namespace prefix for any labels
 	// imported from Azure.
 	AzureLabelNamespace = "azure"
+	// GCPLabelNamespace is used as the namespace prefix for any labels imported
+	// from GCP.
+	GCPLabelNamespace = "gcp"
 	// labelUpdatePeriod is the period for updating cloud labels.
 	labelUpdatePeriod = time.Hour
 )
@@ -43,13 +52,14 @@ const (
 const (
 	awsErrorMessage   = "Could not fetch EC2 instance's tags, please ensure 'allow instance tags in metadata' is enabled on the instance."
 	azureErrorMessage = "Could not fetch Azure instance's tags."
+	gcpErrorMessage   = "Could not fetch GCP instance's labels, please ensure instance's service principal has read access to instances."
 )
 
 // CloudConfig is the configuration for a cloud label service.
 type CloudConfig struct {
-	Client               cloud.InstanceMetadata
+	Client               imds.Client
 	Clock                clockwork.Clock
-	Log                  logrus.FieldLogger
+	Log                  *slog.Logger
 	namespace            string
 	instanceMetadataHint string
 }
@@ -58,12 +68,9 @@ func (conf *CloudConfig) checkAndSetDefaults() error {
 	if conf.Client == nil {
 		return trace.BadParameter("missing parameter: Client")
 	}
-	if conf.Clock == nil {
-		conf.Clock = clockwork.NewRealClock()
-	}
-	if conf.Log == nil {
-		conf.Log = logrus.WithField(trace.Component, "cloudlabels")
-	}
+
+	conf.Clock = cmp.Or(conf.Clock, clockwork.NewRealClock())
+	conf.Log = cmp.Or(conf.Log, slog.With(teleport.ComponentKey, "cloudlabels"))
 	return nil
 }
 
@@ -96,6 +103,8 @@ func NewCloudImporter(ctx context.Context, c *CloudConfig) (*CloudImporter, erro
 		cloudImporter.initEC2()
 	case types.InstanceMetadataTypeAzure:
 		cloudImporter.initAzure()
+	case types.InstanceMetadataTypeGCP:
+		cloudImporter.initGCP()
 	}
 	return cloudImporter, nil
 }
@@ -110,15 +119,17 @@ func (l *CloudImporter) initAzure() {
 	l.instanceMetadataHint = azureErrorMessage
 }
 
+func (l *CloudImporter) initGCP() {
+	l.namespace = GCPLabelNamespace
+	l.instanceMetadataHint = gcpErrorMessage
+}
+
 // Get returns the list of updated cloud labels.
 func (l *CloudImporter) Get() map[string]string {
 	l.muLabels.RLock()
 	defer l.muLabels.RUnlock()
-	labels := make(map[string]string)
-	for k, v := range l.labels {
-		labels[k] = v
-	}
-	return labels
+
+	return maps.Clone(l.labels)
 }
 
 // Apply adds cloud labels to the provided resource.
@@ -134,10 +145,10 @@ func (l *CloudImporter) Apply(r types.ResourceWithLabels) {
 func (l *CloudImporter) Sync(ctx context.Context) error {
 	tags, err := l.Client.GetTags(ctx)
 	if err != nil {
-		if trace.IsNotFound(err) {
+		if trace.IsNotFound(err) || trace.IsAccessDenied(err) {
 			// Only show the error the first time around.
 			l.instanceTagsNotFoundOnce.Do(func() {
-				l.Log.Warning(l.instanceMetadataHint)
+				l.Log.WarnContext(ctx, l.instanceMetadataHint) //nolint:sloglint // message should be a constant but in this case we are creating it at runtime.
 			})
 			return nil
 		}
@@ -147,10 +158,10 @@ func (l *CloudImporter) Sync(ctx context.Context) error {
 	m := make(map[string]string)
 	for key, value := range tags {
 		if !types.IsValidLabelKey(key) {
-			l.Log.Debugf("Skipping cloud tag %q, not a valid label key.", key)
+			l.Log.DebugContext(ctx, "Skipping cloud tag due to invalid label key", "tag", key)
 			continue
 		}
-		m[formatKey(l.namespace, key)] = value
+		m[FormatCloudLabelKey(l.namespace, key)] = value
 	}
 
 	l.muLabels.Lock()
@@ -170,7 +181,7 @@ func (l *CloudImporter) periodicUpdateLabels(ctx context.Context) {
 
 	for {
 		if err := l.Sync(ctx); err != nil {
-			l.Log.Warningf("Error fetching cloud tags: %v", err)
+			l.Log.WarnContext(ctx, "Failed to fetch cloud tags", "error", err)
 		}
 		select {
 		case <-ticker.Chan():
@@ -180,7 +191,7 @@ func (l *CloudImporter) periodicUpdateLabels(ctx context.Context) {
 	}
 }
 
-// formatKey formats label keys coming from a cloud instance.
-func formatKey(namespace, key string) string {
+// FormatCloudLabelKey formats label keys coming from a cloud instance.
+func FormatCloudLabelKey(namespace, key string) string {
 	return fmt.Sprintf("%s/%s", namespace, key)
 }

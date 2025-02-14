@@ -1,24 +1,26 @@
 /*
-Copyright 2015-2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package scripts
 
 import (
 	_ "embed"
-	"net/http"
+	"fmt"
 	"sort"
 	"strings"
 	"text/template"
@@ -29,11 +31,6 @@ import (
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/api/utils"
 )
-
-// SetScriptHeaders sets response headers to plain text.
-func SetScriptHeaders(h http.Header) {
-	h.Set("Content-Type", "text/plain")
-}
 
 // ErrorBashScript is used to display friendly error message when
 // there is an error prepping the actual script.
@@ -51,9 +48,15 @@ var installNodeBashScript string
 
 var InstallNodeBashScript = template.Must(template.New("nodejoin").Parse(installNodeBashScript))
 
-// MarshalLabelsYAML returns a list of strings, each one containing a label key/value pair.
+// MarshalLabelsYAML returns a list of strings, each one containing a
+// label key and list of value's pair.
 // This is used to create yaml sections within the join scripts.
-func MarshalLabelsYAML(resourceMatcherLabels types.Labels) ([]string, error) {
+//
+// The arg `extraListIndent` allows adding `extra` indent space on
+// top of the default space already used, for the default yaml listing
+// format (the listing values with the dashes). If `extraListIndent`
+// is zero, it's equivalent to using default space only (which is 4 spaces).
+func MarshalLabelsYAML(resourceMatcherLabels types.Labels, extraListIndent int) ([]string, error) {
 	if len(resourceMatcherLabels) == 0 {
 		return []string{"{}"}, nil
 	}
@@ -69,14 +72,30 @@ func MarshalLabelsYAML(resourceMatcherLabels types.Labels) ([]string, error) {
 	sort.Strings(labelKeys)
 
 	for _, labelName := range labelKeys {
-		labelValue := resourceMatcherLabels[labelName]
-		bs, err := yaml.Marshal(map[string]utils.Strings{labelName: labelValue})
+		labelValues := resourceMatcherLabels[labelName]
+		bs, err := yaml.Marshal(map[string]utils.Strings{labelName: labelValues})
 		if err != nil {
 			return nil, trace.Wrap(err)
 		}
 
-		ret = append(ret, strings.TrimSpace(string(bs)))
+		labelStr := strings.TrimSpace(string(bs))
+		if len(labelValues) > 1 && extraListIndent > 0 {
+			labelStr = addExtraListIndentToYAMLLabelStr(labelStr, extraListIndent)
+		}
+
+		ret = append(ret, labelStr)
 	}
 
 	return ret, nil
+}
+
+func addExtraListIndentToYAMLLabelStr(labelStr string, indent int) string {
+	words := strings.Split(labelStr, "\n")
+	// Skip the first word, since that is the label key.
+	// Add extra spaces defined by `yamlListIndent` arg.
+	for i := 1; i < len(words); i++ {
+		words[i] = fmt.Sprintf("%s%s", strings.Repeat(" ", indent), words[i])
+	}
+
+	return strings.Join(words, "\n")
 }

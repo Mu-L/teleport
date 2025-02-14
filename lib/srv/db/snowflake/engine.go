@@ -1,20 +1,20 @@
 /*
-
- Copyright 2022 Gravitational, Inc.
-
- Licensed under the Apache License, Version 2.0 (the "License");
- you may not use this file except in compliance with the License.
- You may obtain a copy of the License at
-
-     http://www.apache.org/licenses/LICENSE-2.0
-
- Unless required by applicable law or agreed to in writing, software
- distributed under the License is distributed on an "AS IS" BASIS,
- WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- See the License for the specific language governing permissions and
- limitations under the License.
-
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package snowflake
 
@@ -35,9 +35,9 @@ import (
 	"time"
 
 	"github.com/gravitational/trace"
+	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/gravitational/teleport/api/types"
-	"github.com/gravitational/teleport/lib/auth"
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/srv/db/common"
 	"github.com/gravitational/teleport/lib/srv/db/common/role"
@@ -113,7 +113,7 @@ func (e *Engine) SendError(err error) {
 		Message: err.Error(),
 	})
 	if err != nil {
-		e.Log.WithError(err).Errorf("failed to marshal error response")
+		e.Log.ErrorContext(e.Context, "failed to marshal error response", "error", err)
 		return
 	}
 
@@ -129,12 +129,14 @@ func (e *Engine) SendError(err error) {
 	}
 
 	if err := response.Write(e.clientConn); err != nil {
-		e.Log.Errorf("snowflake error: %+v", trace.Unwrap(err))
+		e.Log.ErrorContext(e.Context, "snowflake error", "error", err)
 		return
 	}
 }
 
 func (e *Engine) HandleConnection(ctx context.Context, sessionCtx *common.Session) error {
+	observe := common.GetConnectionSetupTimeObserver(sessionCtx.Database)
+
 	var err error
 	e.accountName, e.snowflakeHost, err = parseConnectionString(sessionCtx.Database.GetURI())
 	if err != nil {
@@ -150,13 +152,18 @@ func (e *Engine) HandleConnection(ctx context.Context, sessionCtx *common.Sessio
 
 	clientConnReader := bufio.NewReader(e.clientConn)
 
+	observe()
+
+	msgFromClient := common.GetMessagesFromClientMetric(e.sessionCtx.Database)
+	msgFromServer := common.GetMessagesFromServerMetric(e.sessionCtx.Database)
+
 	for {
 		req, err := http.ReadRequest(clientConnReader)
 		if err != nil {
 			return trace.Wrap(err)
 		}
 
-		err = e.process(ctx, sessionCtx, req)
+		err = e.process(ctx, sessionCtx, req, msgFromClient, msgFromServer)
 		if err != nil {
 			return trace.Wrap(err)
 		}
@@ -165,7 +172,9 @@ func (e *Engine) HandleConnection(ctx context.Context, sessionCtx *common.Sessio
 
 // process reads request from connected Snowflake client, processes the requests/responses and send data back
 // to the client.
-func (e *Engine) process(ctx context.Context, sessionCtx *common.Session, req *http.Request) error {
+func (e *Engine) process(ctx context.Context, sessionCtx *common.Session, req *http.Request, msgFromClient prometheus.Counter, msgFromServer prometheus.Counter) error {
+	msgFromClient.Inc()
+
 	snowflakeToken, err := e.getConnectionToken(ctx, req)
 	if err != nil {
 		return trace.Wrap(err)
@@ -193,6 +202,8 @@ func (e *Engine) process(ctx context.Context, sessionCtx *common.Session, req *h
 		return trace.Wrap(err)
 	}
 	defer resp.Body.Close()
+
+	msgFromServer.Inc()
 
 	switch req.URL.Path {
 	case loginRequestPath:
@@ -341,19 +352,19 @@ func (e *Engine) processResponse(resp *http.Response, modifyReqFn func(body []by
 // authorizeConnection does authorization check for Snowflake connection about
 // to be established.
 func (e *Engine) authorizeConnection(ctx context.Context) error {
-	ap, err := e.Auth.GetAuthPreference(ctx)
+	authPref, err := e.Auth.GetAuthPreference(ctx)
 	if err != nil {
 		return trace.Wrap(err)
 	}
-	mfaParams := e.sessionCtx.MFAParams(ap.GetRequireMFAType())
-	dbRoleMatchers := role.DatabaseRoleMatchers(
-		e.sessionCtx.Database.GetProtocol(),
-		e.sessionCtx.DatabaseUser,
-		e.sessionCtx.DatabaseName,
-	)
+	state := e.sessionCtx.GetAccessState(authPref)
+	dbRoleMatchers := role.GetDatabaseRoleMatchers(role.RoleMatchersConfig{
+		Database:     e.sessionCtx.Database,
+		DatabaseUser: e.sessionCtx.DatabaseUser,
+		DatabaseName: e.sessionCtx.DatabaseName,
+	})
 	err = e.sessionCtx.Checker.CheckAccess(
 		e.sessionCtx.Database,
-		mfaParams,
+		state,
 		dbRoleMatchers...,
 	)
 	if err != nil {
@@ -440,7 +451,7 @@ func (e *Engine) processLoginResponse(bodyBytes []byte, createSessionFn func(tok
 	}
 
 	if !loginResp.Success {
-		e.Log.Errorf("Snowflake authentication failed: %s", loginResp.Message)
+		e.Log.ErrorContext(e.Context, "Snowflake authentication failed.", "error_message", loginResp.Message)
 		// Return not modified response, so client can handle it. Otherwise, the client my keep retrying where
 		// most likely each response will return the same error (invalid JWT when user doesn't exist for ex.)
 		return bodyBytes, nil
@@ -551,11 +562,6 @@ func (e *Engine) getSnowflakeToken(ctx context.Context, sessionToken string) (st
 	snowflakeToken := e.tokens.getToken(sessionToken)
 	if snowflakeToken != "" {
 		return snowflakeToken, nil
-	}
-
-	// Fetch the token from the auth server if not found in the local cache.
-	if err := auth.WaitForSnowflakeSession(ctx, sessionToken, e.sessionCtx.Identity.Username, e.AuthClient); err != nil {
-		return "", trace.Wrap(err)
 	}
 
 	snowflakeSession, err := e.AuthClient.GetSnowflakeSession(ctx, types.GetSnowflakeSessionRequest{SessionID: sessionToken})

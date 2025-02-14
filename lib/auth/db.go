@@ -1,18 +1,20 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package auth
 
@@ -21,6 +23,8 @@ import (
 	"crypto"
 	"crypto/sha256"
 	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/asn1"
 	"encoding/base64"
 	"encoding/pem"
 	"fmt"
@@ -34,6 +38,7 @@ import (
 	apidefaults "github.com/gravitational/teleport/api/defaults"
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/api/utils"
+	"github.com/gravitational/teleport/entitlements"
 	"github.com/gravitational/teleport/lib/auth/keystore"
 	"github.com/gravitational/teleport/lib/jwt"
 	"github.com/gravitational/teleport/lib/modules"
@@ -43,33 +48,99 @@ import (
 
 // GenerateDatabaseCert generates client certificate used by a database
 // service to authenticate with the database instance.
-func (s *Server) GenerateDatabaseCert(ctx context.Context, req *proto.DatabaseCertRequest) (*proto.DatabaseCertResponse, error) {
-	csr, err := tlsca.ParseCertificateRequestPEM(req.CSR)
+func (a *Server) GenerateDatabaseCert(ctx context.Context, req *proto.DatabaseCertRequest) (*proto.DatabaseCertResponse, error) {
+	if req.RequesterName == proto.DatabaseCertRequest_TCTL {
+		// tctl/web cert request needs to generate a db server cert and trust
+		// the db client CA.
+		return a.generateDatabaseServerCert(ctx, req)
+	}
+	// db service needs to generate a db client cert and trust the db server CA.
+	return a.generateDatabaseClientCert(ctx, req)
+}
+
+// generateDatabaseServerCert generates database server certificate used by a
+// database to authenticate itself to a database service.
+func (a *Server) generateDatabaseServerCert(ctx context.Context, req *proto.DatabaseCertRequest) (*proto.DatabaseCertResponse, error) {
+	clusterName, err := a.GetClusterName()
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	clusterName, err := s.GetClusterName()
+	// databases should be configured to trust the DatabaseClientCA when
+	// clients connect so return DatabaseClientCA in the response.
+	dbClientCA, err := a.GetCertAuthority(ctx, types.CertAuthID{
+		Type:       types.DatabaseClientCA,
+		DomainName: clusterName.GetClusterName(),
+	}, false)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	databaseCA, err := s.GetCertAuthority(ctx, types.CertAuthID{
+	dbServerCA, err := a.GetCertAuthority(ctx, types.CertAuthID{
 		Type:       types.DatabaseCA,
 		DomainName: clusterName.GetClusterName(),
 	}, true)
 	if err != nil {
-		if trace.IsNotFound(err) {
-			// Database CA doesn't exist. Fallback to Host CA.
-			// https://github.com/gravitational/teleport/issues/5029
-			databaseCA, err = s.GetCertAuthority(ctx, types.CertAuthID{
-				Type:       types.HostCA,
-				DomainName: clusterName.GetClusterName(),
-			}, true)
-		}
-		if err != nil {
-			return nil, trace.Wrap(err)
-		}
+		return nil, trace.Wrap(err)
 	}
-	caCert, signer, err := getCAandSigner(ctx, s.GetKeyStore(), databaseCA, req)
+
+	cert, err := a.generateDatabaseCert(ctx, req, dbServerCA)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	return &proto.DatabaseCertResponse{
+		Cert:    cert,
+		CACerts: services.GetTLSCerts(dbClientCA),
+	}, nil
+}
+
+// generateDatabaseClientCert generates client certificate used by a database
+// service to authenticate with the database instance.
+func (a *Server) generateDatabaseClientCert(ctx context.Context, req *proto.DatabaseCertRequest) (*proto.DatabaseCertResponse, error) {
+	clusterName, err := a.GetClusterName()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	dbClientCA, err := a.GetCertAuthority(ctx, types.CertAuthID{
+		Type:       types.DatabaseClientCA,
+		DomainName: clusterName.GetClusterName(),
+	}, true)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	cert, err := a.generateDatabaseCert(ctx, req, dbClientCA)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	// db clients should trust the Database Server CA when establishing
+	// connection to a database, so return that CA's certs in the response.
+	//
+	// The only exception is the SQL Server with PKINIT integration, where the
+	// `kinit` command line needs our client CA to trust the user certificates
+	// we pass.
+	returnedCAType := types.DatabaseCA
+	if req.CertificateExtensions == proto.DatabaseCertRequest_WINDOWS_SMARTCARD {
+		returnedCAType = types.DatabaseClientCA
+	}
+
+	returnedCA, err := a.GetCertAuthority(ctx, types.CertAuthID{
+		Type:       returnedCAType,
+		DomainName: clusterName.GetClusterName(),
+	}, false)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	return &proto.DatabaseCertResponse{
+		Cert:    cert,
+		CACerts: services.GetTLSCerts(returnedCA),
+	}, nil
+}
+
+func (a *Server) generateDatabaseCert(ctx context.Context, req *proto.DatabaseCertRequest, ca types.CertAuthority) ([]byte, error) {
+	csr, err := tlsca.ParseCertificateRequestPEM(req.CSR)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	caCert, signer, err := getCAandSigner(ctx, a.GetKeyStore(), ca, req)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -78,10 +149,10 @@ func (s *Server) GenerateDatabaseCert(ctx context.Context, req *proto.DatabaseCe
 		return nil, trace.Wrap(err)
 	}
 	certReq := tlsca.CertificateRequest{
-		Clock:     s.clock,
+		Clock:     a.clock,
 		PublicKey: csr.PublicKey,
 		Subject:   csr.Subject,
-		NotAfter:  s.clock.Now().UTC().Add(req.TTL.Get()),
+		NotAfter:  a.clock.Now().UTC().Add(req.TTL.Get()),
 	}
 	if req.CertificateExtensions == proto.DatabaseCertRequest_WINDOWS_SMARTCARD {
 		// Pass through ExtKeyUsage (which we need for Smartcard Logon usage)
@@ -96,15 +167,21 @@ func (s *Server) GenerateDatabaseCert(ctx context.Context, req *proto.DatabaseCe
 		// has been deprecated since Go 1.15:
 		//   https://golang.org/doc/go1.15#commonname
 		certReq.DNSNames = getServerNames(req)
+
+		// The windows smartcard cert req already does the same in
+		// lib/auth/windows/windows.go, along with another ExtKeyUsage for
+		// smartcard logon that we don't want to override above.
+		switch ca.GetType() {
+		case types.DatabaseCA:
+			// Override ExtKeyUsage to ExtKeyUsageServerAuth.
+			certReq.ExtraExtensions = append(certReq.ExtraExtensions, extKeyUsageServerAuthExtension)
+		case types.DatabaseClientCA:
+			// Override ExtKeyUsage to ExtKeyUsageClientAuth.
+			certReq.ExtraExtensions = append(certReq.ExtraExtensions, extKeyUsageClientAuthExtension)
+		}
 	}
 	cert, err := tlsCA.GenerateCertificate(certReq)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	return &proto.DatabaseCertResponse{
-		Cert:    cert,
-		CACerts: services.GetTLSCerts(databaseCA),
-	}, nil
+	return cert, trace.Wrap(err)
 }
 
 // getCAandSigner returns correct signer and CA that should be used when generating database certificate.
@@ -114,6 +191,7 @@ func (s *Server) GenerateDatabaseCert(ctx context.Context, req *proto.DatabaseCe
 func getCAandSigner(ctx context.Context, keyStore *keystore.Manager, databaseCA types.CertAuthority, req *proto.DatabaseCertRequest,
 ) ([]byte, crypto.Signer, error) {
 	if req.RequesterName == proto.DatabaseCertRequest_TCTL &&
+		databaseCA.GetType() == types.DatabaseCA &&
 		databaseCA.GetRotation().Phase == types.RotationPhaseInit {
 		return keyStore.GetAdditionalTrustedTLSCertAndSigner(ctx, databaseCA)
 	}
@@ -132,20 +210,20 @@ func getServerNames(req *proto.DatabaseCertRequest) []string {
 
 // SignDatabaseCSR generates a client certificate used by proxy when talking
 // to a remote database service.
-func (s *Server) SignDatabaseCSR(ctx context.Context, req *proto.DatabaseCSRRequest) (*proto.DatabaseCSRResponse, error) {
-	if !modules.GetModules().Features().DB {
+func (a *Server) SignDatabaseCSR(ctx context.Context, req *proto.DatabaseCSRRequest) (*proto.DatabaseCSRResponse, error) {
+	if !modules.GetModules().Features().GetEntitlement(entitlements.DB).Enabled {
 		return nil, trace.AccessDenied(
 			"this Teleport cluster is not licensed for database access, please contact the cluster administrator")
 	}
 
-	log.Debugf("Signing database CSR for cluster %v.", req.ClusterName)
+	a.logger.DebugContext(ctx, "Signing database CSR for cluster", "cluster", req.ClusterName)
 
-	clusterName, err := s.GetClusterName()
+	clusterName, err := a.GetClusterName()
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	hostCA, err := s.GetCertAuthority(ctx, types.CertAuthID{
+	hostCA, err := a.GetCertAuthority(ctx, types.CertAuthID{
 		Type:       types.HostCA,
 		DomainName: req.ClusterName,
 	}, false)
@@ -178,7 +256,7 @@ func (s *Server) SignDatabaseCSR(ctx context.Context, req *proto.DatabaseCSRRequ
 	}
 
 	// Extract user roles from the identity.
-	roles, err := services.FetchRoles(id.Groups, s, id.Traits)
+	roles, err := services.FetchRoles(id.Groups, a, id.Traits)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -186,24 +264,16 @@ func (s *Server) SignDatabaseCSR(ctx context.Context, req *proto.DatabaseCSRRequ
 	// Get the correct cert TTL based on roles.
 	ttl := roles.AdjustSessionTTL(apidefaults.CertDuration)
 
-	caType := types.UserCA
-	if req.SignWithDatabaseCA {
-		// Field SignWithDatabaseCA was added in Teleport 10 when DatabaseCA was introduced.
-		// Previous Teleport versions used UserCA, and we still need to sign certificates with UserCA
-		// for compatibility reason. Teleport 10+ expects request signed with DatabaseCA.
-		caType = types.DatabaseCA
-	}
-
 	// Generate the TLS certificate.
-	ca, err := s.GetCertAuthority(ctx, types.CertAuthID{
-		Type:       caType,
+	ca, err := a.GetCertAuthority(ctx, types.CertAuthID{
+		Type:       types.DatabaseCA,
 		DomainName: clusterName.GetClusterName(),
 	}, true)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	cert, signer, err := s.GetKeyStore().GetTLSCertAndSigner(ctx, ca)
+	cert, signer, err := a.GetKeyStore().GetTLSCertAndSigner(ctx, ca)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -213,10 +283,10 @@ func (s *Server) SignDatabaseCSR(ctx context.Context, req *proto.DatabaseCSRRequ
 	}
 
 	tlsCert, err := tlsAuthority.GenerateCertificate(tlsca.CertificateRequest{
-		Clock:     s.clock,
+		Clock:     a.clock,
 		PublicKey: csr.PublicKey,
 		Subject:   subject,
-		NotAfter:  s.clock.Now().UTC().Add(ttl),
+		NotAfter:  a.clock.Now().UTC().Add(ttl),
 	})
 	if err != nil {
 		return nil, trace.Wrap(err)
@@ -229,22 +299,32 @@ func (s *Server) SignDatabaseCSR(ctx context.Context, req *proto.DatabaseCSRRequ
 }
 
 // GenerateSnowflakeJWT generates JWT in the format required by Snowflake.
-func (s *Server) GenerateSnowflakeJWT(ctx context.Context, req *proto.SnowflakeJWTRequest) (*proto.SnowflakeJWTResponse, error) {
-	if !modules.GetModules().Features().DB {
+func (a *Server) GenerateSnowflakeJWT(ctx context.Context, req *proto.SnowflakeJWTRequest) (*proto.SnowflakeJWTResponse, error) {
+	if !modules.GetModules().Features().GetEntitlement(entitlements.DB).Enabled {
 		return nil, trace.AccessDenied(
 			"this Teleport cluster is not licensed for database access, please contact the cluster administrator")
 	}
 
-	clusterName, err := s.GetClusterName()
+	clusterName, err := a.GetClusterName()
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	ca, err := s.GetCertAuthority(ctx, types.CertAuthID{
-		Type:       types.DatabaseCA,
+	ca, err := a.GetCertAuthority(ctx, types.CertAuthID{
+		Type:       types.DatabaseClientCA,
 		DomainName: clusterName.GetClusterName(),
 	}, true)
 	if err != nil {
-		return nil, trace.Wrap(err)
+		if !trace.IsNotFound(err) {
+			return nil, trace.Wrap(err)
+		}
+		// DatabaseClientCA doesn't exist, fallback to DatabaseCA.
+		ca, err = a.GetCertAuthority(ctx, types.CertAuthID{
+			Type:       types.DatabaseCA,
+			DomainName: clusterName.GetClusterName(),
+		}, true)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
 	}
 
 	if len(ca.GetActiveKeys().TLS) == 0 {
@@ -268,13 +348,13 @@ func (s *Server) GenerateSnowflakeJWT(ctx context.Context, req *proto.SnowflakeJ
 		return nil, trace.Wrap(err)
 	}
 
-	subject, issuer := getSnowflakeJWTParams(req.AccountName, req.UserName, pubKey)
+	subject, issuer := getSnowflakeJWTParams(ctx, req.AccountName, req.UserName, pubKey)
 
-	_, signer, err := s.GetKeyStore().GetTLSCertAndSigner(ctx, ca)
+	_, signer, err := a.GetKeyStore().GetTLSCertAndSigner(ctx, ca)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	privateKey, err := services.GetJWTSigner(signer, ca.GetClusterName(), s.clock)
+	privateKey, err := services.GetJWTSigner(signer, ca.GetClusterName(), a.clock)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -291,7 +371,7 @@ func (s *Server) GenerateSnowflakeJWT(ctx context.Context, req *proto.SnowflakeJ
 	}, nil
 }
 
-func getSnowflakeJWTParams(accountName, userName string, publicKey []byte) (string, string) {
+func getSnowflakeJWTParams(ctx context.Context, accountName, userName string, publicKey []byte) (string, string) {
 	// Use only the first part of the account name to generate JWT
 	// Based on:
 	// https://github.com/snowflakedb/snowflake-connector-python/blob/f2f7e6f35a162484328399c8a50a5015825a5573/src/snowflake/connector/auth_keypair.py#L83
@@ -303,7 +383,10 @@ func getSnowflakeJWTParams(accountName, userName string, publicKey []byte) (stri
 	accnToken, _, _ := strings.Cut(accountName, accNameSeparator)
 	accnTokenCap := strings.ToUpper(accnToken)
 	userNameCap := strings.ToUpper(userName)
-	log.Debugf("Signing database JWT token for %s %s", accnTokenCap, userNameCap)
+	logger.DebugContext(ctx, "Signing database JWT token",
+		"account_name", accnTokenCap,
+		"user_name", userNameCap,
+	)
 
 	subject := fmt.Sprintf("%s.%s", accnTokenCap, userNameCap)
 
@@ -315,3 +398,44 @@ func getSnowflakeJWTParams(accountName, userName string, publicKey []byte) (stri
 
 	return subject, issuer
 }
+
+func filterExtensions(extensions []pkix.Extension, oids ...asn1.ObjectIdentifier) []pkix.Extension {
+	filtered := make([]pkix.Extension, 0, len(oids))
+	for _, e := range extensions {
+		for _, id := range oids {
+			if e.Id.Equal(id) {
+				filtered = append(filtered, e)
+			}
+		}
+	}
+	return filtered
+}
+
+// TODO(gavin): move OIDs from here and in lib/auth/windows to tlsca package.
+var (
+	oidExtKeyUsage    = asn1.ObjectIdentifier{2, 5, 29, 37}
+	oidSubjectAltName = asn1.ObjectIdentifier{2, 5, 29, 17}
+
+	oidExtKeyUsageServerAuth       = asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 3, 1}
+	oidExtKeyUsageClientAuth       = asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 3, 2}
+	extKeyUsageServerAuthExtension = pkix.Extension{
+		Id: oidExtKeyUsage,
+		Value: func() []byte {
+			val, err := asn1.Marshal([]asn1.ObjectIdentifier{oidExtKeyUsageServerAuth})
+			if err != nil {
+				panic(err)
+			}
+			return val
+		}(),
+	}
+	extKeyUsageClientAuthExtension = pkix.Extension{
+		Id: oidExtKeyUsage,
+		Value: func() []byte {
+			val, err := asn1.Marshal([]asn1.ObjectIdentifier{oidExtKeyUsageClientAuth})
+			if err != nil {
+				panic(err)
+			}
+			return val
+		}(),
+	}
+)

@@ -1,18 +1,20 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package proxy
 
@@ -26,18 +28,21 @@ import (
 	"github.com/google/uuid"
 	"github.com/gravitational/trace"
 	"github.com/jackc/pgconn"
-	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
 
 	apidefaults "github.com/gravitational/teleport/api/defaults"
 	"github.com/gravitational/teleport/api/types"
+	"github.com/gravitational/teleport/entitlements"
 	"github.com/gravitational/teleport/integration/helpers"
 	"github.com/gravitational/teleport/lib"
 	"github.com/gravitational/teleport/lib/auth"
+	"github.com/gravitational/teleport/lib/auth/authclient"
 	"github.com/gravitational/teleport/lib/auth/testauthority"
+	"github.com/gravitational/teleport/lib/cloud/imds"
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/modules"
 	"github.com/gravitational/teleport/lib/service"
+	"github.com/gravitational/teleport/lib/service/servicecfg"
 	"github.com/gravitational/teleport/lib/srv/db/common"
 	"github.com/gravitational/teleport/lib/srv/db/postgres"
 	"github.com/gravitational/teleport/lib/tlsca"
@@ -55,10 +60,8 @@ type proxyTunnelStrategy struct {
 	node    *helpers.TeleInstance
 
 	db           *helpers.TeleInstance
-	dbAuthClient *auth.Client
+	dbAuthClient *authclient.Client
 	postgresDB   *postgres.TestServer
-
-	log *logrus.Logger
 }
 
 func newProxyTunnelStrategy(t *testing.T, cluster string, strategy *types.TunnelStrategyV1) *proxyTunnelStrategy {
@@ -66,7 +69,6 @@ func newProxyTunnelStrategy(t *testing.T, cluster string, strategy *types.Tunnel
 		cluster:  cluster,
 		username: helpers.MustGetCurrentUser(t).Username,
 		strategy: strategy,
-		log:      utils.NewLoggerForTests(),
 	}
 
 	lib.SetInsecureDevMode(true)
@@ -153,7 +155,11 @@ func TestProxyTunnelStrategyProxyPeering(t *testing.T) {
 	// This test cannot run in parallel as set module changes the global state.
 	modules.SetTestModules(t, &modules.TestModules{
 		TestBuildType: modules.BuildEnterprise,
-		TestFeatures:  modules.Features{DB: true},
+		TestFeatures: modules.Features{
+			Entitlements: map[entitlements.EntitlementKind]modules.EntitlementInfo{
+				entitlements.DB: {Enabled: true},
+			},
+		},
 	})
 
 	p := newProxyTunnelStrategy(t, "proxy-tunnel-proxy-peer",
@@ -223,7 +229,7 @@ func (p *proxyTunnelStrategy) dialNode(t *testing.T) {
 		client.Stdout = output
 
 		cmd := []string{"echo", "hello world"}
-		err = client.SSH(context.Background(), cmd, false)
+		err = client.SSH(context.Background(), cmd)
 		require.NoError(t, err)
 		require.Equal(t, "hello world\n", output.String())
 	}
@@ -293,14 +299,14 @@ func (p *proxyTunnelStrategy) makeAuth(t *testing.T) {
 		NodeName:    helpers.Loopback,
 		Priv:        privateKey,
 		Pub:         publicKey,
-		Log:         utils.NewLoggerForTests(),
+		Logger:      utils.NewSlogLoggerForTests(),
 	})
 
 	auth.AddUser(p.username, []string{p.username})
 
-	conf := service.MakeDefaultConfig()
+	conf := servicecfg.MakeDefaultConfig()
 	conf.DataDir = t.TempDir()
-	conf.Log = auth.Log
+	conf.Logger = auth.Log
 
 	conf.Auth.Enabled = true
 	conf.Auth.NetworkingConfig.SetTunnelStrategy(p.strategy)
@@ -315,22 +321,23 @@ func (p *proxyTunnelStrategy) makeAuth(t *testing.T) {
 }
 
 // makeProxy bootstraps a new teleport proxy instance.
-// It's public address points to a load balancer.
+// Its public address points to a load balancer.
 func (p *proxyTunnelStrategy) makeProxy(t *testing.T) {
 	proxy := helpers.NewInstance(t, helpers.InstanceConfig{
 		ClusterName: p.cluster,
 		HostID:      uuid.New().String(),
 		NodeName:    helpers.Loopback,
-		Log:         utils.NewLoggerForTests(),
+		Logger:      utils.NewSlogLoggerForTests(),
 	})
 
 	authAddr := utils.MustParseAddr(p.auth.Auth)
 
-	conf := service.MakeDefaultConfig()
+	conf := servicecfg.MakeDefaultConfig()
 	conf.SetAuthServerAddress(*authAddr)
 	conf.SetToken("token")
 	conf.DataDir = t.TempDir()
-	conf.Log = proxy.Log
+	conf.Logger = proxy.Log
+	conf.InstanceMetadataClient = imds.NewDisabledIMDSClient()
 
 	conf.Auth.Enabled = false
 	conf.SSH.Enabled = false
@@ -339,8 +346,8 @@ func (p *proxyTunnelStrategy) makeProxy(t *testing.T) {
 	conf.Proxy.ReverseTunnelListenAddr.Addr = proxy.ReverseTunnel
 	conf.Proxy.SSHAddr.Addr = proxy.SSHProxy
 	conf.Proxy.WebAddr.Addr = proxy.Web
-	conf.Proxy.PeerAddr.Addr = helpers.NewListenerOn(t, helpers.Loopback, service.ListenerProxyPeer, &proxy.Fds)
-	conf.Proxy.PeerPublicAddr = conf.Proxy.PeerAddr
+	conf.Proxy.PeerAddress.Addr = helpers.NewListenerOn(t, helpers.Loopback, service.ListenerProxyPeer, &proxy.Fds)
+	conf.Proxy.PeerPublicAddr = conf.Proxy.PeerAddress
 	conf.Proxy.PublicAddrs = append(conf.Proxy.PublicAddrs, utils.FromAddr(p.lb.Addr()))
 	conf.Proxy.DisableWebInterface = true
 	conf.FileDescriptors = proxy.Fds
@@ -367,14 +374,15 @@ func (p *proxyTunnelStrategy) makeNode(t *testing.T) {
 		ClusterName: p.cluster,
 		HostID:      uuid.New().String(),
 		NodeName:    helpers.Loopback,
-		Log:         utils.NewLoggerForTests(),
+		Logger:      utils.NewSlogLoggerForTests(),
 	})
 
-	conf := service.MakeDefaultConfig()
+	conf := servicecfg.MakeDefaultConfig()
 	conf.Version = types.V3
 	conf.SetToken("token")
 	conf.DataDir = t.TempDir()
-	conf.Log = node.Log
+	conf.Logger = node.Log
+	conf.InstanceMetadataClient = imds.NewDisabledIMDSClient()
 
 	conf.Auth.Enabled = false
 	conf.Proxy.Enabled = false
@@ -411,21 +419,22 @@ func (p *proxyTunnelStrategy) makeDatabase(t *testing.T) {
 		ClusterName: p.cluster,
 		HostID:      uuid.New().String(),
 		NodeName:    helpers.Loopback,
-		Log:         utils.NewLoggerForTests(),
+		Logger:      utils.NewSlogLoggerForTests(),
 	})
 
-	conf := service.MakeDefaultConfig()
+	conf := servicecfg.MakeDefaultConfig()
 	conf.Version = types.V3
 	conf.SetToken("token")
 	conf.DataDir = t.TempDir()
-	conf.Log = db.Log
+	conf.Logger = db.Log
+	conf.InstanceMetadataClient = imds.NewDisabledIMDSClient()
 
 	conf.Auth.Enabled = false
 	conf.Proxy.Enabled = false
 	conf.SSH.Enabled = false
 	conf.Databases.Enabled = true
 	conf.ProxyServer = utils.FromAddr(p.lb.Addr())
-	conf.Databases.Databases = []service.Database{
+	conf.Databases.Databases = []servicecfg.Database{
 		{
 			Name:     p.cluster + "-postgres",
 			Protocol: defaults.ProtocolPostgres,
@@ -433,12 +442,12 @@ func (p *proxyTunnelStrategy) makeDatabase(t *testing.T) {
 		},
 	}
 
-	_, role, err := auth.CreateUserAndRole(p.auth.Process.GetAuthServer(), p.username, []string{p.username})
+	_, role, err := auth.CreateUserAndRole(p.auth.Process.GetAuthServer(), p.username, []string{p.username}, nil)
 	require.NoError(t, err)
 
 	role.SetDatabaseUsers(types.Allow, []string{types.Wildcard})
 	role.SetDatabaseNames(types.Allow, []string{types.Wildcard})
-	err = p.auth.Process.GetAuthServer().UpsertRole(context.Background(), role)
+	_, err = p.auth.Process.GetAuthServer().UpsertRole(context.Background(), role)
 	require.NoError(t, err)
 
 	// start the process and block until specified events are received.
@@ -454,7 +463,7 @@ func (p *proxyTunnelStrategy) makeDatabase(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	var client *auth.Client
+	var client *authclient.Client
 	for _, event := range receivedEvents {
 		if event.Name == service.DatabasesIdentityEvent {
 			conn, ok := (event.Payload).(*service.Connector)
@@ -541,20 +550,15 @@ func (p *proxyTunnelStrategy) waitForResource(t *testing.T, role string, check f
 		for _, proxy := range p.proxies {
 			ok, err := check(proxy, availability)
 			if err != nil {
-				p.log.Debugf("check for %s availability error: %+v", role, trace.Wrap(err))
 				return false
 			}
 			if !ok {
-				p.log.Debugf("%s not found", role)
 				return false
 			}
 			propagated++
 		}
-		if len(p.proxies) != propagated {
-			p.log.Debugf("%s not available", role)
-			return false
-		}
-		return true
+
+		return len(p.proxies) == propagated
 	},
 		30*time.Second,
 		time.Second,

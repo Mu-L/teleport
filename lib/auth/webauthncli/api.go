@@ -1,16 +1,20 @@
-// Copyright 2022 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package webauthncli
 
@@ -20,13 +24,27 @@ import (
 	"strings"
 
 	"github.com/gravitational/trace"
-	log "github.com/sirupsen/logrus"
+	oteltrace "go.opentelemetry.io/otel/trace"
 
+	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/api/client/proto"
+	"github.com/gravitational/teleport/api/observability/tracing"
 	"github.com/gravitational/teleport/lib/auth/touchid"
-	wanlib "github.com/gravitational/teleport/lib/auth/webauthn"
-	"github.com/gravitational/teleport/lib/auth/webauthnwin"
+	wantypes "github.com/gravitational/teleport/lib/auth/webauthntypes"
+	wanwin "github.com/gravitational/teleport/lib/auth/webauthnwin"
+	logutils "github.com/gravitational/teleport/lib/utils/log"
 )
+
+var (
+	log     = logutils.NewPackageLogger(teleport.ComponentKey, "WebAuthn")
+	fidoLog = logutils.NewPackageLogger(teleport.ComponentKey, "FIDO2")
+)
+
+// ErrUsingNonRegisteredDevice is returned from Login when the user attempts to
+// authenticate with a non-registered security key.
+// The error message is meant to be displayed to end-users, thus it breaks the
+// usual Go error conventions (capitalized sentences, punctuation).
+var ErrUsingNonRegisteredDevice = errors.New("You are using a security key that is not registered with Teleport. Try a different security key.")
 
 // AuthenticatorAttachment allows callers to choose a specific attachment.
 type AuthenticatorAttachment int
@@ -72,13 +90,21 @@ type LoginPrompt interface {
 	// PromptTouch prompts the user for a security key touch.
 	// In certain situations multiple touches may be required (PIN-protected
 	// devices, passwordless flows, etc).
-	PromptTouch() error
+	// Returns a TouchAcknowledger which should be called to signal to the user
+	// that the touch was successfully detected.
+	// Returns an error if the prompt fails to be sent to the user.
+	PromptTouch() (TouchAcknowledger, error)
 	// PromptCredential prompts the user to choose a credential, in case multiple
 	// credentials are available.
 	// Callers are free to modify the slice, such as by sorting the credentials,
 	// but must return one of the pointers contained within.
 	PromptCredential(creds []*CredentialInfo) (*CredentialInfo, error)
 }
+
+// TouchAcknowledger is a function type which should be called to signal to the
+// user that a security key touch was successfully detected.
+// May return an error if the acknowledgement fails to be sent to the user.
+type TouchAcknowledger func() error
 
 // LoginOpts groups non-mandatory options for Login.
 type LoginOpts struct {
@@ -90,7 +116,7 @@ type LoginOpts struct {
 	AuthenticatorAttachment AuthenticatorAttachment
 }
 
-// Login performs client-side, U2F-compatible, Webauthn login.
+// Login performs client-side, Webauthn login.
 // This method blocks until either device authentication is successful or the
 // context is canceled. Calling Login without a deadline or cancel condition
 // may cause it to block forever.
@@ -103,17 +129,24 @@ type LoginOpts struct {
 // authentication and connected devices.
 func Login(
 	ctx context.Context,
-	origin string, assertion *wanlib.CredentialAssertion, prompt LoginPrompt, opts *LoginOpts,
+	origin string, assertion *wantypes.CredentialAssertion, prompt LoginPrompt, opts *LoginOpts,
 ) (*proto.MFAAuthenticateResponse, string, error) {
+	ctx, span := tracing.NewTracer("mfa").Start(
+		ctx,
+		"webauthncli/Login",
+		oteltrace.WithSpanKind(oteltrace.SpanKindClient),
+	)
+	defer span.End()
+
 	// origin vs RPID sanity check.
 	// Doesn't necessarily means a failure, but it's likely to be one.
 	switch {
 	case origin == "", assertion == nil: // let downstream handle empty/nil
 	case !strings.HasPrefix(origin, "https://"+assertion.Response.RelyingPartyID):
-		log.Warnf(""+
-			"WebAuthn: origin and RPID mismatch, "+
-			"if you are having authentication problems double check your proxy address "+
-			"(%q vs %q)", origin, assertion.Response.RelyingPartyID)
+		log.WarnContext(ctx, "origin and RPID mismatch, if you are having authentication problems double check your proxy address",
+			"origin", origin,
+			"rpid", assertion.Response.RelyingPartyID,
+		)
 	}
 
 	var attachment AuthenticatorAttachment
@@ -123,56 +156,49 @@ func Login(
 		user = opts.User
 	}
 
-	if webauthnwin.IsAvailable() {
-		log.Debug("WebAuthnWin: Using windows webauthn for credential assertion")
-		return webauthnwin.Login(ctx, origin, assertion, &webauthnwin.LoginOpts{
-			AuthenticatorAttachment: webauthnwin.AuthenticatorAttachment(attachment),
+	if wanwin.IsAvailable() {
+		log.DebugContext(ctx, "Using windows webauthn for credential assertion")
+		return wanwin.Login(ctx, origin, assertion, &wanwin.LoginOpts{
+			AuthenticatorAttachment: wanwin.AuthenticatorAttachment(attachment),
 		})
 	}
 
 	switch attachment {
 	case AttachmentCrossPlatform:
-		log.Debug("Cross-platform login")
+		log.DebugContext(ctx, "Cross-platform login")
 		return crossPlatformLogin(ctx, origin, assertion, prompt, opts)
 	case AttachmentPlatform:
-		log.Debug("Platform login")
+		log.DebugContext(ctx, "Platform login")
 		return platformLogin(origin, user, assertion, prompt)
 	default:
-		log.Debug("Attempting platform login")
+		log.DebugContext(ctx, "Attempting platform login")
 		resp, credentialUser, err := platformLogin(origin, user, assertion, prompt)
 		if !errors.Is(err, &touchid.ErrAttemptFailed{}) {
 			return resp, credentialUser, trace.Wrap(err)
 		}
 
-		log.WithError(err).Debug("Platform login failed, falling back to cross-platform")
+		log.DebugContext(ctx, "Platform login failed, falling back to cross-platform", "error", err)
 		return crossPlatformLogin(ctx, origin, assertion, prompt, opts)
 	}
 }
 
 func crossPlatformLogin(
 	ctx context.Context,
-	origin string, assertion *wanlib.CredentialAssertion, prompt LoginPrompt, opts *LoginOpts,
+	origin string, assertion *wantypes.CredentialAssertion, prompt LoginPrompt, opts *LoginOpts,
 ) (*proto.MFAAuthenticateResponse, string, error) {
-	if isLibfido2Enabled() {
-		log.Debug("FIDO2: Using libfido2 for assertion")
-		return FIDO2Login(ctx, origin, assertion, prompt, opts)
-	}
-
-	if err := prompt.PromptTouch(); err != nil {
-		return nil, "", trace.Wrap(err)
-	}
-	resp, err := U2FLogin(ctx, origin, assertion)
-	return resp, "" /* credentialUser */, err
+	fidoLog.DebugContext(ctx, "Using libfido2 for assertion")
+	resp, user, err := FIDO2Login(ctx, origin, assertion, prompt, opts)
+	return resp, user, trace.Wrap(err)
 }
 
-func platformLogin(origin, user string, assertion *wanlib.CredentialAssertion, prompt LoginPrompt) (*proto.MFAAuthenticateResponse, string, error) {
+func platformLogin(origin, user string, assertion *wantypes.CredentialAssertion, prompt LoginPrompt) (*proto.MFAAuthenticateResponse, string, error) {
 	resp, credentialUser, err := touchid.AttemptLogin(origin, user, assertion, ToTouchIDCredentialPicker(prompt))
 	if err != nil {
 		return nil, "", err
 	}
 	return &proto.MFAAuthenticateResponse{
 		Response: &proto.MFAAuthenticateResponse_Webauthn{
-			Webauthn: wanlib.CredentialAssertionResponseToProto(resp),
+			Webauthn: wantypes.CredentialAssertionResponseToProto(resp),
 		},
 	}, credentialUser, nil
 }
@@ -184,12 +210,15 @@ type RegisterPrompt interface {
 	// PromptPIN prompts the user for their PIN.
 	PromptPIN() (string, error)
 	// PromptTouch prompts the user for a security key touch.
-	// In certain situations multiple touches may be required (eg, PIN-protected
-	// devices)
-	PromptTouch() error
+	// In certain situations multiple touches may be required (PIN-protected
+	// devices, passwordless flows, etc).
+	// Returns a TouchAcknowledger which should be called to signal to the user
+	// that the touch was successfully detected.
+	// Returns an error if the prompt fails to be sent to the user.
+	PromptTouch() (TouchAcknowledger, error)
 }
 
-// Register performs client-side, U2F-compatible, Webauthn registration.
+// Register performs client-side, Webauthn registration.
 // This method blocks until either device authentication is successful or the
 // context is canceled. Calling Register without a deadline or cancel condition
 // may cause it block forever.
@@ -198,31 +227,25 @@ type RegisterPrompt interface {
 // type of authentication and connected devices.
 func Register(
 	ctx context.Context,
-	origin string, cc *wanlib.CredentialCreation, prompt RegisterPrompt) (*proto.MFARegisterResponse, error) {
-	if webauthnwin.IsAvailable() {
-		log.Debug("WebAuthnWin: Using windows webauthn for credential creation")
-		return webauthnwin.Register(ctx, origin, cc)
+	origin string, cc *wantypes.CredentialCreation, prompt RegisterPrompt) (*proto.MFARegisterResponse, error) {
+	if wanwin.IsAvailable() {
+		log.DebugContext(ctx, "Using windows webauthn for credential creation")
+		return wanwin.Register(ctx, origin, cc)
 	}
 
-	if isLibfido2Enabled() {
-		log.Debug("FIDO2: Using libfido2 for credential creation")
-		return FIDO2Register(ctx, origin, cc, prompt)
-	}
-
-	if err := prompt.PromptTouch(); err != nil {
-		return nil, trace.Wrap(err)
-	}
-	return U2FRegister(ctx, origin, cc)
+	fidoLog.DebugContext(ctx, "Using libfido2 for credential creation")
+	resp, err := FIDO2Register(ctx, origin, cc, prompt)
+	return resp, trace.Wrap(err)
 }
 
 // HasPlatformSupport returns true if the platform supports client-side
 // WebAuthn-compatible logins.
 func HasPlatformSupport() bool {
-	return IsFIDO2Available() || touchid.IsAvailable() || isU2FAvailable()
+	return IsFIDO2Available() || touchid.IsAvailable()
 }
 
 // IsFIDO2Available returns true if FIDO2 is implemented either via native
 // libfido2 library or Windows WebAuthn API.
 func IsFIDO2Available() bool {
-	return isLibfido2Enabled() || webauthnwin.IsAvailable()
+	return isLibfido2Enabled() || wanwin.IsAvailable()
 }

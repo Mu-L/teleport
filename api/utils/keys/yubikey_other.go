@@ -1,4 +1,4 @@
-//go:build !piv
+//go:build !piv && !pivtest
 
 /*
 Copyright 2022 Gravitational, Inc.
@@ -16,7 +16,7 @@ limitations under the License.
 package keys
 
 import (
-	"crypto"
+	"context"
 	"errors"
 
 	"github.com/gravitational/trace"
@@ -24,10 +24,20 @@ import (
 
 var errPIVUnavailable = errors.New("PIV is unavailable in current build")
 
-func getOrGenerateYubiKeyPrivateKey(touchRequired bool) (*PrivateKey, error) {
+func getOrGenerateYubiKeyPrivateKey(ctx context.Context, policy PrivateKeyPolicy, slot PIVSlot, _ HardwareKeyPrompt) (*PrivateKey, error) {
 	return nil, trace.Wrap(errPIVUnavailable)
 }
 
-func parseYubiKeyPrivateKeyData(keyDataBytes []byte) (crypto.Signer, error) {
+func parseYubiKeyPrivateKeyData(keyDataBytes []byte, _ HardwareKeyPrompt) (*PrivateKey, error) {
 	return nil, trace.Wrap(errPIVUnavailable)
+}
+
+func (s PIVSlot) validate() error {
+	return trace.Wrap(errPIVUnavailable)
+}
+
+// IsHardware returns true if [k] is a hardware PIV key.
+func (k *PrivateKey) IsHardware() bool {
+	// Built without PIV support - this must be false.
+	return false
 }

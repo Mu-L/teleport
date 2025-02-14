@@ -1,16 +1,20 @@
-// Copyright 2022 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package tracing
 
@@ -31,6 +35,9 @@ import (
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/proto"
+
+	apidefaults "github.com/gravitational/teleport/api/defaults"
+	"github.com/gravitational/teleport/lib/defaults"
 )
 
 // Collector is a simple in memory implementation of an OpenTelemetry Collector
@@ -43,8 +50,9 @@ type Collector struct {
 	coltracepb.TraceServiceServer
 	tlsConfing *tls.Config
 
-	spanLock sync.RWMutex
-	spans    []*otlp.ScopeSpans
+	spanLock  sync.RWMutex
+	spans     []*otlp.ScopeSpans
+	exportedC chan struct{}
 }
 
 // CollectorConfig configures how a Collector should be created.
@@ -54,12 +62,12 @@ type CollectorConfig struct {
 
 // NewCollector creates a new Collector based on the provided config.
 func NewCollector(cfg CollectorConfig) (*Collector, error) {
-	grpcLn, err := net.Listen("tcp4", "")
+	grpcLn, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	httpLn, err := net.Listen("tcp4", "")
+	httpLn, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -74,11 +82,19 @@ func NewCollector(cfg CollectorConfig) (*Collector, error) {
 	c := &Collector{
 		grpcLn:     grpcLn,
 		httpLn:     httpLn,
-		grpcServer: grpc.NewServer(grpc.Creds(creds)),
+		grpcServer: grpc.NewServer(grpc.Creds(creds), grpc.MaxConcurrentStreams(defaults.GRPCMaxConcurrentStreams)),
 		tlsConfing: tlsConfig,
+		exportedC:  make(chan struct{}, 1),
 	}
 
-	c.httpServer = &http.Server{Handler: c, TLSConfig: tlsConfig.Clone()}
+	c.httpServer = &http.Server{
+		Handler:           c,
+		ReadTimeout:       apidefaults.DefaultIOTimeout,
+		ReadHeaderTimeout: defaults.ReadHeadersTimeout,
+		WriteTimeout:      apidefaults.DefaultIOTimeout,
+		IdleTimeout:       apidefaults.DefaultIdleTimeout,
+		TLSConfig:         tlsConfig.Clone(),
+	}
 
 	coltracepb.RegisterTraceServiceServer(c.grpcServer, c)
 
@@ -186,14 +202,26 @@ func (c *Collector) Export(ctx context.Context, req *coltracepb.ExportTraceServi
 		c.spans = append(c.spans, span.ScopeSpans...)
 	}
 
+	select {
+	case c.exportedC <- struct{}{}:
+	default:
+	}
+
 	return &coltracepb.ExportTraceServiceResponse{}, nil
 }
 
+func (c *Collector) WaitForExport() {
+	<-c.exportedC
+}
+
+// Spans returns all collected spans and resets the collector
 func (c *Collector) Spans() []*otlp.ScopeSpans {
-	c.spanLock.RLock()
-	defer c.spanLock.RUnlock()
+	c.spanLock.Lock()
+	defer c.spanLock.Unlock()
 	spans := make([]*otlp.ScopeSpans, len(c.spans))
 	copy(spans, c.spans)
+
+	c.spans = nil
 
 	return spans
 }

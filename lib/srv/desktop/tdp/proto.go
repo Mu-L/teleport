@@ -1,18 +1,20 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 // Package tdp implements the Teleport desktop protocol (TDP)
 // encoder/decoder.
@@ -34,7 +36,7 @@ import (
 	"github.com/gravitational/trace"
 
 	authproto "github.com/gravitational/teleport/api/client/proto"
-	wanlib "github.com/gravitational/teleport/lib/auth/webauthn"
+	wantypes "github.com/gravitational/teleport/lib/auth/webauthntypes"
 	"github.com/gravitational/teleport/lib/client"
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/web/mfajson"
@@ -46,34 +48,40 @@ type MessageType byte
 // For descriptions of each message type see:
 // https://github.com/gravitational/teleport/blob/master/rfd/0037-desktop-access-protocol.md#message-types
 const (
-	TypeClientScreenSpec              = MessageType(1)
-	TypePNGFrame                      = MessageType(2)
-	TypeMouseMove                     = MessageType(3)
-	TypeMouseButton                   = MessageType(4)
-	TypeKeyboardButton                = MessageType(5)
-	TypeClipboardData                 = MessageType(6)
-	TypeClientUsername                = MessageType(7)
-	TypeMouseWheel                    = MessageType(8)
-	TypeError                         = MessageType(9)
-	TypeMFA                           = MessageType(10)
-	TypeSharedDirectoryAnnounce       = MessageType(11)
-	TypeSharedDirectoryAcknowledge    = MessageType(12)
-	TypeSharedDirectoryInfoRequest    = MessageType(13)
-	TypeSharedDirectoryInfoResponse   = MessageType(14)
-	TypeSharedDirectoryCreateRequest  = MessageType(15)
-	TypeSharedDirectoryCreateResponse = MessageType(16)
-	TypeSharedDirectoryDeleteRequest  = MessageType(17)
-	TypeSharedDirectoryDeleteResponse = MessageType(18)
-	TypeSharedDirectoryReadRequest    = MessageType(19)
-	TypeSharedDirectoryReadResponse   = MessageType(20)
-	TypeSharedDirectoryWriteRequest   = MessageType(21)
-	TypeSharedDirectoryWriteResponse  = MessageType(22)
-	TypeSharedDirectoryMoveRequest    = MessageType(23)
-	TypeSharedDirectoryMoveResponse   = MessageType(24)
-	TypeSharedDirectoryListRequest    = MessageType(25)
-	TypeSharedDirectoryListResponse   = MessageType(26)
-	TypePNG2Frame                     = MessageType(27)
-	TypeNotification                  = MessageType(28)
+	TypeClientScreenSpec                = MessageType(1)
+	TypePNGFrame                        = MessageType(2)
+	TypeMouseMove                       = MessageType(3)
+	TypeMouseButton                     = MessageType(4)
+	TypeKeyboardButton                  = MessageType(5)
+	TypeClipboardData                   = MessageType(6)
+	TypeClientUsername                  = MessageType(7)
+	TypeMouseWheel                      = MessageType(8)
+	TypeError                           = MessageType(9)
+	TypeMFA                             = MessageType(10)
+	TypeSharedDirectoryAnnounce         = MessageType(11)
+	TypeSharedDirectoryAcknowledge      = MessageType(12)
+	TypeSharedDirectoryInfoRequest      = MessageType(13)
+	TypeSharedDirectoryInfoResponse     = MessageType(14)
+	TypeSharedDirectoryCreateRequest    = MessageType(15)
+	TypeSharedDirectoryCreateResponse   = MessageType(16)
+	TypeSharedDirectoryDeleteRequest    = MessageType(17)
+	TypeSharedDirectoryDeleteResponse   = MessageType(18)
+	TypeSharedDirectoryReadRequest      = MessageType(19)
+	TypeSharedDirectoryReadResponse     = MessageType(20)
+	TypeSharedDirectoryWriteRequest     = MessageType(21)
+	TypeSharedDirectoryWriteResponse    = MessageType(22)
+	TypeSharedDirectoryMoveRequest      = MessageType(23)
+	TypeSharedDirectoryMoveResponse     = MessageType(24)
+	TypeSharedDirectoryListRequest      = MessageType(25)
+	TypeSharedDirectoryListResponse     = MessageType(26)
+	TypePNG2Frame                       = MessageType(27)
+	TypeAlert                           = MessageType(28)
+	TypeRDPFastPathPDU                  = MessageType(29)
+	TypeRDPResponsePDU                  = MessageType(30)
+	TypeRDPConnectionInitialized        = MessageType(31)
+	TypeSyncKeys                        = MessageType(32)
+	TypeSharedDirectoryTruncateRequest  = MessageType(33)
+	TypeSharedDirectoryTruncateResponse = MessageType(34)
 )
 
 // Message is a Go representation of a desktop protocol message.
@@ -94,25 +102,6 @@ type byteReader interface {
 	io.ByteReader
 }
 
-func readRaw(in byteReader) ([]byte, error) {
-	// Peek at the first byte to figure out message type.
-	t, err := in.ReadByte()
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	switch mt := MessageType(t); mt {
-	case TypePNG2Frame:
-		return readRawPNG2Frame(t, in)
-	default:
-		message, err := decodeMessage(t, in)
-		if err != nil {
-			return nil, trace.Wrap(err)
-		}
-		return message.Encode()
-	}
-}
-
 func decode(in byteReader) (Message, error) {
 	// Peek at the first byte to figure out message type.
 	t, err := in.ReadByte()
@@ -131,6 +120,12 @@ func decodeMessage(firstByte byte, in byteReader) (Message, error) {
 		return decodePNGFrame(in)
 	case TypePNG2Frame:
 		return decodePNG2Frame(in)
+	case TypeRDPFastPathPDU:
+		return decodeRDPFastPathPDU(in)
+	case TypeRDPResponsePDU:
+		return decodeRDPResponsePDU(in)
+	case TypeRDPConnectionInitialized:
+		return decodeConnectionActivated(in)
 	case TypeMouseMove:
 		return decodeMouseMove(in)
 	case TypeMouseButton:
@@ -139,14 +134,16 @@ func decodeMessage(firstByte byte, in byteReader) (Message, error) {
 		return decodeMouseWheel(in)
 	case TypeKeyboardButton:
 		return decodeKeyboardButton(in)
+	case TypeSyncKeys:
+		return decodeSyncKeys(in)
 	case TypeClientUsername:
 		return decodeClientUsername(in)
 	case TypeClipboardData:
 		return decodeClipboardData(in, maxClipboardDataLength)
 	case TypeError:
 		return decodeError(in)
-	case TypeNotification:
-		return decodeNotification(in)
+	case TypeAlert:
+		return decodeAlert(in)
 	case TypeMFA:
 		return DecodeMFA(in)
 	case TypeSharedDirectoryAnnounce:
@@ -181,24 +178,21 @@ func decodeMessage(firstByte byte, in byteReader) (Message, error) {
 		return decodeSharedDirectoryMoveRequest(in)
 	case TypeSharedDirectoryMoveResponse:
 		return decodeSharedDirectoryMoveResponse(in)
+	case TypeSharedDirectoryTruncateRequest:
+		return decodeSharedDirectoryTruncateRequest(in)
+	case TypeSharedDirectoryTruncateResponse:
+		return decodeSharedDirectoryTruncateResponse(in)
 	default:
 		return nil, trace.BadParameter("unsupported desktop protocol message type %d", firstByte)
 	}
 }
 
 // PNGFrame is the PNG frame message
-// https://github.com/gravitational/teleport/blob/master/rfd/0037-desktop-access-protocol.md#2---png-frame
+// | message type (2) | left uint32 | top uint32 | right uint32 | bottom uint32 | data []byte |
 type PNGFrame struct {
 	Img image.Image
 
 	enc *png.Encoder // optionally override the PNG encoder
-}
-
-func NewPNG(img image.Image, enc *png.Encoder) PNG2Frame {
-	return PNG2Frame{
-		Img: img,
-		enc: enc,
-	}
 }
 
 func (f PNGFrame) Encode() ([]byte, error) {
@@ -242,92 +236,195 @@ func decodePNGFrame(in byteReader) (PNGFrame, error) {
 	return PNGFrame{Img: img}, nil
 }
 
-// PNG2Frame is a newer versin of PNGFrame that includes the
-// length of the PNG data.
-type PNG2Frame PNGFrame
+// PNG2Frame is a newer version of PNGFrame that includes the
+// length of the PNG data. It's represented as a fully encoded
+// byte slice to optimize for speed and simplicity of encoding/decoding.
+// | message type (27) | png_length uint32 | left uint32 | top uint32 | right uint32 | bottom uint32 | data []byte |
+type PNG2Frame []byte
 
 func decodePNG2Frame(in byteReader) (PNG2Frame, error) {
-	var length uint32
-	var header struct {
-		Left, Top     uint32
-		Right, Bottom uint32
-	}
-	if err := binary.Read(in, binary.BigEndian, &length); err != nil {
-		return PNG2Frame{}, trace.Wrap(err)
-	}
-	if err := binary.Read(in, binary.BigEndian, &header); err != nil {
-		return PNG2Frame{}, trace.Wrap(err)
-	}
-	img, err := png.Decode(io.LimitReader(in, int64(length)))
-	if err != nil {
-		return PNG2Frame{}, trace.Wrap(err)
-	}
-	// PNG encoding does not preserve offset image bounds.
-	// Opportunistically restore them based on the header.
-	switch img := img.(type) {
-	case *image.RGBA:
-		img.Rect = image.Rect(int(header.Left), int(header.Top), int(header.Right), int(header.Bottom))
-	case *image.NRGBA:
-		img.Rect = image.Rect(int(header.Left), int(header.Top), int(header.Right), int(header.Bottom))
-	}
-	return PNG2Frame{Img: img}, nil
-}
-
-func readRawPNG2Frame(firstByte byte, in byteReader) ([]byte, error) {
-	if MessageType(firstByte) != TypePNG2Frame {
-		return nil, trace.Wrap(trace.BadParameter("incorrect first byte passed to readRawPNG2Frame, expected %v but got %v", TypePNG2Frame, firstByte))
-	}
-
+	// Read PNG length so we can allocate buffer that will fit PNG2Frame message
 	var pngLength uint32
 	if err := binary.Read(in, binary.BigEndian, &pngLength); err != nil {
-		return nil, trace.Wrap(err)
+		return PNG2Frame{}, trace.Wrap(err)
 	}
 
-	b := make([]byte, 1+4+pngLength+16)
-	b[0] = firstByte
-
-	binary.BigEndian.PutUint32(b[1:5], pngLength)
-
-	if _, err := io.ReadFull(in, b[5:]); err != nil {
-		return nil, trace.Wrap(err)
+	// prevent allocation of giant buffers.
+	// this also avoids panic for pngLength ~ 4294967295 due to overflow.
+	if pngLength > maxPNGFrameDataLength {
+		return PNG2Frame{}, trace.BadParameter("pngLength too big: %v", pngLength)
 	}
 
-	return b, nil
+	// Allocate buffer that will fit PNG2Frame message
+	// https://github.com/gravitational/teleport/blob/master/rfd/0037-desktop-access-protocol.md#27---png-frame-2
+	// message type (1) + png length (4) + left, right, top, bottom (4 x 4) + data => 21 + data
+	png2frame := make([]byte, 21+pngLength)
+
+	// Write message type and png length into the buffer
+	png2frame[0] = byte(TypePNG2Frame)
+	binary.BigEndian.PutUint32(png2frame[1:5], pngLength)
+
+	// Write left, top, right, bottom, and the png itself into the buffer
+	if _, err := io.ReadFull(in, png2frame[5:]); err != nil {
+		return PNG2Frame{}, trace.Wrap(err)
+	}
+
+	return png2frame, nil
 }
 
 func (f PNG2Frame) Encode() ([]byte, error) {
+	// Encode gets called on the reusable buffer at
+	// lib/srv/desktop/rdp/rdclient.Client.png2FrameBuffer,
+	// which was causing us recording problems due to the async
+	// nature of SessionWriter. Copying into a new buffer here is
+	// a temporary hack that fixes that.
+	//
+	// TODO(isaiah, zmb3): remove this once a buffer pool is added.
+	b := make([]byte, len(f))
+	copy(b, f)
+	return b, nil
+}
+
+func (f PNG2Frame) Left() uint32   { return binary.BigEndian.Uint32(f[5:9]) }
+func (f PNG2Frame) Top() uint32    { return binary.BigEndian.Uint32(f[9:13]) }
+func (f PNG2Frame) Right() uint32  { return binary.BigEndian.Uint32(f[13:17]) }
+func (f PNG2Frame) Bottom() uint32 { return binary.BigEndian.Uint32(f[17:21]) }
+func (f PNG2Frame) Data() []byte   { return f[21:] }
+
+// RDPFastPathPDU is an RDP Fast-Path PDU message. It carries a raw
+// RDP Server Fast-Path Update PDU (https://tinyurl.com/3t2t6er8) which
+// is used to transport image data to the frontend.
+//
+// | message type (29) | data_length uint32 | data []byte |
+//
+// Whenever you see this type itself, you can assume that it's just
+// the | data []byte | part of the message. Calling Encode() on this
+// type will return the full encoded message, including the
+// | message type (29) | data_length uint32 | parts.
+type RDPFastPathPDU []byte
+
+func decodeRDPFastPathPDU(in byteReader) (RDPFastPathPDU, error) {
+	// Read data length so we can allocate buffer that will fit RDPFastPathPDU message
+	var dataLength uint32
+	if err := binary.Read(in, binary.BigEndian, &dataLength); err != nil {
+		return RDPFastPathPDU(nil), trace.Wrap(err)
+	}
+
+	// Allocate buffer that will fit the data
+	// TODO(isaiah): improve performance by changing
+	// this api to allow buffer re-use.
+	data := make([]byte, dataLength)
+
+	// Write the data into the buffer
+	if _, err := io.ReadFull(in, data); err != nil {
+		return RDPFastPathPDU(nil), trace.Wrap(err)
+	}
+
+	return RDPFastPathPDU(data), nil
+}
+
+func (f RDPFastPathPDU) Encode() ([]byte, error) {
+	// TODO(isaiah, zmb3): remove this once a buffer pool is added.
+	b := make([]byte, 1+4+len(f))                      // byte + uint32 + len(f)
+	b[0] = byte(TypeRDPFastPathPDU)                    // message type (29)
+	binary.BigEndian.PutUint32(b[1:5], uint32(len(f))) // data_length uint32
+	copy(b[5:], f)                                     // data []byte
+	return b, nil
+}
+
+// RDPResponsePDU is an RDP Response PDU message. It carries a raw
+// encoded RDP response PDU created by the ironrdp client on the
+// frontend and sends it directly to the RDP server.
+//
+// | message type (30) | data_length uint32 | data []byte |
+//
+// Whenever you see this type itself, you can assume that it's just
+// the | data []byte | section of the message. Calling Encode() on
+// this type will return the full encoded message, including the
+// | message type (30) | data_length uint32 | parts.
+type RDPResponsePDU []byte
+
+func decodeRDPResponsePDU(in byteReader) (RDPResponsePDU, error) {
+	var resFrameLength uint32
+	if err := binary.Read(in, binary.BigEndian, &resFrameLength); err != nil {
+		return RDPResponsePDU{}, trace.Wrap(err)
+	}
+
+	resFrame := make([]byte, resFrameLength)
+	if _, err := io.ReadFull(in, resFrame); err != nil {
+		return RDPResponsePDU{}, trace.Wrap(err)
+	}
+
+	return resFrame, nil
+}
+
+func (r RDPResponsePDU) Encode() ([]byte, error) {
 	buf := new(bytes.Buffer)
-	buf.WriteByte(byte(TypePNG2Frame))
+	buf.WriteByte(byte(TypeRDPResponsePDU))
+	writeUint32(buf, uint32(len(r)))
+	buf.Write(r)
+	return buf.Bytes(), nil
+}
 
-	// write 0 as a placeholder length for now
-	writeUint32(buf, uint32(0))
+// ConnectionActivated is sent to the browser when an RDP session is fully activated.
+// This includes after the RDP connection is first initialized, or after executing a
+// Deactivation-Reactivation Sequence.
+//
+// It contains data that the browser needs in order to correctly handle the session.
+//
+// See "3. Channel Connection" at https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/023f1e69-cfe8-4ee6-9ee0-7e759fb4e4ee
+// Also see 1.3.1.3 Deactivation-Reactivation Sequence: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/dfc234ce-481a-4674-9a5d-2a7bafb14432
+//
+// | message type (31) | io_channel_id uint16 | user_channel_id uint16 | screen_width uint16 | screen_height uint16 |
+type ConnectionActivated struct {
+	IOChannelID   uint16
+	UserChannelID uint16
+	ScreenWidth   uint16
+	ScreenHeight  uint16
+}
 
-	writeUint32(buf, uint32(f.Img.Bounds().Min.X))
-	writeUint32(buf, uint32(f.Img.Bounds().Min.Y))
-	writeUint32(buf, uint32(f.Img.Bounds().Max.X))
-	writeUint32(buf, uint32(f.Img.Bounds().Max.Y))
+func (c ConnectionActivated) Encode() ([]byte, error) {
+	buf := new(bytes.Buffer)
+	buf.WriteByte(byte(TypeRDPConnectionInitialized))
+	writeUint16(buf, c.IOChannelID)
+	writeUint16(buf, c.UserChannelID)
+	writeUint16(buf, c.ScreenWidth)
+	writeUint16(buf, c.ScreenHeight)
+	return buf.Bytes(), nil
+}
 
-	encoder := f.enc
-	if encoder == nil {
-		encoder = &png.Encoder{}
-	}
-	before := buf.Len()
-	if err := encoder.Encode(buf, f.Img); err != nil {
-		return nil, trace.Wrap(err)
-	}
-	after := buf.Len()
+func decodeConnectionActivated(in byteReader) (ConnectionActivated, error) {
+	var ids ConnectionActivated
+	err := binary.Read(in, binary.BigEndian, &ids)
+	return ids, trace.Wrap(err)
+}
 
-	result := buf.Bytes()
+// | message type (32) | scroll_lock_state byte | num_lock_state byte | caps_lock_state byte | kana_lock_state byte |
+type SyncKeys struct {
+	ScrollLockState ButtonState
+	NumLockState    ButtonState
+	CapsLockState   ButtonState
+	KanaLockState   ButtonState
+}
 
-	// fill in the length
-	pngLen := after - before
-	binary.BigEndian.PutUint32(result[1:5], uint32(pngLen))
+func (k SyncKeys) Encode() ([]byte, error) {
+	buf := new(bytes.Buffer)
+	buf.WriteByte(byte(TypeSyncKeys))
+	buf.WriteByte(byte(k.ScrollLockState))
+	buf.WriteByte(byte(k.NumLockState))
+	buf.WriteByte(byte(k.CapsLockState))
+	buf.WriteByte(byte(k.KanaLockState))
+	return buf.Bytes(), nil
+}
 
-	return result, nil
+func decodeSyncKeys(in byteReader) (SyncKeys, error) {
+	var k SyncKeys
+	err := binary.Read(in, binary.BigEndian, &k)
+	return k, trace.Wrap(err)
 }
 
 // MouseMove is the mouse movement message.
-// https://github.com/gravitational/teleport/blob/master/rfd/0037-desktop-access-protocol.md#3---mouse-move
+// | message type (3) | x uint32 | y uint32 |
 type MouseMove struct {
 	X, Y uint32
 }
@@ -364,7 +461,7 @@ const (
 )
 
 // MouseButton is the mouse button press message.
-// https://github.com/gravitational/teleport/blob/master/rfd/0037-desktop-access-protocol.md#4---mouse-button
+// | message type (4) | button byte | state byte |
 type MouseButton struct {
 	Button MouseButtonType
 	State  ButtonState
@@ -381,7 +478,7 @@ func decodeMouseButton(in byteReader) (MouseButton, error) {
 }
 
 // KeyboardButton is the keyboard button press message.
-// https://github.com/gravitational/teleport/blob/master/rfd/0037-desktop-access-protocol.md#4---keyboard-input
+// | message type (5) | key_code uint32 | state byte |
 type KeyboardButton struct {
 	KeyCode uint32
 	State   ButtonState
@@ -402,7 +499,7 @@ func decodeKeyboardButton(in byteReader) (KeyboardButton, error) {
 }
 
 // ClientScreenSpec is the client screen specification.
-// https://github.com/gravitational/teleport/blob/master/rfd/0037-desktop-access-protocol.md#1---client-screen-spec
+// | message type (1) | width uint32 | height uint32 |
 type ClientScreenSpec struct {
 	Width  uint32
 	Height uint32
@@ -423,7 +520,7 @@ func decodeClientScreenSpec(in io.Reader) (ClientScreenSpec, error) {
 }
 
 // ClientUsername is the client username.
-// https://github.com/gravitational/teleport/blob/master/rfd/0037-desktop-access-protocol.md#7---client-username
+// | message type (7) | username_length uint32 | username []byte |
 type ClientUsername struct {
 	Username string
 }
@@ -454,8 +551,12 @@ func decodeClientUsername(in io.Reader) (ClientUsername, error) {
 }
 
 // Error is used to send a fatal error message to the browser.
+//
 // In Teleport 12 and up, Error is deprecated and Notification
-// should be preferred.
+// should be preferred. Nevertheless, IT SHOULD NOT BE DELETED
+// in order for older session recordings to continue to work.
+//
+// | message type (9) | message_length uint32 | message []byte |
 type Error struct {
 	Message string
 }
@@ -470,7 +571,7 @@ func (m Error) Encode() ([]byte, error) {
 }
 
 func decodeError(in io.Reader) (Error, error) {
-	message, err := decodeString(in, tdpMaxNotificationMessageLength)
+	message, err := decodeString(in, tdpMaxAlertMessageLength)
 	if err != nil {
 		return Error{}, trace.Wrap(err)
 	}
@@ -485,17 +586,19 @@ const (
 	SeverityError   Severity = 2
 )
 
-// Notification is an informational message sent from Teleport
+// Alert is an informational message sent from Teleport
 // to the Web UI. It can be used for fatal errors or non-fatal
 // warnings.
-type Notification struct {
+//
+// | message type (28) | message_length uint32 | message []byte | severity byte |
+type Alert struct {
 	Message  string
 	Severity Severity
 }
 
-func (m Notification) Encode() ([]byte, error) {
+func (m Alert) Encode() ([]byte, error) {
 	buf := new(bytes.Buffer)
-	buf.WriteByte(byte(TypeNotification))
+	buf.WriteByte(byte(TypeAlert))
 	if err := encodeString(buf, m.Message); err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -503,16 +606,16 @@ func (m Notification) Encode() ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-func decodeNotification(in byteReader) (Notification, error) {
-	message, err := decodeString(in, tdpMaxNotificationMessageLength)
+func decodeAlert(in byteReader) (Alert, error) {
+	message, err := decodeString(in, tdpMaxAlertMessageLength)
 	if err != nil {
-		return Notification{}, trace.Wrap(err)
+		return Alert{}, trace.Wrap(err)
 	}
 	severity, err := in.ReadByte()
 	if err != nil {
-		return Notification{}, trace.Wrap(err)
+		return Alert{}, trace.Wrap(err)
 	}
-	return Notification{Message: message, Severity: Severity(severity)}, nil
+	return Alert{Message: message, Severity: Severity(severity)}, nil
 }
 
 // MouseWheelAxis identifies a scroll axis on the mouse wheel.
@@ -524,7 +627,7 @@ const (
 )
 
 // MouseWheel is the mouse wheel scroll message.
-// https://github.com/gravitational/teleport/blob/master/rfd/0037-desktop-access-protocol.md#8---mouse-wheel
+// | message type (8) | axis byte | delta int16 |
 type MouseWheel struct {
 	Axis  MouseWheelAxis
 	Delta int16
@@ -546,6 +649,7 @@ func decodeMouseWheel(in io.Reader) (MouseWheel, error) {
 }
 
 // ClipboardData represents shared clipboard data.
+// | message type (6) | length uint32 | data []byte |
 type ClipboardData []byte
 
 func (c ClipboardData) Encode() ([]byte, error) {
@@ -579,6 +683,8 @@ func decodeClipboardData(in io.Reader, maxLen uint32) (ClipboardData, error) {
 
 const maxMFADataLength = 1024 * 1024
 
+// MFA represents a MFA challenge or response.
+// | message type (10) | mfa_type byte | length uint32 | JSON []byte |
 type MFA struct {
 	// Type should be defaults.WebsocketWebauthnChallenge
 	Type byte
@@ -605,7 +711,7 @@ func (m MFA) Encode() ([]byte, error) {
 	} else if m.MFAAuthenticateResponse != nil {
 		switch t := m.MFAAuthenticateResponse.Response.(type) {
 		case *authproto.MFAAuthenticateResponse_Webauthn:
-			buff, err = json.Marshal(wanlib.CredentialAssertionResponseFromProto(m.MFAAuthenticateResponse.GetWebauthn()))
+			buff, err = json.Marshal(wantypes.CredentialAssertionResponseFromProto(m.MFAAuthenticateResponse.GetWebauthn()))
 			if err != nil {
 				return nil, trace.Wrap(err)
 			}
@@ -631,10 +737,10 @@ func DecodeMFA(in byteReader) (*MFA, error) {
 	}
 	s := string(mt)
 	switch s {
-	case defaults.WebsocketWebauthnChallenge:
+	case defaults.WebsocketMFAChallenge:
 	default:
 		return nil, trace.BadParameter(
-			"got mfa type %v, expected %v (WebAuthn)", mt, defaults.WebsocketWebauthnChallenge)
+			"got mfa type %v, expected %v (MFAChallenge)", mt, defaults.WebsocketMFAChallenge)
 	}
 
 	var length uint32
@@ -645,6 +751,8 @@ func DecodeMFA(in byteReader) (*MFA, error) {
 	if length > maxMFADataLength {
 		_, _ = io.CopyN(io.Discard, in, int64(length))
 		return nil, mfaDataMaxLenErr
+	} else if length == 0 {
+		return nil, trace.BadParameter("mfa data missing")
 	}
 
 	b := make([]byte, int(length))
@@ -672,10 +780,10 @@ func DecodeMFAChallenge(in byteReader) (*MFA, error) {
 	}
 	s := string(mt)
 	switch s {
-	case defaults.WebsocketWebauthnChallenge:
+	case defaults.WebsocketMFAChallenge:
 	default:
 		return nil, trace.BadParameter(
-			"got mfa type %v, expected %v (WebAuthn)", mt, defaults.WebsocketWebauthnChallenge)
+			"got mfa type %v, expected %v (MFAChallenge)", mt, defaults.WebsocketMFAChallenge)
 	}
 
 	var length uint32
@@ -685,6 +793,8 @@ func DecodeMFAChallenge(in byteReader) (*MFA, error) {
 
 	if length > maxMFADataLength {
 		return nil, trace.BadParameter("mfa challenge data exceeds maximum length")
+	} else if length == 0 {
+		return nil, trace.BadParameter("mfa challenge data missing")
 	}
 
 	b := make([]byte, int(length))
@@ -692,20 +802,19 @@ func DecodeMFAChallenge(in byteReader) (*MFA, error) {
 		return nil, trace.Wrap(err)
 	}
 
-	var req *client.MFAAuthenticateChallenge
+	var req client.MFAAuthenticateChallenge
 	if err := json.Unmarshal(b, &req); err != nil {
-		return nil, trace.Wrap(err)
-	}
-	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
 	return &MFA{
 		Type:                     mt,
-		MFAAuthenticateChallenge: req,
+		MFAAuthenticateChallenge: &req,
 	}, nil
 }
 
+// SharedDirectoryAnnounce announces a new directory to be shared.
+// | message type (11) | directory_id uint32 | name_length uint32 | name []byte |
 type SharedDirectoryAnnounce struct {
 	DirectoryID uint32
 	Name        string
@@ -714,6 +823,8 @@ type SharedDirectoryAnnounce struct {
 func (s SharedDirectoryAnnounce) Encode() ([]byte, error) {
 	buf := new(bytes.Buffer)
 	buf.WriteByte(byte(TypeSharedDirectoryAnnounce))
+	// TODO(isaiah): The discard here allows fuzz tests to succeed, it should eventually be done away with.
+	writeUint32(buf, 0) // discard
 	writeUint32(buf, s.DirectoryID)
 	if err := encodeString(buf, s.Name); err != nil {
 		return nil, trace.Wrap(err)
@@ -722,11 +833,15 @@ func (s SharedDirectoryAnnounce) Encode() ([]byte, error) {
 }
 
 func decodeSharedDirectoryAnnounce(in io.Reader) (SharedDirectoryAnnounce, error) {
-	var completionID, directoryID uint32
-	err := binary.Read(in, binary.BigEndian, &completionID)
+	// TODO(isaiah): The discard here is a copy-paste error, but we need to keep it
+	// for now in order that the proxy stay compatible with previous versions of the wds.
+	var discard uint32
+	err := binary.Read(in, binary.BigEndian, &discard)
 	if err != nil {
 		return SharedDirectoryAnnounce{}, trace.Wrap(err)
 	}
+
+	var directoryID uint32
 	err = binary.Read(in, binary.BigEndian, &directoryID)
 	if err != nil {
 		return SharedDirectoryAnnounce{}, trace.Wrap(err)
@@ -742,6 +857,8 @@ func decodeSharedDirectoryAnnounce(in io.Reader) (SharedDirectoryAnnounce, error
 	}, nil
 }
 
+// SharedDirectoryAcknowledge acknowledges a SharedDirectoryAnnounce was received.
+// | message type (12) | err_code uint32 | directory_id uint32 |
 type SharedDirectoryAcknowledge struct {
 	ErrCode     uint32
 	DirectoryID uint32
@@ -761,6 +878,8 @@ func (s SharedDirectoryAcknowledge) Encode() ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+// SharedDirectoryInfoRequest requests information about a file or directory.
+// | message type (13) | completion_id uint32 | directory_id uint32 | path_length uint32 | path []byte |
 type SharedDirectoryInfoRequest struct {
 	CompletionID uint32
 	DirectoryID  uint32
@@ -800,6 +919,8 @@ func decodeSharedDirectoryInfoRequest(in io.Reader) (SharedDirectoryInfoRequest,
 	}, nil
 }
 
+// SharedDirectoryInfoResponse returns information about a file or directory.
+// | message type (14) | completion_id uint32 | err_code uint32 | file_system_object fso |
 type SharedDirectoryInfoResponse struct {
 	CompletionID uint32
 	ErrCode      uint32
@@ -841,6 +962,8 @@ func decodeSharedDirectoryInfoResponse(in byteReader) (SharedDirectoryInfoRespon
 	}, nil
 }
 
+// FileSystemObject represents a file or directory.
+// | last_modified uint64 | size uint64 | file_type uint32 | is_empty bool | path_length uint32 | path byte[] |
 type FileSystemObject struct {
 	LastModified uint64
 	Size         uint64
@@ -895,6 +1018,8 @@ func decodeFileSystemObject(in byteReader) (FileSystemObject, error) {
 	}, nil
 }
 
+// SharedDirectoryCreateRequest is sent by the TDP server to the client to request the creation of a new file or directory.
+// | message type (15) | completion_id uint32 | directory_id uint32 | file_type uint32 | path_length uint32 | path []byte |
 type SharedDirectoryCreateRequest struct {
 	CompletionID uint32
 	DirectoryID  uint32
@@ -940,9 +1065,10 @@ func decodeSharedDirectoryCreateRequest(in io.Reader) (SharedDirectoryCreateRequ
 		FileType:     fileType,
 		Path:         path,
 	}, nil
-
 }
 
+// SharedDirectoryCreateResponseis sent by the TDP client to the server with information from an executed SharedDirectoryCreateRequest.
+// | message type (16) | completion_id uint32 | err_code uint32 | file_system_object fso |
 type SharedDirectoryCreateResponse struct {
 	CompletionID uint32
 	ErrCode      uint32
@@ -985,6 +1111,8 @@ func decodeSharedDirectoryCreateResponse(in byteReader) (SharedDirectoryCreateRe
 	}, err
 }
 
+// SharedDirectoryDeleteRequest is sent by the TDP server to the client to request the deletion of a file or directory.
+// | message type (17) | completion_id uint32 | directory_id uint32 | path_length uint32 | path []byte |
 type SharedDirectoryDeleteRequest struct {
 	CompletionID uint32
 	DirectoryID  uint32
@@ -1025,6 +1153,8 @@ func decodeSharedDirectoryDeleteRequest(in io.Reader) (SharedDirectoryDeleteRequ
 	}, nil
 }
 
+// SharedDirectoryDeleteResponse is sent by the TDP client to the server with information from an executed SharedDirectoryDeleteRequest.
+// | message type (18) | completion_id uint32 | err_code uint32 |
 type SharedDirectoryDeleteResponse struct {
 	CompletionID uint32
 	ErrCode      uint32
@@ -1044,6 +1174,8 @@ func decodeSharedDirectoryDeleteResponse(in io.Reader) (SharedDirectoryDeleteRes
 	return res, err
 }
 
+// SharedDirectoryListRequest is sent by the TDP server to the client to request a directory listing.
+// | message type (25) | completion_id uint32 | directory_id uint32 | path_length uint32 | path []byte |
 type SharedDirectoryListRequest struct {
 	CompletionID uint32
 	DirectoryID  uint32
@@ -1084,6 +1216,7 @@ func decodeSharedDirectoryListRequest(in io.Reader) (SharedDirectoryListRequest,
 	}, nil
 }
 
+// SharedDirectoryListResponse is sent by the TDP client to the server with the information from an executed SharedDirectoryListRequest.
 // | message type (26) | completion_id uint32 | err_code uint32 | fso_list_length uint32 | fso_list fso[] |
 type SharedDirectoryListResponse struct {
 	CompletionID uint32
@@ -1140,8 +1273,9 @@ func decodeSharedDirectoryListResponse(in byteReader) (SharedDirectoryListRespon
 	}, nil
 }
 
-// SharedDirectoryReadRequest is a message sent by the server to the client to request
+// SharedDirectoryReadRequest is a message sent by the TDP server to the client to request
 // bytes to be read from the file at the path and starting at byte offset.
+// | message type (19) | completion_id uint32 | directory_id uint32 | path_length uint32 | path []byte | offset uint64 | length uint32 |
 type SharedDirectoryReadRequest struct {
 	CompletionID uint32
 	DirectoryID  uint32
@@ -1201,8 +1335,9 @@ func decodeSharedDirectoryReadRequest(in io.Reader) (SharedDirectoryReadRequest,
 	}, nil
 }
 
-// SharedDirectoryReadResponse is a message sent by the client to the server
+// SharedDirectoryReadResponse is a message sent by the TDP client to the server
 // in response to the SharedDirectoryReadRequest.
+// | message type (20) | completion_id uint32 | err_code uint32 | read_data_length uint32 | read_data []byte |
 type SharedDirectoryReadResponse struct {
 	CompletionID   uint32
 	ErrCode        uint32
@@ -1256,8 +1391,9 @@ func decodeSharedDirectoryReadResponse(in io.Reader, maxLen uint32) (SharedDirec
 	}, nil
 }
 
-// SharedDirectoryWriteRequest is a message sent by the server to the client to request
+// SharedDirectoryWriteRequest is a message sent by the TDP server to the client to request
 // bytes to be written the file at the path and starting at byte offset.
+// | message type (21) | completion_id uint32 | directory_id uint32 | path_length uint32 | path []byte | offset uint64 | write_data_length uint32 | write_data []byte |
 type SharedDirectoryWriteRequest struct {
 	CompletionID    uint32
 	DirectoryID     uint32
@@ -1329,11 +1465,11 @@ func decodeSharedDirectoryWriteRequest(in byteReader, maxLen uint32) (SharedDire
 		WriteDataLength: writeDataLength,
 		WriteData:       writeData,
 	}, nil
-
 }
 
-// SharedDirectoryWriteResponse is a message sent by the client to the server
+// SharedDirectoryWriteResponse is a message sent by the TDP client to the server
 // in response to the SharedDirectoryWriteRequest.
+// | message type (22) | completion_id uint32 | err_code uint32 | bytes_written uint32 |
 type SharedDirectoryWriteResponse struct {
 	CompletionID uint32
 	ErrCode      uint32
@@ -1357,6 +1493,7 @@ func decodeSharedDirectoryWriteResponse(in io.Reader) (SharedDirectoryWriteRespo
 
 // SharedDirectoryMoveRequest is sent from the TDP server to the client
 // to request a file at original_path be moved to new_path.
+// | message type (23) | completion_id uint32 | directory_id uint32 | original_path_length uint32 | original_path []byte | new_path_length uint32 | new_path []byte |
 type SharedDirectoryMoveRequest struct {
 	CompletionID uint32
 	DirectoryID  uint32
@@ -1404,6 +1541,9 @@ func decodeSharedDirectoryMoveRequest(in io.Reader) (SharedDirectoryMoveRequest,
 	}, nil
 }
 
+// SharedDirectoryMoveResponse is sent from the TDP client to the server
+// to acknowledge a SharedDirectoryMoveRequest was executed.
+// | message type (24) | completion_id uint32 | err_code uint32 |
 type SharedDirectoryMoveResponse struct {
 	CompletionID uint32
 	ErrCode      uint32
@@ -1419,6 +1559,74 @@ func (s SharedDirectoryMoveResponse) Encode() ([]byte, error) {
 
 func decodeSharedDirectoryMoveResponse(in io.Reader) (SharedDirectoryMoveResponse, error) {
 	var res SharedDirectoryMoveResponse
+	err := binary.Read(in, binary.BigEndian, &res)
+	return res, err
+}
+
+// | message type (33) | completion_id uint32 | directory_id uint32 | path_length uint32 | path []byte | end_of_file uint32 |
+type SharedDirectoryTruncateRequest struct {
+	CompletionID uint32
+	DirectoryID  uint32
+	Path         string
+	EndOfFile    uint32
+}
+
+func (s SharedDirectoryTruncateRequest) Encode() ([]byte, error) {
+	buf := new(bytes.Buffer)
+	buf.WriteByte(byte(TypeSharedDirectoryTruncateRequest))
+	writeUint32(buf, s.CompletionID)
+	writeUint32(buf, s.DirectoryID)
+	if err := encodeString(buf, s.Path); err != nil {
+		return nil, trace.Wrap(err)
+	}
+	writeUint32(buf, s.EndOfFile)
+	return buf.Bytes(), nil
+}
+
+func decodeSharedDirectoryTruncateRequest(in io.Reader) (SharedDirectoryTruncateRequest, error) {
+	var completionID, directoryID, endOfFile uint32
+	err := binary.Read(in, binary.BigEndian, &completionID)
+	if err != nil {
+		return SharedDirectoryTruncateRequest{}, trace.Wrap(err)
+	}
+	err = binary.Read(in, binary.BigEndian, &directoryID)
+	if err != nil {
+		return SharedDirectoryTruncateRequest{}, trace.Wrap(err)
+	}
+	path, err := decodeString(in, tdpMaxPathLength)
+	if err != nil {
+		return SharedDirectoryTruncateRequest{}, trace.Wrap(err)
+	}
+	err = binary.Read(in, binary.BigEndian, &endOfFile)
+	if err != nil {
+		return SharedDirectoryTruncateRequest{}, trace.Wrap(err)
+	}
+	return SharedDirectoryTruncateRequest{
+		CompletionID: completionID,
+		DirectoryID:  directoryID,
+		Path:         path,
+		EndOfFile:    endOfFile,
+	}, nil
+}
+
+// SharedDirectoryTruncateResponse is sent from the TDP client to the server
+// to acknowledge a SharedDirectoryTruncateRequest was executed.
+// | message type (34) | completion_id uint32 | err_code uint32 |
+type SharedDirectoryTruncateResponse struct {
+	CompletionID uint32
+	ErrCode      uint32
+}
+
+func (s SharedDirectoryTruncateResponse) Encode() ([]byte, error) {
+	buf := new(bytes.Buffer)
+	buf.WriteByte(byte(TypeSharedDirectoryTruncateResponse))
+	writeUint32(buf, s.CompletionID)
+	writeUint32(buf, s.ErrCode)
+	return buf.Bytes(), nil
+}
+
+func decodeSharedDirectoryTruncateResponse(in io.Reader) (SharedDirectoryTruncateResponse, error) {
+	var res SharedDirectoryTruncateResponse
 	err := binary.Read(in, binary.BigEndian, &res)
 	return res, err
 }
@@ -1454,6 +1662,12 @@ func decodeString(r io.Reader, maxLen uint32) (string, error) {
 	return string(s), nil
 }
 
+// writeUint16 writes v to b in big endian order
+func writeUint16(b *bytes.Buffer, v uint16) {
+	b.WriteByte(byte(v >> 8))
+	b.WriteByte(byte(v))
+}
+
 // writeUint32 writes v to b in big endian order
 func writeUint32(b *bytes.Buffer, v uint32) {
 	b.WriteByte(byte(v >> 24))
@@ -1474,17 +1688,22 @@ func writeUint64(b *bytes.Buffer, v uint64) {
 	b.WriteByte(byte(v))
 }
 
-// tdpMaxNotificationMessageLength is somewhat arbitrary, as it is only sent *to*
-// the browser (Teleport never receives this message, so won't be decoding it)
-const tdpMaxNotificationMessageLength = 10240
+const (
+	// tdpMaxAlertMessageLength is somewhat arbitrary, as it is only sent *to*
+	// the browser (Teleport never receives this message, so won't be decoding it)
+	tdpMaxAlertMessageLength = 10240
 
-// tdpMaxPathLength is somewhat arbitrary because we weren't able to determine
-// a precise value to set it to: https://github.com/gravitational/teleport/issues/14950#issuecomment-1341632465
-// The limit is kept as an additional defense-in-depth measure.
-const tdpMaxPathLength = 10240
+	// tdpMaxPathLength is somewhat arbitrary because we weren't able to determine
+	// a precise value to set it to: https://github.com/gravitational/teleport/issues/14950#issuecomment-1341632465
+	// The limit is kept as an additional defense-in-depth measure.
+	tdpMaxPathLength = 10240
 
-const maxClipboardDataLength = 1024 * 1024    // 1MB
-const tdpMaxFileReadWriteLength = 1024 * 1024 // 1MB
+	maxClipboardDataLength    = 1024 * 1024 // 1MB
+	tdpMaxFileReadWriteLength = 1024 * 1024 // 1MB
+)
+
+// maxPNGFrameDataLength is maximum data length for PNG2Frame
+const maxPNGFrameDataLength = 10 * 1024 * 1024 // 10MB
 
 // These correspond to TdpErrCode enum in the rust RDP client.
 const (

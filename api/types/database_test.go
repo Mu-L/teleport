@@ -17,27 +17,130 @@ limitations under the License.
 package types
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
+	"github.com/gravitational/trace"
 	"github.com/stretchr/testify/require"
+
+	gcputils "github.com/gravitational/teleport/api/utils/gcp"
 )
 
 // TestDatabaseRDSEndpoint verifies AWS info is correctly populated
 // based on the RDS endpoint.
 func TestDatabaseRDSEndpoint(t *testing.T) {
-	database, err := NewDatabaseV3(Metadata{
-		Name: "rds",
-	}, DatabaseSpecV3{
-		Protocol: "postgres",
-		URI:      "aurora-instance-1.abcdefghijklmnop.us-west-1.rds.amazonaws.com:5432",
-	})
-	require.NoError(t, err)
-	require.Equal(t, AWS{
-		Region: "us-west-1",
-		RDS: RDS{
-			InstanceID: "aurora-instance-1",
+	isBadParamErrFn := func(tt require.TestingT, err error, i ...any) {
+		require.True(tt, trace.IsBadParameter(err), "expected bad parameter, got %v", err)
+	}
+
+	for _, tt := range []struct {
+		name                 string
+		labels               map[string]string
+		spec                 DatabaseSpecV3
+		errorCheck           require.ErrorAssertionFunc
+		expectedAWS          AWS
+		expectedEndpointType string
+	}{
+		{
+			name: "aurora instance",
+			spec: DatabaseSpecV3{
+				Protocol: "postgres",
+				URI:      "aurora-instance-1.abcdefghijklmnop.us-west-1.rds.amazonaws.com:5432",
+			},
+			errorCheck: require.NoError,
+			expectedAWS: AWS{
+				Region: "us-west-1",
+				RDS: RDS{
+					InstanceID: "aurora-instance-1",
+				},
+			},
+			expectedEndpointType: "instance",
 		},
-	}, database.GetAWS())
+		{
+			name: "invalid account id",
+			spec: DatabaseSpecV3{
+				Protocol: "postgres",
+				URI:      "marcotest-db001.abcdefghijklmnop.us-east-1.rds.amazonaws.com:5432",
+				AWS: AWS{
+					AccountID: "invalid",
+				},
+			},
+			errorCheck: isBadParamErrFn,
+		},
+		{
+			name: "valid account id",
+			spec: DatabaseSpecV3{
+				Protocol: "postgres",
+				URI:      "marcotest-db001.cluster-ro-abcdefghijklmnop.us-east-1.rds.amazonaws.com:5432",
+				AWS: AWS{
+					AccountID: "123456789012",
+				},
+			},
+			errorCheck: require.NoError,
+			expectedAWS: AWS{
+				Region: "us-east-1",
+				RDS: RDS{
+					ClusterID: "marcotest-db001",
+				},
+				AccountID: "123456789012",
+			},
+			expectedEndpointType: "reader",
+		},
+		{
+			name: "discovered instance",
+			labels: map[string]string{
+				"account-id":                        "123456789012",
+				"endpoint-type":                     "primary",
+				"engine":                            "aurora-postgresql",
+				"engine-version":                    "15.2",
+				"region":                            "us-west-1",
+				"teleport.dev/cloud":                "AWS",
+				"teleport.dev/origin":               "cloud",
+				"teleport.internal/discovered-name": "rds",
+			},
+			spec: DatabaseSpecV3{
+				Protocol: "postgres",
+				URI:      "discovered.rds.com:5432",
+				AWS: AWS{
+					Region: "us-west-1",
+					RDS: RDS{
+						InstanceID: "aurora-instance-1",
+						IAMAuth:    true,
+					},
+				},
+			},
+			errorCheck: require.NoError,
+			expectedAWS: AWS{
+				Region: "us-west-1",
+				RDS: RDS{
+					InstanceID: "aurora-instance-1",
+					IAMAuth:    true,
+				},
+			},
+			expectedEndpointType: "primary",
+		},
+	} {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			database, err := NewDatabaseV3(
+				Metadata{
+					Labels: tt.labels,
+					Name:   "rds",
+				},
+				tt.spec,
+			)
+			tt.errorCheck(t, err)
+			if err != nil {
+				return
+			}
+
+			require.Equal(t, tt.expectedAWS, database.GetAWS())
+			require.Equal(t, tt.expectedEndpointType, database.GetEndpointType())
+		})
+	}
 }
 
 // TestDatabaseRDSProxyEndpoint verifies AWS info is correctly populated based
@@ -213,7 +316,7 @@ func TestDatabaseAzureEndpoints(t *testing.T) {
 			},
 		},
 		{
-			name: "valid PostgresSQL",
+			name: "valid PostgreSQL",
 			spec: DatabaseSpecV3{
 				Protocol: "postgres",
 				URI:      "example-postgres.postgres.database.azure.com:5432",
@@ -354,7 +457,7 @@ func TestCassandraAWSEndpoint(t *testing.T) {
 			Protocol: "cassandra",
 			AWS: AWS{
 				Region:    "us-west-1",
-				AccountID: "12345",
+				AccountID: "123456789012",
 			},
 		})
 		require.NoError(t, err)
@@ -368,7 +471,7 @@ func TestCassandraAWSEndpoint(t *testing.T) {
 			Protocol: "cassandra",
 			URI:      "cassandra.us-west-1.amazonaws.com:9142",
 			AWS: AWS{
-				AccountID: "12345",
+				AccountID: "123456789012",
 			},
 		})
 		require.NoError(t, err)
@@ -383,7 +486,7 @@ func TestCassandraAWSEndpoint(t *testing.T) {
 			Protocol: "cassandra",
 			URI:      "cassandra-fips.us-west-2.amazonaws.com:9142",
 			AWS: AWS{
-				AccountID: "12345",
+				AccountID: "123456789012",
 			},
 		})
 		require.NoError(t, err)
@@ -413,11 +516,11 @@ func TestDatabaseFromRedshiftServerlessEndpoint(t *testing.T) {
 			Name: "test",
 		}, DatabaseSpecV3{
 			Protocol: "postgres",
-			URI:      "my-workgroup.1234567890.us-east-1.redshift-serverless.amazonaws.com:5439",
+			URI:      "my-workgroup.123456789012.us-east-1.redshift-serverless.amazonaws.com:5439",
 		})
 		require.NoError(t, err)
 		require.Equal(t, AWS{
-			AccountID: "1234567890",
+			AccountID: "123456789012",
 			Region:    "us-east-1",
 			RedshiftServerless: RedshiftServerless{
 				WorkgroupName: "my-workgroup",
@@ -430,7 +533,7 @@ func TestDatabaseFromRedshiftServerlessEndpoint(t *testing.T) {
 			Name: "test",
 		}, DatabaseSpecV3{
 			Protocol: "postgres",
-			URI:      "my-vpc-endpoint-xxxyyyzzz.1234567890.us-east-1.redshift-serverless.amazonaws.com:5439",
+			URI:      "my-vpc-endpoint-xxxyyyzzz.123456789012.us-east-1.redshift-serverless.amazonaws.com:5439",
 			AWS: AWS{
 				RedshiftServerless: RedshiftServerless{
 					WorkgroupName: "my-workgroup",
@@ -439,7 +542,7 @@ func TestDatabaseFromRedshiftServerlessEndpoint(t *testing.T) {
 		})
 		require.NoError(t, err)
 		require.Equal(t, AWS{
-			AccountID: "1234567890",
+			AccountID: "123456789012",
 			Region:    "us-east-1",
 			RedshiftServerless: RedshiftServerless{
 				WorkgroupName: "my-workgroup",
@@ -477,6 +580,597 @@ func TestDatabaseSelfHosted(t *testing.T) {
 			require.NoError(t, err)
 			require.Equal(t, DatabaseTypeSelfHosted, database.GetType())
 			require.False(t, database.IsCloudHosted())
+		})
+	}
+}
+
+func TestDynamoDBConfig(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		desc       string
+		uri        string
+		region     string
+		account    string
+		roleARN    string
+		externalID string
+		wantSpec   DatabaseSpecV3
+		wantErrMsg string
+	}{
+		{
+			desc:    "account and region and empty URI is correct",
+			region:  "us-west-1",
+			account: "123456789012",
+			wantSpec: DatabaseSpecV3{
+				URI: "aws://dynamodb.us-west-1.amazonaws.com",
+				AWS: AWS{
+					Region:    "us-west-1",
+					AccountID: "123456789012",
+				},
+			},
+		},
+		{
+			desc:       "account and region and assume role is correct",
+			region:     "us-west-1",
+			account:    "123456789012",
+			roleARN:    "arn:aws:iam::123456789012:role/DBDiscoverer",
+			externalID: "externalid123",
+			wantSpec: DatabaseSpecV3{
+				URI: "aws://dynamodb.us-west-1.amazonaws.com",
+				AWS: AWS{
+					Region:        "us-west-1",
+					AccountID:     "123456789012",
+					AssumeRoleARN: "arn:aws:iam::123456789012:role/DBDiscoverer",
+					ExternalID:    "externalid123",
+				},
+			},
+		},
+		{
+			desc:    "account and AWS URI and empty region is correct",
+			uri:     "dynamodb.us-west-1.amazonaws.com",
+			account: "123456789012",
+			wantSpec: DatabaseSpecV3{
+				URI: "dynamodb.us-west-1.amazonaws.com",
+				AWS: AWS{
+					Region:    "us-west-1",
+					AccountID: "123456789012",
+				},
+			},
+		},
+		{
+			desc:    "account and AWS streams dynamodb URI and empty region is correct",
+			uri:     "streams.dynamodb.us-west-1.amazonaws.com",
+			account: "123456789012",
+			wantSpec: DatabaseSpecV3{
+				URI: "streams.dynamodb.us-west-1.amazonaws.com",
+				AWS: AWS{
+					Region:    "us-west-1",
+					AccountID: "123456789012",
+				},
+			},
+		},
+		{
+			desc:    "account and AWS dax URI and empty region is correct",
+			uri:     "dax.us-west-1.amazonaws.com",
+			account: "123456789012",
+			wantSpec: DatabaseSpecV3{
+				URI: "dax.us-west-1.amazonaws.com",
+				AWS: AWS{
+					Region:    "us-west-1",
+					AccountID: "123456789012",
+				},
+			},
+		},
+		{
+			desc:    "account and region and matching AWS URI region is correct",
+			uri:     "dynamodb.us-west-1.amazonaws.com",
+			region:  "us-west-1",
+			account: "123456789012",
+			wantSpec: DatabaseSpecV3{
+				URI: "dynamodb.us-west-1.amazonaws.com",
+				AWS: AWS{
+					Region:    "us-west-1",
+					AccountID: "123456789012",
+				},
+			},
+		},
+		{
+			desc:    "account and region and custom URI is correct",
+			uri:     "localhost:8080",
+			region:  "us-west-1",
+			account: "123456789012",
+			wantSpec: DatabaseSpecV3{
+				URI: "localhost:8080",
+				AWS: AWS{
+					Region:    "us-west-1",
+					AccountID: "123456789012",
+				},
+			},
+		},
+		{
+			desc:       "configured external ID but not assume role is ok",
+			uri:        "localhost:8080",
+			region:     "us-west-1",
+			account:    "123456789012",
+			externalID: "externalid123",
+			wantSpec: DatabaseSpecV3{
+				URI: "localhost:8080",
+				AWS: AWS{
+					Region:     "us-west-1",
+					AccountID:  "123456789012",
+					ExternalID: "externalid123",
+				},
+			},
+		},
+		{
+			desc:       "region and different AWS URI region is an error",
+			uri:        "dynamodb.us-west-2.amazonaws.com",
+			region:     "us-west-1",
+			account:    "123456789012",
+			wantErrMsg: "does not match the configured URI",
+		},
+		{
+			desc:       "invalid AWS URI is an error",
+			uri:        "a.streams.dynamodb.us-west-1.amazonaws.com",
+			region:     "us-west-1",
+			account:    "123456789012",
+			wantErrMsg: "invalid DynamoDB endpoint",
+		},
+		{
+			desc:       "custom URI and missing region is an error",
+			uri:        "localhost:8080",
+			account:    "123456789012",
+			wantErrMsg: "region is empty",
+		},
+		{
+			desc:       "missing URI and missing region is an error",
+			account:    "123456789012",
+			wantErrMsg: "URI is empty",
+		},
+		{
+			desc:       "invalid AWS account ID is an error",
+			uri:        "localhost:8080",
+			region:     "us-west-1",
+			account:    "12345",
+			wantErrMsg: "must be 12-digit",
+		},
+		{
+			region:     "us-west-1",
+			desc:       "missing account id",
+			wantErrMsg: "account ID is empty",
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.desc, func(t *testing.T) {
+			t.Parallel()
+			database, err := NewDatabaseV3(Metadata{
+				Name: "test",
+			}, DatabaseSpecV3{
+				Protocol: "dynamodb",
+				URI:      tt.uri,
+				AWS: AWS{
+					Region:        tt.region,
+					AccountID:     tt.account,
+					AssumeRoleARN: tt.roleARN,
+					ExternalID:    tt.externalID,
+				},
+			})
+			if tt.wantErrMsg != "" {
+				require.Error(t, err)
+				require.ErrorContains(t, err, tt.wantErrMsg)
+				return
+			}
+			require.NoError(t, err)
+			diff := cmp.Diff(tt.wantSpec, database.Spec, cmpopts.IgnoreFields(DatabaseSpecV3{}, "Protocol"))
+			require.Empty(t, diff)
+		})
+	}
+}
+
+func TestOpenSearchConfig(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		desc       string
+		uri        string
+		region     string
+		account    string
+		wantSpec   DatabaseSpecV3
+		wantErrMsg string
+	}{
+		{
+			desc:       "missing account is an error",
+			uri:        "my-opensearch-instance-xxxxxx.us-west-2.amazonaws.com",
+			region:     "us-west-2",
+			account:    "",
+			wantErrMsg: "database \"test\" AWS account ID is empty",
+		},
+		{
+			desc:       "custom URI without region is an error",
+			uri:        "localhost:8080",
+			region:     "",
+			account:    "123456789012",
+			wantErrMsg: "database \"test\" AWS region is missing and cannot be derived from the URI \"localhost:8080\"",
+		},
+		{
+			desc:    "custom URI with region is correct",
+			uri:     "localhost:8080",
+			region:  "eu-central-1",
+			account: "123456789012",
+			wantSpec: DatabaseSpecV3{
+				Protocol: "opensearch",
+				URI:      "localhost:8080",
+				AWS: AWS{
+					Region:    "eu-central-1",
+					AccountID: "123456789012",
+				},
+			},
+		},
+		{
+			desc:       "AWS URI for wrong service",
+			uri:        "my-opensearch-instance-xxxxxx.eu-central-1.foobar.amazonaws.com",
+			region:     "eu-central-1",
+			account:    "123456789012",
+			wantErrMsg: "invalid OpenSearch endpoint \"my-opensearch-instance-xxxxxx.eu-central-1.foobar.amazonaws.com\", invalid service \"foobar\"",
+		},
+		{
+			desc:    "region is optional if it can be derived from URI",
+			uri:     "my-opensearch-instance-xxxxxx.eu-central-1.es.amazonaws.com",
+			region:  "",
+			account: "123456789012",
+			wantSpec: DatabaseSpecV3{
+				Protocol: "opensearch",
+				URI:      "my-opensearch-instance-xxxxxx.eu-central-1.es.amazonaws.com",
+				AWS: AWS{
+					Region:    "eu-central-1",
+					AccountID: "123456789012",
+				},
+			},
+		},
+		{
+			desc:       "URI-derived region must match explicit region",
+			uri:        "my-opensearch-instance-xxxxxx.eu-central-1.es.amazonaws.com",
+			region:     "eu-central-2",
+			account:    "123456789012",
+			wantErrMsg: "database \"test\" AWS region \"eu-central-2\" does not match the configured URI region \"eu-central-1\"",
+		},
+
+		{
+			desc:    "no error when full data provided and matches",
+			uri:     "my-opensearch-instance-xxxxxx.eu-central-1.es.amazonaws.com",
+			region:  "eu-central-1",
+			account: "123456789012",
+			wantSpec: DatabaseSpecV3{
+				Protocol: "opensearch",
+				URI:      "my-opensearch-instance-xxxxxx.eu-central-1.es.amazonaws.com",
+				AWS: AWS{
+					Region:    "eu-central-1",
+					AccountID: "123456789012",
+				},
+			},
+		},
+
+		{
+			desc:       "invalid AWS account ID is an error",
+			uri:        "localhost:8080",
+			region:     "us-west-1",
+			account:    "12345",
+			wantErrMsg: "must be 12-digit",
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.desc, func(t *testing.T) {
+			t.Parallel()
+			database, err := NewDatabaseV3(Metadata{
+				Name: "test",
+			}, DatabaseSpecV3{
+				Protocol: "opensearch",
+				URI:      tt.uri,
+				AWS: AWS{
+					Region:    tt.region,
+					AccountID: tt.account,
+				},
+			})
+
+			if tt.wantErrMsg != "" {
+				require.Error(t, err)
+				require.ErrorContains(t, err, tt.wantErrMsg)
+				return
+			}
+
+			require.NoError(t, err)
+			require.True(t, database.IsOpenSearch())
+			require.Equal(t, tt.wantSpec, database.Spec)
+		})
+	}
+}
+
+func TestAWSIsEmpty(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		input  AWS
+		assert require.BoolAssertionFunc
+	}{
+		{
+			name:   "true",
+			input:  AWS{},
+			assert: require.True,
+		},
+		{
+			name: "true with unrecognized bytes",
+			input: AWS{
+				XXX_unrecognized: []byte{66, 0},
+			},
+			assert: require.True,
+		},
+		{
+			name: "true with nested unrecognized bytes",
+			input: AWS{
+				MemoryDB: MemoryDB{
+					XXX_unrecognized: []byte{99, 0},
+				},
+			},
+			assert: require.True,
+		},
+		{
+			name: "false",
+			input: AWS{
+				Region: "us-west-1",
+			},
+			assert: require.False,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			test.assert(t, test.input.IsEmpty())
+		})
+	}
+}
+
+func TestValidateDatabaseName(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name              string
+		dbName            string
+		expectErrContains string
+	}{
+		{
+			name:   "valid long name and uppercase chars",
+			dbName: strings.Repeat("aA", 100),
+		},
+		{
+			name:              "invalid trailing hyphen",
+			dbName:            "invalid-database-name-",
+			expectErrContains: `"invalid-database-name-" does not match regex`,
+		},
+		{
+			name:              "invalid first character",
+			dbName:            "1-invalid-database-name",
+			expectErrContains: `"1-invalid-database-name" does not match regex`,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := ValidateDatabaseName(test.dbName)
+			if test.expectErrContains != "" {
+				require.Error(t, err)
+				require.ErrorContains(t, err, test.expectErrContains)
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
+}
+
+func TestIAMPolicyStatusJSON(t *testing.T) {
+	t.Parallel()
+
+	status := IAMPolicyStatus_IAM_POLICY_STATUS_SUCCESS
+
+	marshaled, err := status.MarshalJSON()
+	require.NoError(t, err)
+	require.Equal(t, `"IAM_POLICY_STATUS_SUCCESS"`, string(marshaled))
+
+	data, err := json.Marshal("IAM_POLICY_STATUS_FAILED")
+	require.NoError(t, err)
+	require.NoError(t, status.UnmarshalJSON(data))
+	require.Equal(t, IAMPolicyStatus_IAM_POLICY_STATUS_FAILED, status)
+}
+
+func TestDatabaseSpanner(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]struct {
+		spec       DatabaseSpecV3
+		errorCheck require.ErrorAssertionFunc
+	}{
+		"valid with uri": {
+			spec: DatabaseSpecV3{
+				Protocol: "spanner",
+				URI:      gcputils.SpannerEndpoint,
+				GCP: GCPCloudSQL{
+					ProjectID:  "project-id",
+					InstanceID: "instance-id",
+				},
+			},
+			errorCheck: require.NoError,
+		},
+		"valid without uri": {
+			spec: DatabaseSpecV3{
+				Protocol: "spanner",
+				GCP: GCPCloudSQL{
+					ProjectID:  "project-id",
+					InstanceID: "instance-id",
+				},
+			},
+			errorCheck: require.NoError,
+		},
+		"invalid missing project id": {
+			spec: DatabaseSpecV3{
+				Protocol: "spanner",
+				GCP: GCPCloudSQL{
+					InstanceID: "instance-id",
+				},
+			},
+			errorCheck: require.Error,
+		},
+		"invalid missing instance id": {
+			spec: DatabaseSpecV3{
+				Protocol: "spanner",
+				GCP: GCPCloudSQL{
+					ProjectID: "project-id",
+				},
+			},
+			errorCheck: require.Error,
+		},
+		"invalid missing project and instance id for spanner protocol": {
+			spec: DatabaseSpecV3{
+				Protocol: "spanner",
+			},
+			errorCheck: require.Error,
+		},
+		"invalid missing project and instance id for spanner endpoint": {
+			spec: DatabaseSpecV3{
+				URI: gcputils.SpannerEndpoint,
+			},
+			errorCheck: require.Error,
+		},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			db, err := NewDatabaseV3(
+				Metadata{
+					Name: "my-spanner",
+				},
+				test.spec,
+			)
+			test.errorCheck(t, err)
+			if err != nil {
+				return
+			}
+
+			require.True(t, db.IsGCPHosted())
+			require.Equal(t, DatabaseTypeSpanner, db.GetType())
+			require.Equal(t, gcputils.SpannerEndpoint, db.GetURI())
+		})
+	}
+}
+
+func TestDatabaseGCPCloudSQL(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		inputName   string
+		inputSpec   DatabaseSpecV3
+		expectError bool
+	}{
+		{
+			inputName: "gcp-valid-configuration",
+			inputSpec: DatabaseSpecV3{
+				Protocol: DatabaseProtocolPostgreSQL,
+				URI:      "localhost:5432",
+				GCP: GCPCloudSQL{
+					ProjectID:  "project-1",
+					InstanceID: "instance-1",
+				},
+			},
+			expectError: false,
+		},
+		{
+			inputName: "gcp-project-id-specified-without-instance-id",
+			inputSpec: DatabaseSpecV3{
+				Protocol: DatabaseProtocolPostgreSQL,
+				URI:      "localhost:5432",
+				GCP: GCPCloudSQL{
+					ProjectID: "project-1",
+				},
+			},
+			expectError: true,
+		},
+		{
+			inputName: "gcp-instance-id-specified-without-project-id",
+			inputSpec: DatabaseSpecV3{
+				Protocol: DatabaseProtocolPostgreSQL,
+				URI:      "localhost:5432",
+				GCP: GCPCloudSQL{
+					InstanceID: "instance-1",
+				},
+			},
+			expectError: true,
+		},
+	} {
+		t.Run(test.inputName, func(t *testing.T) {
+			_, err := NewDatabaseV3(Metadata{
+				Name: test.inputName,
+			}, test.inputSpec)
+			if test.expectError {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestGetAdminUser(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		desc      string
+		specAdmin *DatabaseAdminUser
+		labels    map[string]string
+		want      DatabaseAdminUser
+	}{
+		{
+			desc: "no admin",
+			want: DatabaseAdminUser{},
+		},
+		{
+			desc:      "gets admin from spec",
+			specAdmin: &DatabaseAdminUser{Name: "llama", DefaultDatabase: "hill"},
+			want:      DatabaseAdminUser{Name: "llama", DefaultDatabase: "hill"},
+		},
+		{
+			desc: "gets admin from labels",
+			labels: map[string]string{
+				DatabaseAdminLabel:                "llama",
+				DatabaseAdminDefaultDatabaseLabel: "hill",
+			},
+			want: DatabaseAdminUser{Name: "llama", DefaultDatabase: "hill"},
+		},
+		{
+			desc:      "gets admin from spec ignoring labels",
+			specAdmin: &DatabaseAdminUser{Name: "llama", DefaultDatabase: "hill"},
+			labels: map[string]string{
+				DatabaseAdminLabel:                "horse",
+				DatabaseAdminDefaultDatabaseLabel: "pasture",
+			},
+			want: DatabaseAdminUser{Name: "llama", DefaultDatabase: "hill"},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.desc, func(t *testing.T) {
+			meta := Metadata{
+				Name:   "example",
+				Labels: test.labels,
+			}
+			spec := DatabaseSpecV3{
+				Protocol:  "postgres",
+				URI:       "aurora-instance-1.abcdefghijklmnop.us-west-1.rds.amazonaws.com:5432",
+				AdminUser: test.specAdmin,
+			}
+			d, err := NewDatabaseV3(meta, spec)
+			require.NoError(t, err)
+			require.Equal(t, test.want, d.GetAdminUser())
 		})
 	}
 }

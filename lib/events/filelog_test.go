@@ -1,24 +1,28 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package events
 
 import (
 	"bufio"
 	"context"
+	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -26,13 +30,13 @@ import (
 	"github.com/jonboulle/clockwork"
 	"github.com/stretchr/testify/require"
 
-	apidefaults "github.com/gravitational/teleport/api/defaults"
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/api/types/events"
 )
 
 func TestFileLogPagination(t *testing.T) {
 	clock := clockwork.NewFakeClock()
+	ctx := context.Background()
 
 	log, err := NewFileLog(FileLogConfig{
 		Dir:            t.TempDir(),
@@ -41,7 +45,7 @@ func TestFileLogPagination(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	err = log.EmitAuditEvent(context.TODO(), &events.SessionJoin{
+	err = log.EmitAuditEvent(ctx, &events.SessionJoin{
 		Metadata: events.Metadata{
 			ID:   "a",
 			Type: SessionJoinEvent,
@@ -53,7 +57,7 @@ func TestFileLogPagination(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	err = log.EmitAuditEvent(context.TODO(), &events.SessionJoin{
+	err = log.EmitAuditEvent(ctx, &events.SessionJoin{
 		Metadata: events.Metadata{
 			ID:   "b",
 			Type: SessionJoinEvent,
@@ -65,7 +69,7 @@ func TestFileLogPagination(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	err = log.EmitAuditEvent(context.TODO(), &events.SessionJoin{
+	err = log.EmitAuditEvent(ctx, &events.SessionJoin{
 		Metadata: events.Metadata{
 			ID:   "c",
 			Type: SessionJoinEvent,
@@ -79,13 +83,24 @@ func TestFileLogPagination(t *testing.T) {
 
 	from := clock.Now().Add(-time.Hour).UTC()
 	to := clock.Now().Add(time.Hour).UTC()
-	eventArr, checkpoint, err := log.SearchEvents(from, to, apidefaults.Namespace, nil, 2, types.EventOrderAscending, "")
+	eventArr, checkpoint, err := log.SearchEvents(ctx, SearchEventsRequest{
+		From:  from,
+		To:    to,
+		Limit: 2,
+		Order: types.EventOrderAscending,
+	})
 	require.NoError(t, err)
 	require.Len(t, eventArr, 2)
 	require.NotEmpty(t, checkpoint)
 
-	eventArr, checkpoint, err = log.SearchEvents(from, to, apidefaults.Namespace, nil, 2, types.EventOrderAscending, checkpoint)
-	require.Nil(t, err)
+	eventArr, checkpoint, err = log.SearchEvents(ctx, SearchEventsRequest{
+		From:     from,
+		To:       to,
+		Limit:    2,
+		Order:    types.EventOrderAscending,
+		StartKey: checkpoint,
+	})
+	require.NoError(t, err)
 	require.Len(t, eventArr, 1)
 	require.Empty(t, checkpoint)
 }
@@ -93,16 +108,17 @@ func TestFileLogPagination(t *testing.T) {
 func TestSearchSessionEvents(t *testing.T) {
 	clock := clockwork.NewFakeClock()
 	start := clock.Now()
+	ctx := context.Background()
 
 	log, err := NewFileLog(FileLogConfig{
 		Dir:            t.TempDir(),
 		RotationPeriod: time.Hour * 24,
 		Clock:          clock,
 	})
-	require.Nil(t, err)
+	require.NoError(t, err)
 	clock.Advance(1 * time.Minute)
 
-	require.NoError(t, log.EmitAuditEvent(context.Background(), &events.SessionEnd{
+	require.NoError(t, log.EmitAuditEvent(ctx, &events.SessionEnd{
 		Metadata: events.Metadata{
 			ID:   "a",
 			Type: SessionEndEvent,
@@ -111,14 +127,19 @@ func TestSearchSessionEvents(t *testing.T) {
 	}))
 	clock.Advance(1 * time.Minute)
 
-	result, _, err := log.SearchSessionEvents(start, clock.Now(), 10, types.EventOrderAscending, "", nil, "")
+	result, _, err := log.SearchSessionEvents(ctx, SearchSessionEventsRequest{
+		From:  start,
+		To:    clock.Now(),
+		Limit: 10,
+		Order: types.EventOrderAscending,
+	})
 	require.NoError(t, err)
 	require.Len(t, result, 1)
-	require.Equal(t, result[0].GetType(), SessionEndEvent)
-	require.Equal(t, result[0].GetID(), "a")
+	require.Equal(t, SessionEndEvent, result[0].GetType())
+	require.Equal(t, "a", result[0].GetID())
 
 	// emit a non-session event, it should not show up in the next query
-	require.NoError(t, log.EmitAuditEvent(context.Background(), &events.SessionJoin{
+	require.NoError(t, log.EmitAuditEvent(ctx, &events.SessionJoin{
 		Metadata: events.Metadata{
 			ID:   "b",
 			Type: SessionJoinEvent,
@@ -127,14 +148,19 @@ func TestSearchSessionEvents(t *testing.T) {
 	}))
 	clock.Advance(1 * time.Minute)
 
-	result, _, err = log.SearchSessionEvents(start, clock.Now(), 10, types.EventOrderAscending, "", nil, "")
+	result, _, err = log.SearchSessionEvents(ctx, SearchSessionEventsRequest{
+		From:  start,
+		To:    clock.Now(),
+		Limit: 10,
+		Order: types.EventOrderAscending,
+	})
 	require.NoError(t, err)
 	require.Len(t, result, 1)
-	require.Equal(t, result[0].GetType(), SessionEndEvent)
-	require.Equal(t, result[0].GetID(), "a")
+	require.Equal(t, SessionEndEvent, result[0].GetType())
+	require.Equal(t, "a", result[0].GetID())
 
 	// emit a desktop session event, it should show up in the next query
-	require.NoError(t, log.EmitAuditEvent(context.Background(), &events.WindowsDesktopSessionEnd{
+	require.NoError(t, log.EmitAuditEvent(ctx, &events.WindowsDesktopSessionEnd{
 		Metadata: events.Metadata{
 			ID:   "c",
 			Type: WindowsDesktopSessionEndEvent,
@@ -143,23 +169,28 @@ func TestSearchSessionEvents(t *testing.T) {
 	}))
 	clock.Advance(1 * time.Minute)
 
-	result, _, err = log.SearchSessionEvents(start, clock.Now(), 10, types.EventOrderAscending, "", nil, "")
+	result, _, err = log.SearchSessionEvents(ctx, SearchSessionEventsRequest{
+		From:  start,
+		To:    clock.Now(),
+		Limit: 10,
+		Order: types.EventOrderAscending,
+	})
 	require.NoError(t, err)
 	require.Len(t, result, 2)
-	require.Equal(t, result[0].GetType(), SessionEndEvent)
-	require.Equal(t, result[0].GetID(), "a")
-	require.Equal(t, result[1].GetType(), WindowsDesktopSessionEndEvent)
-	require.Equal(t, result[1].GetID(), "c")
+	require.Equal(t, SessionEndEvent, result[0].GetType())
+	require.Equal(t, "a", result[0].GetID())
+	require.Equal(t, WindowsDesktopSessionEndEvent, result[1].GetType())
+	require.Equal(t, "c", result[1].GetID())
 }
 
 // TestLargeEvent test fileLog behavior in case of large events.
-// If an event is serializable the FileLog handler should trie to trim the event size.
+// If an event is serializable the FileLog handler should try to trim the event size.
 func TestLargeEvent(t *testing.T) {
 	type check func(t *testing.T, event []events.AuditEvent)
 
 	hasEventsLength := func(n int) check {
 		return func(t *testing.T, ee []events.AuditEvent) {
-			require.Equal(t, n, len(ee), "events length mismatch")
+			require.Len(t, ee, n, "events length mismatch")
 		}
 	}
 	hasEventsIDs := func(ids ...string) check {
@@ -172,6 +203,9 @@ func TestLargeEvent(t *testing.T) {
 		}
 	}
 
+	largeMongoQuery, err := makeLargeMongoQuery()
+	require.NoError(t, err)
+
 	tests := []struct {
 		name   string
 		in     []events.AuditEvent
@@ -183,10 +217,11 @@ func TestLargeEvent(t *testing.T) {
 				makeQueryEvent("1", "select 1"),
 				makeQueryEvent("2", strings.Repeat("A", bufio.MaxScanTokenSize)),
 				makeQueryEvent("3", "select 3"),
+				makeQueryEvent("4", largeMongoQuery),
 			},
 			checks: []check{
-				hasEventsLength(3),
-				hasEventsIDs("1", "2", "3"),
+				hasEventsLength(4),
+				hasEventsIDs("1", "2", "3", "4"),
 			},
 		},
 		{
@@ -231,6 +266,28 @@ func TestLargeEvent(t *testing.T) {
 	}
 }
 
+// makeLargeMongoQuery returns an example MongoDB query to test TrimToMaxSize when a
+// query contains a lot of characters that need to be escaped. The additional
+// escaping might push the message size over the limit even after being trimmed.
+// The goal of to make this about as pathological a query as is possible so there
+// are many very small string fields that will require quoting.
+func makeLargeMongoQuery() (string, error) {
+	record := map[string]string{"_id": `{"$oid":"63a0dd6da68baaeb828581fe"}`}
+	for i := 0; i < 100; i++ {
+		t := fmt.Sprintf("%v", i)
+		record[t] = t
+	}
+
+	out, err := json.Marshal(record)
+	if err != nil {
+		return "", err
+	}
+
+	return `OpMsg(Body={"insert": "books","ordered": true,"lsid": {"id": {"$binary":{"base64":"NX7MXcLdRi6pIT86e52k5A==","subType":"04"}}},"$db": "teleport"}, Documents=[` +
+		strings.Repeat(string(out), 500) +
+		`], Flags=)`, nil
+}
+
 func makeQueryEvent(id string, query string) *events.DatabaseSessionQuery {
 	return &events.DatabaseSessionQuery{
 		Metadata: events.Metadata{
@@ -240,6 +297,7 @@ func makeQueryEvent(id string, query string) *events.DatabaseSessionQuery {
 		DatabaseQuery: query,
 	}
 }
+
 func makeAccessRequestEvent(id string, in string) *events.AccessRequestDelete {
 	return &events.AccessRequestDelete{
 		Metadata: events.Metadata{
@@ -251,15 +309,13 @@ func makeAccessRequestEvent(id string, in string) *events.AccessRequestDelete {
 }
 
 func mustSearchEvent(t *testing.T, log *FileLog, start time.Time) []events.AuditEvent {
-	result, _, err := log.SearchEvents(
-		start,
-		start.Add(time.Hour),
-		"",
-		[]string{},
-		100,
-		types.EventOrderAscending,
-		"",
-	)
+	ctx := context.TODO()
+	result, _, err := log.SearchEvents(ctx, SearchEventsRequest{
+		From:  start,
+		To:    start.Add(time.Hour),
+		Limit: 100,
+		Order: types.EventOrderAscending,
+	})
 	require.NoError(t, err)
 	return result
 }

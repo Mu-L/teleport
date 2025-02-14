@@ -1,18 +1,20 @@
 /*
-Copyright 2021-2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package auth
 
@@ -21,7 +23,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"strings"
 	"testing"
@@ -35,6 +36,7 @@ import (
 	"github.com/gravitational/teleport/api/client/proto"
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/auth/testauthority"
+	"github.com/gravitational/teleport/lib/utils"
 )
 
 func responseFromAWSIdentity(id awsIdentity) string {
@@ -133,7 +135,7 @@ func TestAuth_RegisterUsingIAMMethod(t *testing.T) {
 		tokenName                string
 		requestTokenName         string
 		tokenSpec                types.ProvisionTokenSpecV2
-		stsClient                stsClient
+		stsClient                utils.HTTPDoClient
 		iamRegisterOptions       []iamRegisterOption
 		challengeResponseOptions []challengeResponseOption
 		challengeResponseErr     error
@@ -207,6 +209,121 @@ func TestAuth_RegisterUsingIAMMethod(t *testing.T) {
 				}),
 			},
 			assertError: require.NoError,
+		},
+		{
+			desc:             "arn assumed role",
+			tokenName:        "test-token",
+			requestTokenName: "test-token",
+			tokenSpec: types.ProvisionTokenSpecV2{
+				Roles: []types.SystemRole{types.RoleNode},
+				Allow: []*types.TokenRule{
+					{
+						AWSAccount: "123456789012",
+						AWSARN:     "arn:aws:sts::123456789012:assumed-role/my-super-001-test-role/my-session-name",
+					},
+				},
+				JoinMethod: types.JoinMethodIAM,
+			},
+			stsClient: &mockClient{
+				respStatusCode: http.StatusOK,
+				respBody: responseFromAWSIdentity(awsIdentity{
+					Account: "123456789012",
+					Arn:     "arn:aws:sts::123456789012:assumed-role/my-super-001-test-role/my-session-name",
+				}),
+			},
+			assertError: require.NoError,
+		},
+		{
+			desc:             "wildcard arn assumed role",
+			tokenName:        "test-token",
+			requestTokenName: "test-token",
+			tokenSpec: types.ProvisionTokenSpecV2{
+				Roles: []types.SystemRole{types.RoleNode},
+				Allow: []*types.TokenRule{
+					{
+						AWSAccount: "123456789012",
+						AWSARN:     "arn:aws:sts::123456789012:assumed-role/my-*-test-role/my-session-name",
+					},
+				},
+				JoinMethod: types.JoinMethodIAM,
+			},
+			stsClient: &mockClient{
+				respStatusCode: http.StatusOK,
+				respBody: responseFromAWSIdentity(awsIdentity{
+					Account: "123456789012",
+					Arn:     "arn:aws:sts::123456789012:assumed-role/my-super-001-test-role/my-session-name",
+				}),
+			},
+			assertError: require.NoError,
+		},
+		{
+			desc:             "wildcard 2 arn assumed role",
+			tokenName:        "test-token",
+			requestTokenName: "test-token",
+			tokenSpec: types.ProvisionTokenSpecV2{
+				Roles: []types.SystemRole{types.RoleNode},
+				Allow: []*types.TokenRule{
+					{
+						AWSAccount: "123456789012",
+						AWSARN:     "arn:aws:sts::123456789012:assumed-role/my-*-test-role/*",
+					},
+				},
+				JoinMethod: types.JoinMethodIAM,
+			},
+			stsClient: &mockClient{
+				respStatusCode: http.StatusOK,
+				respBody: responseFromAWSIdentity(awsIdentity{
+					Account: "123456789012",
+					Arn:     "arn:aws:sts::123456789012:assumed-role/my-super-001-test-role/my-session-name",
+				}),
+			},
+			assertError: require.NoError,
+		},
+		{
+			desc:             "wrong wildcard arn assumed role",
+			tokenName:        "test-token",
+			requestTokenName: "test-token",
+			tokenSpec: types.ProvisionTokenSpecV2{
+				Roles: []types.SystemRole{types.RoleNode},
+				Allow: []*types.TokenRule{
+					{
+						AWSAccount: "123456789012",
+						AWSARN:     "arn:aws:sts::123456789012:assumed-role/my-*-test-role",
+					},
+				},
+				JoinMethod: types.JoinMethodIAM,
+			},
+			stsClient: &mockClient{
+				respStatusCode: http.StatusOK,
+				respBody: responseFromAWSIdentity(awsIdentity{
+					Account: "123456789012",
+					Arn:     "arn:aws:sts::123456789012:assumed-role/my-super-002-test-role/my-session-name",
+				}),
+			},
+			assertError: isAccessDenied,
+		},
+		{
+			desc:             "wrong wildcard 2 arn assumed role",
+			tokenName:        "test-token",
+			requestTokenName: "test-token",
+			tokenSpec: types.ProvisionTokenSpecV2{
+				Roles: []types.SystemRole{types.RoleNode},
+				Allow: []*types.TokenRule{
+					{
+						AWSAccount: "123456789012",
+						AWSARN:     "arn:aws:sts::123456789012:assumed-role/my-*-test-role",
+					},
+				},
+				JoinMethod: types.JoinMethodIAM,
+			},
+			stsClient: &mockClient{
+				respStatusCode: http.StatusOK,
+				respBody: responseFromAWSIdentity(awsIdentity{
+					Account: "123456789012",
+					Arn:     "arn:aws:sts::123456789012:assumed-role/my-super-002-test-role/my-session-name2",
+				}),
+			},
+			assertError: isAccessDenied,
 		},
 		{
 			desc:             "wrong token",
@@ -456,36 +573,6 @@ func TestAuth_RegisterUsingIAMMethod(t *testing.T) {
 			assertError: require.NoError,
 		},
 		{
-			desc:             "non-fips client pass v11",
-			tokenName:        "test-token",
-			requestTokenName: "test-token",
-			tokenSpec: types.ProvisionTokenSpecV2{
-				Roles: []types.SystemRole{types.RoleNode},
-				Allow: []*types.TokenRule{
-					{
-						AWSAccount: "1234",
-						AWSARN:     "arn:aws::1111",
-					},
-				},
-				JoinMethod: types.JoinMethodIAM,
-			},
-			stsClient: &mockClient{
-				respStatusCode: http.StatusOK,
-				respBody: responseFromAWSIdentity(awsIdentity{
-					Account: "1234",
-					Arn:     "arn:aws::1111",
-				}),
-			},
-			iamRegisterOptions: []iamRegisterOption{
-				withFips(true),
-				withAuthVersion(&semver.Version{Major: 11}),
-			},
-			challengeResponseOptions: []challengeResponseOption{
-				withHost("sts.us-east-1.amazonaws.com"),
-			},
-			assertError: require.NoError,
-		},
-		{
 			desc:             "non-fips client fail v12",
 			tokenName:        "test-token",
 			requestTokenName: "test-token",
@@ -519,6 +606,9 @@ func TestAuth_RegisterUsingIAMMethod(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.desc, func(t *testing.T) {
+			// Set mock client.
+			a.httpClientForAWSSTS = tc.stsClient
+
 			// add token to auth server
 			token, err := types.NewProvisionTokenFromSpec(
 				tc.tokenName,
@@ -530,11 +620,7 @@ func TestAuth_RegisterUsingIAMMethod(t *testing.T) {
 				require.NoError(t, a.DeleteToken(ctx, token.GetName()))
 			}()
 
-			requestContext := context.Background()
-			requestContext = context.WithValue(requestContext, ContextClientAddr, &net.IPAddr{})
-			requestContext = context.WithValue(requestContext, stsClientKey{}, tc.stsClient)
-
-			_, err = a.RegisterUsingIAMMethod(requestContext, func(challenge string) (*proto.RegisterUsingIAMMethodRequest, error) {
+			_, err = a.RegisterUsingIAMMethodWithOpts(context.Background(), func(challenge string) (*proto.RegisterUsingIAMMethodRequest, error) {
 				templateInput := defaultIdentityRequestTemplateInput(challenge)
 				for _, opt := range tc.challengeResponseOptions {
 					opt(&templateInput)

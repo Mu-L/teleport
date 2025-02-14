@@ -1,83 +1,84 @@
-// Copyright 2021 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package handler
 
 import (
 	"context"
-	"sort"
 
 	"github.com/gravitational/trace"
 
-	api "github.com/gravitational/teleport/lib/teleterm/api/protogen/golang/v1"
+	"github.com/gravitational/teleport/api/types"
+	api "github.com/gravitational/teleport/gen/proto/go/teleport/lib/teleterm/v1"
+	"github.com/gravitational/teleport/lib/teleterm/api/uri"
 	"github.com/gravitational/teleport/lib/teleterm/clusters"
+	"github.com/gravitational/teleport/lib/ui"
 )
 
-// GetAllKubes lists kubernetes clusters
-func (s *Handler) GetAllKubes(ctx context.Context, req *api.GetAllKubesRequest) (*api.GetAllKubesResponse, error) {
-	kubes, err := s.DaemonService.GetAllKubes(ctx, req.ClusterUri)
+// ListKubernetesResourcesRequest defines a request to retrieve kube resources paginated.
+// Only one type of kube resource can be retrieved per request (eg: namespace, pods, secrets, etc.)
+func (s *Handler) ListKubernetesResources(ctx context.Context, req *api.ListKubernetesResourcesRequest) (*api.ListKubernetesResourcesResponse, error) {
+	clusterURI, err := uri.Parse(req.GetClusterUri())
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	response := &api.GetAllKubesResponse{}
-	for _, k := range kubes {
-		response.Kubes = append(response.Kubes, newAPIKube(k))
-	}
-
-	return response, nil
-}
-
-// GetKubes accepts parameterized input to enable searching, sorting, and pagination
-func (s *Handler) GetKubes(ctx context.Context, req *api.GetKubesRequest) (*api.GetKubesResponse, error) {
-	resp, err := s.DaemonService.GetKubes(ctx, req)
+	resources, err := s.DaemonService.ListKubernetesResources(ctx, clusterURI, req)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	response := &api.GetKubesResponse{
-		TotalCount: int32(resp.TotalCount),
-		StartKey:   resp.StartKey,
-	}
-	for _, kube := range resp.Kubes {
-		response.Agents = append(response.Agents, newAPIKube(kube))
+	response := &api.ListKubernetesResourcesResponse{}
+
+	for _, resource := range resources {
+		kubeResource, ok := resource.(*types.KubernetesResourceV1)
+		if !ok {
+			return nil, trace.BadParameter("expected resource type %T, got %T", types.KubernetesResourceV1{}, resource)
+		}
+		response.Resources = append(response.Resources, newApiKubeResource(kubeResource, req.GetKubernetesCluster(), clusterURI))
 	}
 
 	return response, nil
 }
 
 func newAPIKube(kube clusters.Kube) *api.Kube {
-	apiLabels := APILabels{}
-	for name, value := range kube.KubernetesCluster.GetStaticLabels() {
-		apiLabels = append(apiLabels, &api.Label{
-			Name:  name,
-			Value: value,
-		})
-	}
-
-	for name, cmd := range kube.KubernetesCluster.GetDynamicLabels() {
-		apiLabels = append(apiLabels, &api.Label{
-			Name:  name,
-			Value: cmd.GetResult(),
-		})
-	}
-
-	sort.Sort(apiLabels)
+	staticLabels := kube.KubernetesCluster.GetStaticLabels()
+	dynamicLabels := kube.KubernetesCluster.GetDynamicLabels()
+	apiLabels := makeAPILabels(
+		ui.MakeLabelsWithoutInternalPrefixes(staticLabels, ui.TransformCommandLabels(dynamicLabels)),
+	)
 
 	return &api.Kube{
 		Name:   kube.KubernetesCluster.GetName(),
 		Uri:    kube.URI.String(),
 		Labels: apiLabels,
+	}
+}
+
+func newApiKubeResource(resource *types.KubernetesResourceV1, kubeCluster string, resourceURI uri.ResourceURI) *api.KubeResource {
+	apiLabels := makeAPILabels(ui.MakeLabelsWithoutInternalPrefixes(resource.GetStaticLabels()))
+
+	return &api.KubeResource{
+		Uri:       resourceURI.AppendKube(kubeCluster).AppendKubeResourceNamespace(resource.GetName()).String(),
+		Kind:      resource.GetKind(),
+		Name:      resource.GetName(),
+		Labels:    apiLabels,
+		Namespace: resource.Spec.Namespace,
+		Cluster:   kubeCluster,
 	}
 }

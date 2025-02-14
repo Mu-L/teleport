@@ -1,29 +1,33 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package ui
 
 import (
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	apidefaults "github.com/gravitational/teleport/api/defaults"
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/services"
+	"github.com/gravitational/teleport/lib/ui"
 )
 
 func TestStripProtocolAndPort(t *testing.T) {
@@ -50,8 +54,8 @@ func TestStripProtocolAndPort(t *testing.T) {
 }
 
 func TestGetAllowedKubeUsersAndGroupsForCluster(t *testing.T) {
-	devEnvRole := &types.RoleV5{
-		Spec: types.RoleSpecV5{
+	devEnvRole := &types.RoleV6{
+		Spec: types.RoleSpecV6{
 			Allow: types.RoleConditions{
 				KubeUsers:  []string{"devuser"},
 				KubeGroups: []string{"devgroup"},
@@ -63,8 +67,8 @@ func TestGetAllowedKubeUsersAndGroupsForCluster(t *testing.T) {
 		},
 	}
 
-	prodEnvRole := &types.RoleV5{
-		Spec: types.RoleSpecV5{
+	prodEnvRole := &types.RoleV6{
+		Spec: types.RoleSpecV6{
 			Allow: types.RoleConditions{
 				KubeUsers:  []string{"produser"},
 				KubeGroups: []string{"prodgroup"},
@@ -76,8 +80,8 @@ func TestGetAllowedKubeUsersAndGroupsForCluster(t *testing.T) {
 		},
 	}
 
-	anyEnvRole := &types.RoleV5{
-		Spec: types.RoleSpecV5{
+	anyEnvRole := &types.RoleV6{
+		Spec: types.RoleSpecV6{
 			Allow: types.RoleConditions{
 				KubeUsers:  []string{"anyenvrole"},
 				KubeGroups: []string{"anyenvgroup"},
@@ -89,8 +93,8 @@ func TestGetAllowedKubeUsersAndGroupsForCluster(t *testing.T) {
 		},
 	}
 
-	rootUser := &types.RoleV5{
-		Spec: types.RoleSpecV5{
+	rootUser := &types.RoleV6{
+		Spec: types.RoleSpecV6{
 			Allow: types.RoleConditions{
 				KubeUsers:  []string{"root"},
 				KubeGroups: []string{"rootgroup"},
@@ -102,8 +106,8 @@ func TestGetAllowedKubeUsersAndGroupsForCluster(t *testing.T) {
 		},
 	}
 
-	roleWithMultipleLabels := &types.RoleV5{
-		Spec: types.RoleSpecV5{
+	roleWithMultipleLabels := &types.RoleV6{
+		Spec: types.RoleSpecV6{
 			Allow: types.RoleConditions{
 				KubeUsers:  []string{"multiplelabelsuser"},
 				KubeGroups: []string{"multiplelabelsgroup"},
@@ -182,8 +186,8 @@ func TestGetAllowedKubeUsersAndGroupsForCluster(t *testing.T) {
 			cluster: makeTestKubeCluster(t, map[string]string{
 				"env": "prod",
 			}),
-			roleSet: services.NewRoleSet(&types.RoleV5{
-				Spec: types.RoleSpecV5{
+			roleSet: services.NewRoleSet(&types.RoleV6{
+				Spec: types.RoleSpecV6{
 					Allow: types.RoleConditions{
 						KubeUsers:  []string{"role1", "role2", "role3"},
 						Namespaces: []string{apidefaults.Namespace},
@@ -219,8 +223,8 @@ func TestGetAllowedKubeUsersAndGroupsForCluster(t *testing.T) {
 			cluster: makeTestKubeCluster(t, map[string]string{
 				"env": "dev",
 			}),
-			roleSet: services.NewRoleSet(&types.RoleV5{
-				Spec: types.RoleSpecV5{
+			roleSet: services.NewRoleSet(&types.RoleV6{
+				Spec: types.RoleSpecV6{
 					Allow: types.RoleConditions{
 						KubeGroups: []string{"anyregiongroup"},
 						Namespaces: []string{apidefaults.Namespace},
@@ -257,8 +261,8 @@ func TestGetAllowedKubeUsersAndGroupsForCluster(t *testing.T) {
 			cluster: makeTestKubeCluster(t, map[string]string{
 				"region": "us-west-1",
 			}),
-			roleSet: services.NewRoleSet(&types.RoleV5{
-				Spec: types.RoleSpecV5{
+			roleSet: services.NewRoleSet(&types.RoleV6{
+				Spec: types.RoleSpecV6{
 					Allow: types.RoleConditions{
 						KubeUsers:  []string{"rolewithregexpuser"},
 						Namespaces: []string{apidefaults.Namespace},
@@ -275,8 +279,8 @@ func TestGetAllowedKubeUsersAndGroupsForCluster(t *testing.T) {
 			cluster: makeTestKubeCluster(t, map[string]string{
 				"env": "dev",
 			}),
-			roleSet: services.NewRoleSet(devEnvRole, &types.RoleV5{
-				Spec: types.RoleSpecV5{
+			roleSet: services.NewRoleSet(devEnvRole, &types.RoleV6{
+				Spec: types.RoleSpecV6{
 					Deny: types.RoleConditions{
 						KubeUsers:  []string{"devuser"},
 						KubeGroups: []string{"devgroup"},
@@ -294,8 +298,8 @@ func TestGetAllowedKubeUsersAndGroupsForCluster(t *testing.T) {
 			cluster: makeTestKubeCluster(t, map[string]string{
 				"env": "dev",
 			}),
-			roleSet: services.NewRoleSet(devEnvRole, &types.RoleV5{
-				Spec: types.RoleSpecV5{
+			roleSet: services.NewRoleSet(devEnvRole, &types.RoleV6{
+				Spec: types.RoleSpecV6{
 					Deny: types.RoleConditions{
 						KubeUsers:  []string{"devuser"},
 						KubeGroups: []string{"devgroup"},
@@ -311,7 +315,8 @@ func TestGetAllowedKubeUsersAndGroupsForCluster(t *testing.T) {
 	}
 	for _, tc := range tt[:1] {
 		t.Run(tc.name, func(t *testing.T) {
-			users, groups := getAllowedKubeUsersAndGroupsForCluster(tc.roleSet, tc.cluster)
+			accessChecker := services.NewAccessCheckerWithRoleSet(&services.AccessInfo{}, "clustername", tc.roleSet)
+			users, groups := getAllowedKubeUsersAndGroupsForCluster(accessChecker, tc.cluster)
 			require.Equal(t, tc.expectedUsers, users)
 			require.Equal(t, tc.expectedGroups, groups)
 		})
@@ -335,7 +340,7 @@ func TestMakeClusterHiddenLabels(t *testing.T) {
 	type testCase struct {
 		name           string
 		clusters       []types.KubeCluster
-		expectedLabels [][]Label
+		expectedLabels [][]ui.Label
 		roleSet        services.RoleSet
 	}
 
@@ -348,7 +353,7 @@ func TestMakeClusterHiddenLabels(t *testing.T) {
 					"label2":                 "value2",
 				}),
 			},
-			expectedLabels: [][]Label{
+			expectedLabels: [][]ui.Label{
 				{
 					{
 						Name:  "label2",
@@ -361,7 +366,8 @@ func TestMakeClusterHiddenLabels(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			clusters := MakeKubeClusters(tc.clusters, tc.roleSet)
+			accessChecker := services.NewAccessCheckerWithRoleSet(&services.AccessInfo{}, "clusterName", tc.roleSet)
+			clusters := MakeKubeClusters(tc.clusters, accessChecker)
 			for i, cluster := range clusters {
 				require.Equal(t, tc.expectedLabels[i], cluster.Labels)
 			}
@@ -374,8 +380,7 @@ func TestMakeServersHiddenLabels(t *testing.T) {
 		name           string
 		clusterName    string
 		servers        []types.Server
-		expectedLabels [][]Label
-		roleSet        services.RoleSet
+		expectedLabels [][]ui.Label
 	}
 
 	testCases := []testCase{
@@ -388,7 +393,7 @@ func TestMakeServersHiddenLabels(t *testing.T) {
 					"teleport.internal/app": "app1",
 				}),
 			},
-			expectedLabels: [][]Label{
+			expectedLabels: [][]ui.Label{
 				{
 					{
 						Name:  "simple",
@@ -401,9 +406,9 @@ func TestMakeServersHiddenLabels(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			servers := MakeServers(tc.clusterName, tc.servers, tc.roleSet)
-			for i, server := range servers {
-				require.Equal(t, tc.expectedLabels[i], server.Labels)
+			for i, srv := range tc.servers {
+				server := MakeServer(tc.clusterName, srv, nil, false)
+				assert.Equal(t, tc.expectedLabels[i], server.Labels)
 			}
 		})
 	}
@@ -426,9 +431,10 @@ func TestMakeDatabaseHiddenLabels(t *testing.T) {
 		},
 	}
 
-	outputDb := MakeDatabase(inputDb, nil, nil)
+	accessChecker := services.NewAccessCheckerWithRoleSet(&services.AccessInfo{}, "clusterName", nil)
+	outputDb := MakeDatabase(inputDb, accessChecker, &mockDatabaseInteractiveChecker{}, false)
 
-	require.Equal(t, []Label{
+	require.Equal(t, []ui.Label{
 		{
 			Name:  "label",
 			Value: "value1",
@@ -437,19 +443,18 @@ func TestMakeDatabaseHiddenLabels(t *testing.T) {
 }
 
 func TestMakeDesktopHiddenLabel(t *testing.T) {
-	windowsDesktop := &types.WindowsDesktopV3{
-		ResourceHeader: types.ResourceHeader{
-			Metadata: types.Metadata{
-				Labels: map[string]string{
-					"teleport.internal/t2": "tt",
-					"label3":               "value2",
-				},
-			},
+	windowsDesktop, err := types.NewWindowsDesktopV3(
+		"test",
+		map[string]string{
+			"teleport.internal/t2": "tt",
+			"label3":               "value2",
 		},
-	}
+		types.WindowsDesktopSpecV3{Addr: "addr"},
+	)
+	require.NoError(t, err)
 
-	desktop := MakeDesktop(windowsDesktop)
-	labels := []Label{
+	desktop := MakeDesktop(windowsDesktop, nil, false)
+	labels := []ui.Label{
 		{
 			Name:  "label3",
 			Value: "value2",
@@ -472,7 +477,7 @@ func TestMakeDesktopServiceHiddenLabel(t *testing.T) {
 	}
 
 	desktopService := MakeDesktopService(windowsDesktopService)
-	labels := []Label{
+	labels := []ui.Label{
 		{
 			Name:  "label3",
 			Value: "value2",
@@ -480,4 +485,139 @@ func TestMakeDesktopServiceHiddenLabel(t *testing.T) {
 	}
 
 	require.Equal(t, labels, desktopService.Labels)
+}
+
+func TestSortedLabels(t *testing.T) {
+	type testCase struct {
+		name           string
+		clusterName    string
+		servers        []types.Server
+		expectedLabels [][]ui.Label
+	}
+
+	testCases := []testCase{
+		{
+			name:        "Server with aws labels pushed to back",
+			clusterName: "cluster1",
+			servers: []types.Server{
+				makeTestServer(t, "server1", map[string]string{
+					"teleport.dev/origin":   "config-file",
+					"aws/asdfasdf":          "hello",
+					"simple":                "value1",
+					"ultra-cool-label":      "value1",
+					"teleport.internal/app": "app1",
+				}),
+			},
+			expectedLabels: [][]ui.Label{
+				{
+					{
+						Name:  "simple",
+						Value: "value1",
+					},
+					{
+						Name:  "ultra-cool-label",
+						Value: "value1",
+					},
+					{
+						Name:  "teleport.dev/origin",
+						Value: "config-file",
+					},
+					{
+						Name:  "aws/asdfasdf",
+						Value: "hello",
+					},
+				},
+			},
+		},
+		{
+			name:        "database with azure labels pushed to back",
+			clusterName: "cluster1",
+			servers: []types.Server{
+				makeTestServer(t, "server1", map[string]string{
+					"azure/asdfasdf":        "hello",
+					"simple":                "value1",
+					"anotherone":            "value2",
+					"teleport.internal/app": "app1",
+				}),
+			},
+			expectedLabels: [][]ui.Label{
+				{
+					{
+						Name:  "anotherone",
+						Value: "value2",
+					},
+					{
+						Name:  "simple",
+						Value: "value1",
+					},
+					{
+						Name:  "azure/asdfasdf",
+						Value: "hello",
+					},
+				},
+			},
+		},
+		{
+			name:        "Server with gcp labels pushed to back",
+			clusterName: "cluster1",
+			servers: []types.Server{
+				makeTestServer(t, "server1", map[string]string{
+					"gcp/asdfasdf":          "hello",
+					"simple":                "value1",
+					"teleport.internal/app": "app1",
+				}),
+			},
+			expectedLabels: [][]ui.Label{
+				{
+					{
+						Name:  "simple",
+						Value: "value1",
+					},
+					{
+						Name:  "gcp/asdfasdf",
+						Value: "hello",
+					},
+				},
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			for i, srv := range tc.servers {
+				server := MakeServer(tc.clusterName, srv, nil, false)
+				assert.Equal(t, tc.expectedLabels[i], server.Labels)
+			}
+		})
+	}
+}
+
+func TestMakeDatabaseSupportsInteractive(t *testing.T) {
+	db := &types.DatabaseV3{}
+	accessChecker := services.NewAccessCheckerWithRoleSet(&services.AccessInfo{}, "clusterName", nil)
+
+	for name, tc := range map[string]struct {
+		supports bool
+	}{
+		"supported":   {supports: true},
+		"unsupported": {supports: false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			interactiveChecker := &mockDatabaseInteractiveChecker{supports: tc.supports}
+			single := MakeDatabase(db, accessChecker, interactiveChecker, false)
+			require.Equal(t, tc.supports, single.SupportsInteractive)
+
+			multi := MakeDatabases([]*types.DatabaseV3{db}, accessChecker, interactiveChecker)
+			require.Len(t, multi, 1)
+			require.Equal(t, tc.supports, multi[0].SupportsInteractive)
+		})
+	}
+}
+
+type mockDatabaseInteractiveChecker struct {
+	supports bool
+}
+
+func (m *mockDatabaseInteractiveChecker) IsSupported(_ string) bool {
+	return m.supports
 }

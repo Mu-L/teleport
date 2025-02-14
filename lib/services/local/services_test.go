@@ -1,18 +1,20 @@
 /*
-Copyright 2015-2019 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package local
 
@@ -58,17 +60,24 @@ func setupServicesContext(ctx context.Context, t *testing.T) *servicesContext {
 	eventsService := NewEventsService(tt.bk)
 	presenceService := NewPresenceService(tt.bk)
 
+	caService := NewCAService(tt.bk)
+
+	identityService, err := NewTestIdentityService(tt.bk)
+	require.NoError(t, err)
+
 	tt.suite = &suite.ServicesTestSuite{
-		CAS:           NewCAService(tt.bk),
-		PresenceS:     presenceService,
-		ProvisioningS: NewProvisioningService(tt.bk),
-		WebS:          NewIdentityService(tt.bk),
-		Access:        NewAccessService(tt.bk),
-		EventsS:       eventsService,
-		ChangesC:      make(chan interface{}),
-		ConfigS:       configService,
-		RestrictionsS: NewRestrictionsService(tt.bk),
-		Clock:         clock,
+		TrustS:         caService,
+		TrustInternalS: caService,
+		PresenceS:      presenceService,
+		ProvisioningS:  NewProvisioningService(tt.bk),
+		WebS:           identityService,
+		Access:         NewAccessService(tt.bk),
+		EventsS:        eventsService,
+		ChangesC:       make(chan interface{}),
+		ConfigS:        configService,
+		LocalConfigS:   configService,
+		RestrictionsS:  NewRestrictionsService(tt.bk),
+		Clock:          clock,
 	}
 
 	return &tt
@@ -88,17 +97,17 @@ func TestCRUD(t *testing.T) {
 	t.Run("TestUsersCRUD", tt.suite.UsersCRUD)
 	t.Run("TestUsersExpiry", tt.suite.UsersExpiry)
 	t.Run("TestLoginAttempts", tt.suite.LoginAttempts)
-	t.Run("TestPasswordHashCRUD", tt.suite.PasswordHashCRUD)
+	t.Run("TestPasswordCRUD", tt.suite.PasswordCRUD)
 	t.Run("TestWebSessionCRUD", tt.suite.WebSessionCRUD)
 	t.Run("TestToken", tt.suite.TokenCRUD)
 	t.Run("TestRoles", tt.suite.RolesCRUD)
 	t.Run("TestSAMLCRUD", tt.suite.SAMLCRUD)
 	t.Run("TestTunnelConnectionsCRUD", tt.suite.TunnelConnectionsCRUD)
 	t.Run("TestGithubConnectorCRUD", tt.suite.GithubConnectorCRUD)
-	t.Run("TestRemoteClustersCRUD", tt.suite.RemoteClustersCRUD)
 	t.Run("TestEvents", tt.suite.Events)
 	t.Run("TestEventsClusterConfig", tt.suite.EventsClusterConfig)
 	t.Run("TestNetworkRestrictions", func(t *testing.T) { tt.suite.NetworkRestrictions(t) })
+	t.Run("TestOIDCCRUD", tt.suite.OIDCCRUD)
 }
 
 func TestSemaphore(t *testing.T) {

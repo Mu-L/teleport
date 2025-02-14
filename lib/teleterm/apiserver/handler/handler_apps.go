@@ -1,61 +1,111 @@
-// Copyright 2021 Gravitational, Inc
+// Teleport
+// Copyright (C) 2024 Gravitational, Inc.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
 //
-//      http://www.apache.org/licenses/LICENSE-2.0
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
 //
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 package handler
 
 import (
 	"context"
-	"sort"
 
 	"github.com/gravitational/trace"
 
-	api "github.com/gravitational/teleport/lib/teleterm/api/protogen/golang/v1"
+	"github.com/gravitational/teleport/api/types"
+	api "github.com/gravitational/teleport/gen/proto/go/teleport/lib/teleterm/v1"
+	"github.com/gravitational/teleport/lib/teleterm/api/uri"
 	"github.com/gravitational/teleport/lib/teleterm/clusters"
+	"github.com/gravitational/teleport/lib/ui"
 )
 
-// ListApps lists cluster applications
-func (s *Handler) ListApps(ctx context.Context, req *api.ListAppsRequest) (*api.ListAppsResponse, error) {
-	apps, err := s.DaemonService.ListApps(ctx, req.ClusterUri)
+func (h *Handler) GetApp(ctx context.Context, req *api.GetAppRequest) (*api.GetAppResponse, error) {
+	appURI, err := uri.Parse(req.AppUri)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	response := &api.ListAppsResponse{}
-	for _, app := range apps {
-		response.Apps = append(response.Apps, newAPIApp(app))
+	proxyClient, err := h.DaemonService.GetCachedClient(ctx, appURI)
+	if err != nil {
+		return nil, trace.Wrap(err)
 	}
 
-	return response, nil
+	var app types.Application
+	if err := clusters.AddMetadataToRetryableError(ctx, func() error {
+		var err error
+		app, err = clusters.GetApp(ctx, proxyClient.CurrentCluster(), appURI.GetAppName())
+		return trace.Wrap(err)
+	}); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	clustersApp := clusters.App{
+		URI: appURI,
+		App: app,
+	}
+
+	return &api.GetAppResponse{
+		App: newAPIApp(clustersApp),
+	}, nil
 }
 
-func newAPIApp(app clusters.App) *api.App {
-	apiLabels := APILabels{}
-	for name, value := range app.GetAllLabels() {
-		apiLabels = append(apiLabels, &api.Label{
-			Name:  name,
-			Value: value,
+func newAPIApp(clusterApp clusters.App) *api.App {
+	app := clusterApp.App
+
+	awsRoles := []*api.AWSRole{}
+	for _, role := range clusterApp.AWSRoles {
+		awsRoles = append(awsRoles, &api.AWSRole{
+			Name:      role.Name,
+			Display:   role.Display,
+			Arn:       role.ARN,
+			AccountId: role.AccountID,
 		})
 	}
-	sort.Sort(apiLabels)
+
+	apiLabels := makeAPILabels(ui.MakeLabelsWithoutInternalPrefixes(app.GetAllLabels()))
+
+	tcpPorts := make([]*api.PortRange, 0, len(app.GetTCPPorts()))
+	for _, portRange := range app.GetTCPPorts() {
+		tcpPorts = append(tcpPorts, &api.PortRange{Port: portRange.Port, EndPort: portRange.EndPort})
+	}
 
 	return &api.App{
-		Uri:         app.URI.String(),
-		Name:        app.GetName(),
-		Labels:      apiLabels,
-		Description: app.GetDescription(),
-		AppUri:      app.GetURI(),
-		PublicAddr:  app.GetPublicAddr(),
-		AwsConsole:  app.IsAWSConsole(),
+		Uri:          clusterApp.URI.String(),
+		EndpointUri:  app.GetURI(),
+		Name:         app.GetName(),
+		Desc:         app.GetDescription(),
+		AwsConsole:   app.IsAWSConsole(),
+		PublicAddr:   app.GetPublicAddr(),
+		Fqdn:         clusterApp.FQDN,
+		AwsRoles:     awsRoles,
+		FriendlyName: types.FriendlyName(app),
+		SamlApp:      false,
+		Labels:       apiLabels,
+		TcpPorts:     tcpPorts,
+	}
+}
+
+func newSAMLIdPServiceProviderAPIApp(clusterApp clusters.SAMLIdPServiceProvider) *api.App {
+	provider := clusterApp.Provider
+	apiLabels := makeAPILabels(ui.MakeLabelsWithoutInternalPrefixes(provider.GetAllLabels()))
+
+	// Keep in sync with lib/web/ui/app.go.
+	return &api.App{
+		Uri:          clusterApp.URI.String(),
+		Name:         provider.GetName(),
+		Desc:         "SAML Application",
+		PublicAddr:   "",
+		FriendlyName: types.FriendlyName(provider),
+		SamlApp:      true,
+		Labels:       apiLabels,
 	}
 }

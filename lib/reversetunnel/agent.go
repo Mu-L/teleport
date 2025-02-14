@@ -1,18 +1,20 @@
 /*
-Copyright 2015-2019 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 // Package reversetunnel sets up persistent reverse tunnel
 // between remote site and teleport proxy, when site agents
@@ -25,20 +27,22 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
-	"github.com/sirupsen/logrus"
 	"golang.org/x/crypto/ssh"
 
 	"github.com/gravitational/teleport/api/constants"
 	tracessh "github.com/gravitational/teleport/api/observability/tracing/ssh"
 	"github.com/gravitational/teleport/api/utils/sshutils"
+	"github.com/gravitational/teleport/lib/multiplexer"
 	"github.com/gravitational/teleport/lib/reversetunnel/track"
 	"github.com/gravitational/teleport/lib/utils"
+	logutils "github.com/gravitational/teleport/lib/utils/log"
 )
 
 type AgentState string
@@ -59,10 +63,10 @@ const (
 // AgentStateCallback is called when an agent's state changes.
 type AgentStateCallback func(AgentState)
 
-// transporter handles the creation of new transports over ssh.
-type transporter interface {
-	// Transport creates a new transport.
-	transport(context.Context, ssh.Channel, <-chan *ssh.Request, sshutils.Conn) *transport
+// transportHandler handles the creation of new transports over ssh.
+type transportHandler interface {
+	// handleTransport runs the receiver of a teleport-transport channel.
+	handleTransport(context.Context, ssh.Channel, <-chan *ssh.Request, sshutils.Conn)
 }
 
 // sshDialer is an ssh dialer that returns an SSHClient
@@ -99,22 +103,24 @@ type agentConfig struct {
 	stateCallback AgentStateCallback
 	// sshDialer creates a new ssh connection.
 	sshDialer sshDialer
-	// transporter creates a new transport.
-	transporter transporter
+	// transportHandler handles teleport-transport channels.
+	transportHandler transportHandler
 	// versionGetter gets the connected auth server version.
 	versionGetter versionGetter
 	// tracker tracks existing proxies.
 	tracker *track.Tracker
 	// lease gives the agent an exclusive claim to connect to a proxy.
-	lease track.Lease
+	lease *track.Lease
 	// clock is use to get the current time. Mock clocks can be used for
 	// testing.
 	clock clockwork.Clock
-	// log is an optional logger.
-	log logrus.FieldLogger
+	// logger is an optional logger.
+	logger *slog.Logger
 	// localAuthAddresses is a list of auth servers to use when dialing back to
 	// the local cluster.
 	localAuthAddresses []string
+	// proxySigner is used to sign PROXY headers for securely propagating client IP address
+	proxySigner multiplexer.PROXYHeaderSigner
 }
 
 // checkAndSetDefaults ensures an agentConfig contains required parameters.
@@ -125,8 +131,8 @@ func (c *agentConfig) checkAndSetDefaults() error {
 	if c.sshDialer == nil {
 		return trace.BadParameter("missing parameter sshDialer")
 	}
-	if c.transporter == nil {
-		return trace.BadParameter("missing parameter transporter")
+	if c.transportHandler == nil {
+		return trace.BadParameter("missing parameter transportHandler")
 	}
 	if c.versionGetter == nil {
 		return trace.BadParameter("missing parameter versionGetter")
@@ -134,17 +140,19 @@ func (c *agentConfig) checkAndSetDefaults() error {
 	if c.tracker == nil {
 		return trace.BadParameter("missing parameter tracker")
 	}
+	if c.lease == nil {
+		return trace.BadParameter("missing parameter lease")
+	}
 	if c.clock == nil {
 		c.clock = clockwork.NewRealClock()
 	}
-	if c.log == nil {
-		c.log = logrus.New()
+	if c.logger == nil {
+		c.logger = slog.Default()
 	}
-	if !c.lease.IsZero() {
-		c.log = c.log.WithField("leaseID", c.lease.ID())
-	}
-
-	c.log = c.log.WithField("target", c.addr.String())
+	c.logger = c.logger.With(
+		"lease_id", c.lease.ID(),
+		"target", c.addr.String(),
+	)
 
 	return nil
 }
@@ -171,8 +179,6 @@ type agent struct {
 	discoveryC <-chan ssh.NewChannel
 	// transportC receives new tranport channels.
 	transportC <-chan ssh.NewChannel
-	// unclaim releases the claim to the proxy in the tracker.
-	unclaim func()
 	// ctx is the internal context used to release resources used by  the agent.
 	ctx context.Context
 	// cancel cancels the internal context.
@@ -186,6 +192,8 @@ type agent struct {
 	// drainWG tracks transports and other concurrent operations required
 	// to drain a connection are finished.
 	drainWG sync.WaitGroup
+	// proxySigner is used to sign PROXY headers for securely propagating client IP address
+	proxySigner multiplexer.PROXYHeaderSigner
 }
 
 // newAgent intializes a reverse tunnel agent.
@@ -200,8 +208,8 @@ func newAgent(config agentConfig) (*agent, error) {
 		state:          AgentInitial,
 		cancel:         noop,
 		drainCancel:    noop,
-		unclaim:        noop,
 		doneConnecting: make(chan struct{}),
+		proxySigner:    config.proxySigner,
 	}, nil
 }
 
@@ -278,7 +286,10 @@ func (a *agent) updateState(state AgentState) (AgentState, error) {
 
 	prevState := a.state
 	a.state = state
-	a.log.Debugf("Changing state %s -> %s.", prevState, state)
+	a.logger.DebugContext(a.ctx, "Agent state updated",
+		"previous_state", prevState,
+		"current_state", state,
+	)
 
 	if a.agentConfig.stateCallback != nil {
 		go a.agentConfig.stateCallback(a.state)
@@ -288,9 +299,9 @@ func (a *agent) updateState(state AgentState) (AgentState, error) {
 }
 
 // Start starts an agent returning after successfully connecting and sending
-// the first heatbeat.
+// the first heartbeat.
 func (a *agent) Start(ctx context.Context) error {
-	a.log.Debugf("Starting agent %v", a.addr)
+	a.logger.DebugContext(ctx, "Starting agent", "addr", a.addr.FullAddress())
 
 	var err error
 	defer func() {
@@ -319,7 +330,7 @@ func (a *agent) Start(ctx context.Context) error {
 	a.wg.Add(1)
 	go func() {
 		if err := a.handleGlobalRequests(a.ctx, a.client.GlobalRequests()); err != nil {
-			a.log.WithError(err).Debug("Failed to handle global requests.")
+			a.logger.DebugContext(a.ctx, "Failed to handle global requests", "error", err)
 		}
 		a.wg.Done()
 		a.Stop()
@@ -330,7 +341,7 @@ func (a *agent) Start(ctx context.Context) error {
 	a.wg.Add(1)
 	go func() {
 		if err := a.handleDrainChannels(); err != nil {
-			a.log.WithError(err).Debug("Failed to handle drainable channels.")
+			a.logger.DebugContext(a.ctx, "Failed to handle drainable channels", "error", err)
 		}
 		a.wg.Done()
 		a.Stop()
@@ -339,7 +350,7 @@ func (a *agent) Start(ctx context.Context) error {
 	a.wg.Add(1)
 	go func() {
 		if err := a.handleChannels(); err != nil {
-			a.log.WithError(err).Debug("Failed to handle channels.")
+			a.logger.DebugContext(a.ctx, "Failed to handle channels", "error", err)
 		}
 		a.wg.Done()
 		a.Stop()
@@ -361,12 +372,12 @@ func (a *agent) connect() error {
 	}
 	a.client = client
 
-	unclaim, ok := a.tracker.Claim(a.client.Principals()...)
-	if !ok {
+	if !a.lease.Claim(a.client.Principals()...) {
 		a.client.Close()
-		return trace.Errorf("Failed to claim proxy: %v claimed by another agent", a.client.Principals())
+		// the error message must end with [proxyAlreadyClaimedError] to be
+		// recognized by [isProxyAlreadyClaimed]
+		return trace.Errorf("failed to claim proxy %v: "+proxyAlreadyClaimedError, a.client.Principals())
 	}
-	a.unclaim = unclaim
 
 	startupCtx, cancel := context.WithCancel(a.ctx)
 
@@ -400,6 +411,7 @@ func (a *agent) sendFirstHeartbeat(ctx context.Context) error {
 	if err != nil {
 		return trace.Wrap(err)
 	}
+	sshutils.DiscardChannelData(channel)
 
 	a.hbChannel = channel
 	a.hbRequests = requests
@@ -425,8 +437,6 @@ func (a *agent) Stop() error {
 	}
 
 	a.drainCancel()
-
-	a.unclaim()
 	a.lease.Release()
 
 	// Wait for open tranports to close before closing the connection.
@@ -455,23 +465,23 @@ func (a *agent) handleGlobalRequests(ctx context.Context, requests <-chan *ssh.R
 			case versionRequest:
 				version, err := a.versionGetter.getVersion(ctx)
 				if err != nil {
-					a.log.WithError(err).Warnf("Failed to retrieve auth version in response to %v request.", r.Type)
+					a.logger.WarnContext(ctx, "Failed to retrieve auth version in response to x-teleport-version request", "error", err)
 					if err := a.client.Reply(r, false, []byte("Failed to retrieve auth version")); err != nil {
-						a.log.Debugf("Failed to reply to %v request: %v.", r.Type, err)
+						a.logger.DebugContext(ctx, "Failed to reply to x-teleport-version request", "error", err)
 						continue
 					}
 				}
 
 				if err := a.client.Reply(r, true, []byte(version)); err != nil {
-					a.log.Debugf("Failed to reply to %v request: %v.", r.Type, err)
+					a.logger.DebugContext(ctx, "Failed to reply to x-teleport-version request", "error", err)
 					continue
 				}
 			case reconnectRequest:
-				a.log.Debugf("Received reconnect advisory request from proxy.")
+				a.logger.DebugContext(ctx, "Received reconnect advisory request from proxy")
 				if r.WantReply {
 					err := a.client.Reply(r, true, nil)
 					if err != nil {
-						a.log.Debugf("Failed to reply to %v request: %v.", r.Type, err)
+						a.logger.DebugContext(ctx, "Failed to reply to reconnect@goteleport.com request", "error", err)
 					}
 				}
 
@@ -482,12 +492,12 @@ func (a *agent) handleGlobalRequests(ctx context.Context, requests <-chan *ssh.R
 				// This handles keep-alive messages and matches the behavior of OpenSSH.
 				err := a.client.Reply(r, false, nil)
 				if err != nil {
-					a.log.Debugf("Failed to reply to %v request: %v.", r.Type, err)
+					a.logger.DebugContext(ctx, "Failed to reply to global request", "request_type", r.Type, "error", err)
 					continue
 				}
 			}
 		case <-ctx.Done():
-			return trace.Wrap(ctx.Err())
+			return nil
 		}
 	}
 }
@@ -532,7 +542,7 @@ func (a *agent) handleDrainChannels() error {
 
 		select {
 		case <-a.ctx.Done():
-			return trace.Wrap(a.ctx.Err())
+			return nil
 		// Signal once when the drain context is canceled to ensure we unblock
 		// to call drainWG.Done().
 		case <-drainSignal:
@@ -550,10 +560,10 @@ func (a *agent) handleDrainChannels() error {
 			bytes, _ := a.clock.Now().UTC().MarshalText()
 			_, err := a.hbChannel.SendRequest(a.ctx, "ping", false, bytes)
 			if err != nil {
-				a.log.Error(err)
+				a.logger.ErrorContext(a.ctx, "failed to send ping request", "error", err)
 				return trace.Wrap(err)
 			}
-			a.log.Debugf("Ping -> %v.", a.client.RemoteAddr())
+			a.logger.DebugContext(a.ctx, "Sent ping request", "target_addr", logutils.StringerAttr(a.client.RemoteAddr()))
 		// Handle transport requests.
 		case nch := <-a.transportC:
 			if nch == nil {
@@ -562,24 +572,22 @@ func (a *agent) handleDrainChannels() error {
 			if a.isDraining() {
 				err := nch.Reject(ssh.ConnectionFailed, "agent connection is draining")
 				if err != nil {
-					a.log.WithError(err).Warningf("Failed to reject transport channel.")
+					a.logger.WarnContext(a.ctx, "Failed to reject transport channel", "error", err)
 				}
 				continue
 			}
 
-			a.log.Debugf("Transport request: %v.", nch.ChannelType())
+			a.logger.DebugContext(a.ctx, "Received transport request", "channel_type", nch.ChannelType())
 			ch, req, err := nch.Accept()
 			if err != nil {
-				a.log.Warningf("Failed to accept transport request: %v.", err)
+				a.logger.WarnContext(a.ctx, "Failed to accept transport request", "error", err)
 				continue
 			}
 
-			t := a.transporter.transport(a.ctx, ch, req, a.client)
-
 			a.drainWG.Add(1)
 			go func() {
-				t.start()
-				a.drainWG.Done()
+				defer a.drainWG.Done()
+				a.transportHandler.handleTransport(a.ctx, ch, req, a.client)
 			}()
 
 		}
@@ -592,16 +600,16 @@ func (a *agent) handleChannels() error {
 		select {
 		// need to exit:
 		case <-a.ctx.Done():
-			return trace.Wrap(a.ctx.Err())
+			return nil
 		// new discovery request channel
 		case nch := <-a.discoveryC:
 			if nch == nil {
 				continue
 			}
-			a.log.Debugf("Discovery request channel opened: %v.", nch.ChannelType())
+			a.logger.DebugContext(a.ctx, "Discovery request channel opened", "channel_type", nch.ChannelType())
 			ch, req, err := nch.Accept()
 			if err != nil {
-				a.log.Warningf("Failed to accept discovery channel request: %v.", err)
+				a.logger.WarnContext(a.ctx, "Failed to accept discovery channel request", "error", err)
 				continue
 			}
 
@@ -621,10 +629,11 @@ func (a *agent) handleChannels() error {
 // ch   : SSH channel which received "teleport-transport" out-of-band request
 // reqC : request payload
 func (a *agent) handleDiscovery(ch ssh.Channel, reqC <-chan *ssh.Request) {
-	a.log.Debugf("handleDiscovery requests channel.")
+	a.logger.DebugContext(a.ctx, "handleDiscovery requests channel")
+	sshutils.DiscardChannelData(ch)
 	defer func() {
 		if err := ch.Close(); err != nil {
-			a.log.Warnf("Failed to close discovery channel: %v", err)
+			a.logger.WarnContext(a.ctx, "Failed to close discovery channel", "error", err)
 		}
 	}()
 
@@ -635,19 +644,18 @@ func (a *agent) handleDiscovery(ch ssh.Channel, reqC <-chan *ssh.Request) {
 			return
 		case req = <-reqC:
 			if req == nil {
-				a.log.Infof("Connection closed, returning")
+				a.logger.InfoContext(a.ctx, "Connection closed, returning")
 				return
 			}
 
 			var r discoveryRequest
 			if err := json.Unmarshal(req.Payload, &r); err != nil {
-				a.log.WithError(err).Warn("Bad payload")
+				a.logger.WarnContext(a.ctx, "Received discovery request with bad payload", "error", err)
 				return
 			}
 
-			proxies := r.ProxyNames()
-			a.log.Debugf("Received discovery request: %v", proxies)
-			a.tracker.TrackExpected(proxies...)
+			a.logger.DebugContext(a.ctx, "Received discovery request", "discovery_request", logutils.StringerAttr(&r))
+			a.tracker.TrackExpected(r.TrackProxies()...)
 		}
 	}
 }
@@ -657,22 +665,4 @@ const (
 	chanDiscovery    = "teleport-discovery"
 	chanDiscoveryReq = "discovery"
 	reconnectRequest = "reconnect@goteleport.com"
-)
-
-const (
-	// LocalNode is a special non-resolvable address that indicates the request
-	// wants to connect to a dialed back node.
-	LocalNode = "@local-node"
-	// RemoteAuthServer is a special non-resolvable address that indicates client
-	// requests a connection to the remote auth server.
-	RemoteAuthServer = "@remote-auth-server"
-	// LocalKubernetes is a special non-resolvable address that indicates that clients
-	// requests a connection to the kubernetes endpoint of the local proxy.
-	// This has to be a valid domain name, so it lacks @
-	LocalKubernetes = "remote.kube.proxy." + constants.APIDomain
-	// LocalWindowsDesktop is a special non-resolvable address that indicates
-	// that clients requests a connection to the windows service endpoint of
-	// the local proxy.
-	// This has to be a valid domain name, so it lacks @
-	LocalWindowsDesktop = "remote.windows_desktop.proxy." + constants.APIDomain
 )
