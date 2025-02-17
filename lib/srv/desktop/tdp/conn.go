@@ -1,18 +1,20 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package tdp
 
@@ -24,8 +26,6 @@ import (
 	"sync"
 
 	"github.com/gravitational/trace"
-
-	"github.com/gravitational/teleport/lib/srv"
 )
 
 // Conn is a desktop protocol connection.
@@ -54,18 +54,28 @@ type Conn struct {
 // NewConn creates a new Conn on top of a ReadWriter, for example a TCP
 // connection. If the provided ReadWriter also implements srv.TrackingConn,
 // then its LocalAddr() and RemoteAddr() will apply to this Conn.
-func NewConn(rw io.ReadWriteCloser) *Conn {
+func NewConn(rwc io.ReadWriteCloser) *Conn {
 	c := &Conn{
-		rwc:  rw,
-		bufr: bufio.NewReader(rw),
+		rwc:  rwc,
+		bufr: bufio.NewReader(rwc),
 	}
 
-	if tc, ok := rw.(srv.TrackingConn); ok {
+	if tc, ok := rwc.(srvTrackingConn); ok {
 		c.localAddr = tc.LocalAddr()
 		c.remoteAddr = tc.RemoteAddr()
 	}
 
 	return c
+}
+
+// srvTrackingConn should be kept in sync with
+// lib/srv.TrackingConn. It is duplicated here
+// to avoid placing a dependency on the lib/srv
+// package, which is incompatible with Windows.
+type srvTrackingConn interface {
+	LocalAddr() net.Addr
+	RemoteAddr() net.Addr
+	Close() error
 }
 
 // Close closes the connection if the underlying reader can be closed.
@@ -75,10 +85,6 @@ func (c *Conn) Close() error {
 		err = c.rwc.Close()
 	})
 	return err
-}
-
-func (c *Conn) ReadRaw() ([]byte, error) {
-	return readRaw(c.bufr)
 }
 
 // ReadMessage reads the next incoming message from the connection.
@@ -104,9 +110,25 @@ func (c *Conn) WriteMessage(m Message) error {
 	return trace.Wrap(err)
 }
 
+// ReadClientScreenSpec reads the next message from the connection, expecting
+// it to be a ClientScreenSpec. If it is not, an error is returned.
+func (c *Conn) ReadClientScreenSpec() (*ClientScreenSpec, error) {
+	m, err := c.ReadMessage()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	spec, ok := m.(ClientScreenSpec)
+	if !ok {
+		return nil, trace.BadParameter("expected ClientScreenSpec, got %T", m)
+	}
+
+	return &spec, nil
+}
+
 // SendNotification is a convenience function for sending a Notification message.
 func (c *Conn) SendNotification(message string, severity Severity) error {
-	return c.WriteMessage(Notification{Message: message, Severity: severity})
+	return c.WriteMessage(Alert{Message: message, Severity: severity})
 }
 
 // LocalAddr returns local address

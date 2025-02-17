@@ -1,33 +1,37 @@
 /*
-Copyright 2020 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package app
 
 import (
 	"context"
 	"crypto/tls"
+	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
 	"path"
+	"slices"
+	"strings"
+	"time"
 
-	"github.com/gravitational/oxy/forward"
 	"github.com/gravitational/trace"
-	"github.com/sirupsen/logrus"
-	"golang.org/x/exp/slices"
 
 	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/api/types"
@@ -45,17 +49,12 @@ type transportConfig struct {
 	publicPort   string
 	cipherSuites []uint16
 	jwt          string
-	audit        common.Audit
 	traits       wrappers.Traits
-	log          logrus.FieldLogger
-	user         string
+	log          *slog.Logger
 }
 
 // Check validates configuration.
 func (c *transportConfig) Check() error {
-	if c.audit == nil {
-		return trace.BadParameter("audit writer missing")
-	}
 	if c.app == nil {
 		return trace.BadParameter("app missing")
 	}
@@ -66,7 +65,7 @@ func (c *transportConfig) Check() error {
 		return trace.BadParameter("jwt missing")
 	}
 	if c.log == nil {
-		c.log = logrus.WithField(trace.Component, "transport")
+		c.log = slog.With(teleport.ComponentKey, "transport")
 	}
 
 	return nil
@@ -77,13 +76,11 @@ func (c *transportConfig) Check() error {
 type transport struct {
 	closeContext context.Context
 
-	c *transportConfig
+	*transportConfig
 
 	tr http.RoundTripper
 
 	uri *url.URL
-
-	ws *websocketTransport
 }
 
 // newTransport creates a new transport.
@@ -103,17 +100,22 @@ func newTransport(ctx context.Context, c *transportConfig) (*transport, error) {
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
+
+	// Add a timeout to control how long it takes to (start) getting a response
+	// from the target server. This allows Teleport to show the user a helpful
+	// error message when the target service is slow in responding.
+	tr.ResponseHeaderTimeout = requestTimeout
+
 	tr.TLSClientConfig, err = configureTLS(c)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
 	return &transport{
-		closeContext: ctx,
-		c:            c,
-		uri:          uri,
-		tr:           tr,
-		ws:           newWebsocketTransport(uri, tr.TLSClientConfig.Clone(), c),
+		closeContext:    ctx,
+		transportConfig: c,
+		uri:             uri,
+		tr:              tr,
 	}, nil
 }
 
@@ -145,19 +147,40 @@ func (t *transport) RoundTrip(r *http.Request) (*http.Response, error) {
 		return nil, trace.Wrap(err)
 	}
 
-	sessionCtx, err := common.GetSessionContext(r)
+	sessCtx, err := common.GetSessionContext(r)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	// Forward the request to the target application and emit an audit event.
+	// Forward the request to the target application.
+	//
+	// If a network error occurred when connecting to the target application,
+	// log and return a helpful error message to the user and Teleport
+	// administrator.
 	resp, err := t.tr.RoundTrip(r)
+	if message, ok := utils.CanExplainNetworkError(err); ok {
+		if t.log.Enabled(r.Context(), slog.LevelDebug) {
+			t.log.DebugContext(r.Context(), "application request failed with a network error",
+				"raw_error", err, "human_error", strings.Join(strings.Fields(message), " "))
+		}
+
+		code := trace.ErrorToCode(err)
+		return &http.Response{
+			StatusCode: code,
+			Status:     http.StatusText(code),
+			Proto:      r.Proto,
+			ProtoMajor: r.ProtoMajor,
+			ProtoMinor: r.ProtoMinor,
+			Body:       io.NopCloser(strings.NewReader(charWrap(message))),
+			TLS:        r.TLS,
+		}, nil
+	}
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
 	// Emit the event to the audit log.
-	if err := t.c.audit.OnRequest(t.closeContext, sessionCtx, r, resp, nil /*aws endpoint*/); err != nil {
+	if err := sessCtx.Audit.OnRequest(t.closeContext, sessCtx, r, uint32(resp.StatusCode), nil /*aws endpoint*/); err != nil {
 		return nil, trace.Wrap(err)
 	}
 
@@ -176,7 +199,7 @@ func (t *transport) rewriteRequest(r *http.Request) error {
 	r.URL.Host = t.uri.Host
 
 	// Add headers from rewrite configuration.
-	rewriteHeaders(r, t.c)
+	rewriteHeaders(r, t.transportConfig)
 
 	return nil
 }
@@ -185,19 +208,21 @@ func (t *transport) rewriteRequest(r *http.Request) error {
 func rewriteHeaders(r *http.Request, c *transportConfig) {
 	// Add in JWT headers.
 	r.Header.Set(teleport.AppJWTHeader, c.jwt)
-	r.Header.Set(teleport.AppCFHeader, c.jwt)
 
 	if c.app.GetRewrite() == nil || len(c.app.GetRewrite().Headers) == 0 {
 		return
 	}
 	for _, header := range c.app.GetRewrite().Headers {
 		if common.IsReservedHeader(header.Name) {
-			c.log.Debugf("Not rewriting Teleport header %q.", header.Name)
+			c.log.DebugContext(r.Context(), "Not rewriting Teleport reserved header", "header_name", header.Name)
 			continue
 		}
 		values, err := services.ApplyValueTraits(header.Value, c.traits)
 		if err != nil {
-			c.log.Debugf("Failed to apply traits to %q: %v.", header.Value, err)
+			c.log.DebugContext(r.Context(), "Failed to apply traits",
+				"header_value", header.Value,
+				"error", err,
+			)
 			continue
 		}
 		r.Header.Del(header.Name)
@@ -237,7 +262,7 @@ func (t *transport) needsPathRedirect(r *http.Request) (string, bool) {
 
 	u := url.URL{
 		Scheme: "https",
-		Host:   net.JoinHostPort(t.c.app.GetPublicAddr(), t.c.publicPort),
+		Host:   net.JoinHostPort(t.app.GetPublicAddr(), t.publicPort),
 		Path:   uriPath,
 	}
 	return u.String(), true
@@ -246,7 +271,7 @@ func (t *transport) needsPathRedirect(r *http.Request) (string, bool) {
 // rewriteResponse applies any rewriting rules to the response before returning it.
 func (t *transport) rewriteResponse(resp *http.Response) error {
 	switch {
-	case t.c.app.GetRewrite() != nil && len(t.c.app.GetRewrite().Redirect) > 0:
+	case t.app.GetRewrite() != nil && len(t.app.GetRewrite().Redirect) > 0:
 		err := t.rewriteRedirect(resp)
 		if err != nil {
 			return trace.Wrap(err)
@@ -258,7 +283,7 @@ func (t *transport) rewriteResponse(resp *http.Response) error {
 
 // rewriteRedirect applies redirect rules to the response.
 func (t *transport) rewriteRedirect(resp *http.Response) error {
-	if isRedirect(resp.StatusCode) {
+	if utils.IsRedirect(resp.StatusCode) {
 		// Parse the "Location" header.
 		u, err := url.Parse(resp.Header.Get("Location"))
 		if err != nil {
@@ -267,9 +292,9 @@ func (t *transport) rewriteRedirect(resp *http.Response) error {
 
 		// If the redirect location is one of the hosts specified in the list of
 		// redirects, rewrite the header.
-		if slices.Contains(t.c.app.GetRewrite().Redirect, host(u.Host)) {
+		if slices.Contains(t.app.GetRewrite().Redirect, host(u.Host)) {
 			u.Scheme = "https"
-			u.Host = net.JoinHostPort(t.c.app.GetPublicAddr(), t.c.publicPort)
+			u.Host = net.JoinHostPort(t.app.GetPublicAddr(), t.publicPort)
 		}
 		resp.Header.Set("Location", u.String())
 	}
@@ -298,50 +323,29 @@ func host(addr string) string {
 	return host
 }
 
-// isRedirect returns true if the status code is a 3xx code.
-func isRedirect(code int) bool {
-	if code >= http.StatusMultipleChoices && code <= http.StatusPermanentRedirect {
-		return true
-	}
-	return false
-}
+// charWrap wraps a line to about 80 characters to make it easier to read.
+func charWrap(message string) string {
+	var sb strings.Builder
+	for _, line := range strings.Split(message, "\n") {
+		var n int
+		for _, word := range strings.Fields(line) {
+			sb.WriteString(word)
+			sb.WriteString(" ")
 
-// websocketTransport combines parameters for websockets transport.
-//
-// Implements forward.ReqRewriter.
-type websocketTransport struct {
-	uri    *url.URL
-	dialer forward.Dialer
-	c      *transportConfig
-}
-
-// newWebsocketTransport returns transport that knows how to rewrite and
-// dial websocket requests.
-func newWebsocketTransport(uri *url.URL, tlsConfig *tls.Config, c *transportConfig) *websocketTransport {
-	return &websocketTransport{
-		uri: uri,
-		dialer: func(network, address string) (net.Conn, error) {
-			// Request is going to "wss://".
-			if uri.Scheme == "https" {
-				return tls.Dial(network, address, tlsConfig)
+			n += len(word) + 1
+			if n > 80 {
+				sb.WriteString("\n")
+				n = 0
 			}
-			// Request is going to "ws://".
-			return net.Dial(network, address)
-		},
-		c: c,
+		}
+		sb.WriteString("\n")
 	}
+	return sb.String()
 }
 
-// Rewrite rewrites the websocket request.
-func (r *websocketTransport) Rewrite(req *http.Request) {
-	// Update scheme and host to those of the target app's to make sure
-	// it's forwarded correctly.
-	req.URL.Scheme = "ws"
-	if r.uri.Scheme == "https" {
-		req.URL.Scheme = "wss"
-	}
-	req.URL.Host = r.uri.Host
-	req.Host = r.uri.Host
-
-	rewriteHeaders(req, r.c)
-}
+const (
+	// requestTimeout is the timeout to receive a response from the upstream
+	// server. Start it out large (not to break things) and slowly decrease it
+	// over time.
+	requestTimeout = 5 * time.Minute
+)

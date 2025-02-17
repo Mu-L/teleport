@@ -1,39 +1,38 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package botfs
 
 import (
+	"context"
 	"io/fs"
 	"os"
 	"os/user"
-	"runtime"
-	"strconv"
-	"syscall"
+	"path/filepath"
 
+	"github.com/google/uuid"
 	"github.com/gravitational/trace"
-	"github.com/sirupsen/logrus"
 
 	"github.com/gravitational/teleport"
-	"github.com/gravitational/teleport/api/constants"
+	logutils "github.com/gravitational/teleport/lib/utils/log"
 )
 
-var log = logrus.WithFields(logrus.Fields{
-	trace.Component: teleport.ComponentTBot,
-})
+var log = logutils.NewPackageLogger(teleport.ComponentKey, teleport.ComponentTBot)
 
 // SymlinksMode is an enum type listing various symlink behavior modes.
 type SymlinksMode string
@@ -100,6 +99,31 @@ type ACLOptions struct {
 	ReaderUser *user.User
 }
 
+// ACLSelector is a target for an ACL entry, pointing at e.g. a single user or
+// group. Only one field may be specified in a given selector and this should be
+// validated with `CheckAndSetDefaults()`.
+type ACLSelector struct {
+	// User is a user specifier. If numeric, it is treated as a UID. Only one
+	// field may be specified per ACLSelector.
+	User string `yaml:"user,omitempty"`
+
+	// Group is a group specifier. If numeric, it is treated as a UID. Only one
+	// field may be specified per ACLSelector.
+	Group string `yaml:"group,omitempty"`
+}
+
+func (s *ACLSelector) CheckAndSetDefaults() error {
+	if s.User != "" && s.Group != "" {
+		return trace.BadParameter("reader: only one of 'user' and 'group' may be set, not both")
+	}
+
+	if s.User == "" && s.Group == "" {
+		return trace.BadParameter("reader: one of 'user' or 'group' must be set")
+	}
+
+	return nil
+}
+
 // openStandard attempts to open the given path for reading and writing with
 // O_CREATE set.
 func openStandard(path string, mode OpenMode) (*os.File, error) {
@@ -128,42 +152,50 @@ func createStandard(path string, isDir bool) error {
 	}
 
 	if err := f.Close(); err != nil {
-		log.Warnf("Failed to close file at %q: %+v", path, err)
+		log.WarnContext(
+			context.TODO(),
+			"Failed to close file",
+			"path", path,
+			"error", err,
+		)
 	}
 
 	return nil
 }
 
-// GetOwner attempts to retrieve the owner of the given file. This is not
-// supported on all platforms and will return a trace.NotImplemented in that
-// case.
-func GetOwner(fileInfo fs.FileInfo) (*user.User, error) {
-	info, ok := fileInfo.Sys().(*syscall.Stat_t)
-	if !ok {
-		return nil, trace.NotImplemented("Cannot verify file ownership on this platform.")
-	}
-
-	user, err := user.LookupId(strconv.Itoa(int(info.Uid)))
+// TestACL attempts to create a temporary file in the given parent directory and
+// apply an ACL to it. Note that `readers` should be representative of runtime
+// reader configuration as `ConfigureACL()` may attempt to resolve named users,
+// and may fail if resolution fails.
+func TestACL(directory string, readers []*ACLSelector) error {
+	// Note: we need to create the test file in the dest dir to ensure we
+	// actually test the target filesystem.
+	id, err := uuid.NewRandom()
 	if err != nil {
-		return nil, trace.Wrap(err)
+		return trace.Wrap(err)
 	}
 
-	return user, nil
-}
-
-// IsOwnedBy checks that the file at the given path is owned by the given user.
-// Returns a trace.NotImplemented() on unsupported platforms.
-func IsOwnedBy(fileInfo fs.FileInfo, user *user.User) (bool, error) {
-	if runtime.GOOS == constants.WindowsOS {
-		// no-op on windows
-		return false, trace.NotImplemented("Cannot verify file ownership on this platform.")
+	testFile := filepath.Join(directory, id.String())
+	if err := Create(testFile, false, SymlinksInsecure); err != nil {
+		return trace.Wrap(err)
 	}
 
-	info, ok := fileInfo.Sys().(*syscall.Stat_t)
-	if !ok {
-		return false, trace.NotImplemented("Cannot verify file ownership on this platform.")
+	defer func() {
+		err := os.Remove(testFile)
+		if err != nil {
+			log.DebugContext(
+				context.TODO(),
+				"Failed to delete ACL test file",
+				"path", testFile,
+			)
+		}
+	}()
+
+	// Configure a dummy ACL that redundantly includes the user as a reader.
+	//nolint:staticcheck // staticcheck doesn't like nop implementations in fs_other.go
+	if err := ConfigureACL(testFile, readers); err != nil {
+		return trace.Wrap(err)
 	}
 
-	// Our files are 0600, so don't bother checking gid.
-	return strconv.Itoa(int(info.Uid)) == user.Uid, nil
+	return nil
 }

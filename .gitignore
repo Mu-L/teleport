@@ -2,6 +2,8 @@
 gitref.go
 .data
 debug
+!/lib/srv/debug
+!/lib/client/debug
 default.etcd
 /darwin
 
@@ -10,6 +12,8 @@ default.etcd
 
 # usually release tarballs get in the way
 *.gz
+# ignore all tarballs except the alpine one
+!fixtures/alpine/alpine-minirootfs-*.tar.gz
 *.zip
 
 # editors
@@ -20,9 +24,11 @@ default.etcd
 # Compiled binaries, Object files, Static and Dynamic libs (Shared Objects)
 out
 build
+!/web/packages/build
 *.o
 *.a
 *.so
+*.syso
 
 # Folders
 _obj
@@ -80,5 +86,29 @@ ssh.config
 go.work
 go.work.sum
 
-# Buf side-effects
-/github.com
+# gogoproto side-effects
+/gogogen
+node_modules
+
+.air.toml
+webassets/
+
+# jest --coverage
+coverage
+
+# vite
+.swc
+web/certs/
+
+# Vagrant
+.vagrant
+
+# Files produced by tests
+*.avi
+
+# We have switched to pnpm, ignore Yarn lockfile
+yarn.lock
+
+# mockServiceWorker.js is generated on each start of Storybook instead of being vendored into the
+# repo, see web/scripts/run-storybook.sh.
+web/.storybook/public/mockServiceWorker.js

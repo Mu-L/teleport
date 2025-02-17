@@ -13,6 +13,10 @@ metadata:
   {{- if .Values.extraLabels.deployment }}
     {{- toYaml .Values.extraLabels.deployment | nindent 4 }}
   {{- end }}
+  {{- if .Values.annotations.deployment }}
+  annotations:
+    {{- toYaml .Values.annotations.deployment | nindent 4 }}
+  {{- end }}
 spec:
   serviceName: {{ .Release.Name }}
   replicas: {{ $replicaCount }}
@@ -33,8 +37,21 @@ spec:
   {{- toYaml .Values.extraLabels.pod | nindent 8 }}
 {{- end }}
     spec:
-      securityContext:
-        fsGroup: 9807
+      {{- if .Values.dnsConfig }}
+      dnsConfig: {{- toYaml .Values.dnsConfig | nindent 8 }}
+      {{- end }}
+      {{- if .Values.dnsPolicy }}
+      dnsPolicy: {{ .Values.dnsPolicy | quote }}
+      {{- end }}
+      {{- if .Values.hostAliases }}
+      hostAliases: {{- toYaml .Values.hostAliases | nindent 8 }}
+      {{- end }}
+      {{- if .Values.podSecurityContext }}
+      securityContext: {{- toYaml .Values.podSecurityContext | nindent 8}}
+      {{- end }}
+      {{- if .Values.terminationGracePeriodSeconds }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- end }}
       {{- if or .Values.affinity (gt (int $replicaCount) 1) }}
       affinity:
         {{- if .Values.affinity }}
@@ -78,17 +95,11 @@ spec:
 {{- if .Values.initContainers }}
       initContainers: {{- toYaml .Values.initContainers | nindent 6 }}
   {{- if .Values.resources }}
-        resources:
-    {{- toYaml .Values.resources | nindent 10 }}
+        resources: {{- toYaml .Values.resources | nindent 10 }}
   {{- end }}
-        securityContext:
-          allowPrivilegeEscalation: false
-          capabilities:
-            drop:
-            - all
-          readOnlyRootFilesystem: true
-          runAsNonRoot: true
-          runAsUser: 9807
+  {{- if .Values.initSecurityContext }}
+        securityContext: {{- toYaml .Values.initSecurityContext | nindent 10 }}
+  {{- end }}
         volumeMounts:
         - mountPath: /etc/teleport
           name: "config"
@@ -103,6 +114,11 @@ spec:
           name: "teleport-tls-ca"
           readOnly: true
           {{- end }}
+          {{- if contains "jamf" (.Values.roles | toString) }}
+        - mountPath: /etc/teleport-jamf-api-credentials
+          name: "jamf-api-credentials"
+          readOnly: true
+          {{- end }}
   {{- if .Values.extraVolumeMounts }}
     {{- toYaml .Values.extraVolumeMounts | nindent 8 }}
   {{- end }}
@@ -110,18 +126,22 @@ spec:
 {{- if .Values.priorityClassName }}
       priorityClassName: {{ .Values.priorityClassName }}
 {{- end }}
-      serviceAccountName: {{ template "teleport.serviceAccountName" . }}
+      serviceAccountName: {{ template "teleport-kube-agent.serviceAccountName" . }}
       {{- if .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml .Values.nodeSelector | nindent 8 }}
       {{- end }}
       containers:
       - name: "teleport"
-        image: "{{ if .Values.enterprise }}{{ .Values.enterpriseImage }}{{ else }}{{ .Values.image }}{{ end }}:{{ .teleportVersion }}"
+        image: {{ include "teleport-kube-agent.image" . | quote }}
         {{- if .Values.imagePullPolicy }}
         imagePullPolicy: {{ toYaml .Values.imagePullPolicy }}
         {{- end }}
         env:
+          # This variable is set for telemetry purposes.
+          # Telemetry is opt-in and controlled at the auth level.
+          - name: TELEPORT_INSTALL_METHOD_HELM_KUBE_AGENT
+            value: "true"
           - name: TELEPORT_REPLICA_NAME
             valueFrom:
               fieldRef:
@@ -132,6 +152,16 @@ spec:
                 fieldPath: metadata.namespace
           - name: RELEASE_NAME
             value: {{ .Release.Name }}
+          {{- if .Values.updater.enabled }}
+          - name: TELEPORT_EXT_UPGRADER
+            value: kube
+          - name: TELEPORT_EXT_UPGRADER_VERSION
+            value: {{ include "teleport-kube-agent.version" . }}
+          {{- end }}
+          {{- if .Values.clusterDomain }}
+          - name: TELEPORT_KUBE_CLUSTER_DOMAIN
+            value: {{ .Values.clusterDomain | quote }}
+          {{- end }}
           {{- if .Values.tls.existingCASecretName }}
           - name: SSL_CERT_FILE
             value: /etc/teleport-tls-ca/ca.pem
@@ -147,14 +177,9 @@ spec:
         {{- if .Values.extraArgs }}
           {{- toYaml .Values.extraArgs | nindent 8 }}
         {{- end }}
-        securityContext:
-          allowPrivilegeEscalation: false
-          capabilities:
-            drop:
-            - all
-          readOnlyRootFilesystem: true
-          runAsNonRoot: true
-          runAsUser: 9807
+        {{- if .Values.securityContext }}
+        securityContext: {{- toYaml .Values.securityContext | nindent 10 }}
+        {{- end }}
         ports:
         - name: diag
           containerPort: 3000
@@ -198,8 +223,16 @@ spec:
           name: "teleport-tls-ca"
           readOnly: true
 {{- end }}
+{{- if contains "jamf" (.Values.roles | toString) }}
+        - mountPath: /etc/teleport-jamf-api-credentials
+          name: "jamf-api-credentials"
+          readOnly: true
+{{- end }}
 {{- if .Values.extraVolumeMounts }}
   {{- toYaml .Values.extraVolumeMounts | nindent 8 }}
+{{- end }}
+{{- if .Values.extraContainers }}
+  {{- toYaml .Values.extraContainers | nindent 6 }}
 {{- end }}
       volumes:
       - name: "config"
@@ -207,7 +240,7 @@ spec:
           name: {{ .Release.Name }}
       - name: "auth-token"
         secret:
-          secretName: {{ .Values.secretName }}
+          secretName: {{ coalesce .Values.secretName .Values.joinTokenSecret.name }}
 {{- if not .Values.storage.enabled }}
       - name: "data"
         emptyDir: {}
@@ -216,6 +249,11 @@ spec:
       - name: "teleport-tls-ca"
         secret:
           secretName: {{ .Values.tls.existingCASecretName }}
+{{- end }}
+{{- if contains "jamf" (.Values.roles | toString) }}
+      - name: "jamf-api-credentials"
+        secret:
+          secretName: {{ .Values.jamfCredentialsSecret.name }}
 {{- end }}
 {{- if .Values.extraVolumes }}
   {{- toYaml .Values.extraVolumes | nindent 6 }}

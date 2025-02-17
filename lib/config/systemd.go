@@ -1,16 +1,20 @@
-// Copyright 2022 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package config
 
@@ -20,6 +24,8 @@ import (
 	"text/template"
 
 	"github.com/gravitational/trace"
+
+	"github.com/gravitational/teleport/lib/defaults"
 )
 
 const (
@@ -38,15 +44,18 @@ After=network.target
 
 [Service]
 Type=simple
-Restart=on-failure
+Restart=always
+RestartSec=5
 EnvironmentFile=-{{ .EnvironmentFile }}
-ExecStart={{ .TeleportInstallationFile }} start --pid-file={{ .PIDFile }}
-ExecReload=/bin/kill -HUP $MAINPID
+ExecStart={{ .TeleportInstallationFile }} start --config {{ .TeleportConfigPath }} --pid-file={{ .PIDFile }}
+# systemd before 239 needs an absolute path
+ExecReload=/bin/sh -c "exec pkill -HUP -L -F {{ .PIDFile }}"
 PIDFile={{ .PIDFile }}
 LimitNOFILE={{ .FileDescriptorLimit }}
 
 [Install]
-WantedBy=multi-user.target`))
+WantedBy=multi-user.target
+`))
 
 // SystemdFlags specifies configuration parameters for a systemd unit file.
 type SystemdFlags struct {
@@ -58,6 +67,8 @@ type SystemdFlags struct {
 	FileDescriptorLimit int
 	// TeleportInstallationFile is the teleport installation path provided by the user.
 	TeleportInstallationFile string
+	// TeleportConfigPath is the path to the teleport config file (as set by Teleport defaults)
+	TeleportConfigPath string
 }
 
 // CheckAndSetDefaults checks and sets default values for the flags.
@@ -69,6 +80,8 @@ func (f *SystemdFlags) CheckAndSetDefaults() error {
 		}
 		f.TeleportInstallationFile = teleportPath
 	}
+	// set Teleport config path to the default
+	f.TeleportConfigPath = defaults.ConfigFilePath
 
 	return nil
 }

@@ -1,23 +1,26 @@
 /*
-Copyright 2018 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package backend
 
 import (
 	"context"
+	"strconv"
 	"testing"
 	"time"
 
@@ -43,22 +46,22 @@ func TestWatcherSimple(t *testing.T) {
 
 	select {
 	case e := <-w.Events():
-		require.Equal(t, e.Type, types.OpInit)
+		require.Equal(t, types.OpInit, e.Type)
 	case <-time.After(100 * time.Millisecond):
 		t.Fatalf("Timeout waiting for event.")
 	}
 
-	b.Emit(Event{Item: Item{Key: []byte{Separator}, ID: 1}})
+	b.Emit(Event{Item: Item{Key: NewKey("1")}})
 
 	select {
 	case e := <-w.Events():
-		require.Equal(t, e.Item.ID, int64(1))
+		require.Equal(t, NewKey("1"), e.Item.Key)
 	case <-time.After(100 * time.Millisecond):
 		t.Fatalf("Timeout waiting for event.")
 	}
 
 	b.Close()
-	b.Emit(Event{Item: Item{ID: 2}})
+	b.Emit(Event{Item: Item{Key: NewKey("2")}})
 
 	select {
 	case <-w.Done():
@@ -80,6 +83,7 @@ func TestWatcherCapacity(t *testing.T) {
 		BufferCapacity(1),
 		BufferClock(clock),
 		BacklogGracePeriod(gracePeriod),
+		CreationGracePeriod(time.Nanosecond),
 	)
 	defer b.Close()
 	b.SetInit()
@@ -92,7 +96,7 @@ func TestWatcherCapacity(t *testing.T) {
 
 	select {
 	case e := <-w.Events():
-		require.Equal(t, e.Type, types.OpInit)
+		require.Equal(t, types.OpInit, e.Type)
 	default:
 		t.Fatalf("Expected immediate OpInit.")
 	}
@@ -100,12 +104,12 @@ func TestWatcherCapacity(t *testing.T) {
 	// emit and then consume 10 events.  this is much larger than our queue size,
 	// but should succeed since we consume within our grace period.
 	for i := 0; i < 10; i++ {
-		b.Emit(Event{Item: Item{Key: []byte{Separator}, ID: int64(i + 1)}})
+		b.Emit(Event{Item: Item{Key: NewKey(strconv.Itoa(i + 1))}})
 	}
 	for i := 0; i < 10; i++ {
 		select {
 		case e := <-w.Events():
-			require.Equal(t, e.Item.ID, int64(i+1))
+			require.Equal(t, string(Separator)+strconv.Itoa(i+1), e.Item.Key.String())
 		default:
 			t.Fatalf("Expected events to be immediately available")
 		}
@@ -115,7 +119,7 @@ func TestWatcherCapacity(t *testing.T) {
 	clock.Advance(gracePeriod + time.Second)
 
 	// emit another event, which will cause buffer to reevaluate the grace period.
-	b.Emit(Event{Item: Item{Key: []byte{Separator}, ID: int64(11)}})
+	b.Emit(Event{Item: Item{Key: NewKey("11")}})
 
 	// ensure that buffer did not close watcher, since previously created backlog
 	// was drained within grace period.
@@ -127,13 +131,13 @@ func TestWatcherCapacity(t *testing.T) {
 
 	// create backlog again, and this time advance past grace period without draining it.
 	for i := 0; i < 10; i++ {
-		b.Emit(Event{Item: Item{Key: []byte{Separator}, ID: int64(i + 12)}})
+		b.Emit(Event{Item: Item{Key: NewKey(strconv.Itoa(i + 12))}})
 	}
 	clock.Advance(gracePeriod + time.Second)
 
 	// emit another event, which will cause buffer to realize that watcher is past
 	// its grace period.
-	b.Emit(Event{Item: Item{Key: []byte{Separator}, ID: int64(22)}})
+	b.Emit(Event{Item: Item{Key: NewKey("22")}})
 
 	select {
 	case <-w.Done():
@@ -142,116 +146,183 @@ func TestWatcherCapacity(t *testing.T) {
 	}
 }
 
+func TestWatcherCreationGracePeriod(t *testing.T) {
+	const backlogGracePeriod = time.Second
+	const creationGracePeriod = backlogGracePeriod * 3
+	const queueSize = 1
+	clock := clockwork.NewFakeClock()
+
+	ctx := context.Background()
+	b := NewCircularBuffer(
+		BufferCapacity(1),
+		BufferClock(clock),
+		BacklogGracePeriod(backlogGracePeriod),
+		CreationGracePeriod(creationGracePeriod),
+	)
+	defer b.Close()
+	b.SetInit()
+
+	w, err := b.NewWatcher(ctx, Watch{
+		QueueSize: queueSize,
+	})
+	require.NoError(t, err)
+	defer w.Close()
+
+	select {
+	case e := <-w.Events():
+		require.Equal(t, types.OpInit, e.Type)
+	default:
+		t.Fatalf("Expected immediate OpInit.")
+	}
+
+	// emit enough events to create a backlog
+	for i := 0; i < queueSize*2; i++ {
+		b.Emit(Event{Item: Item{Key: NewKey("")}})
+	}
+
+	select {
+	case <-w.Done():
+		t.Fatal("watcher closed unexpectedly")
+	default:
+	}
+
+	// sanity-check
+	require.Greater(t, creationGracePeriod, backlogGracePeriod*2)
+
+	// advance well past the backlog grace period, but not past the creation grace period
+	clock.Advance(backlogGracePeriod * 2)
+
+	b.Emit(Event{Item: Item{Key: NewKey("")}})
+
+	select {
+	case <-w.Done():
+		t.Fatal("watcher closed unexpectedly")
+	default:
+	}
+
+	// advance well past creation grace period
+	clock.Advance(creationGracePeriod)
+
+	b.Emit(Event{Item: Item{Key: NewKey("")}})
+	select {
+	case <-w.Done():
+	default:
+		t.Fatal("watcher did not close after creation grace period exceeded")
+	}
+}
+
 // TestWatcherClose makes sure that closed watcher
 // will be removed
 func TestWatcherClose(t *testing.T) {
+	ctx := context.Background()
 	b := NewCircularBuffer(
 		BufferCapacity(3),
 	)
 	defer b.Close()
 	b.SetInit()
 
-	w, err := b.NewWatcher(context.TODO(), Watch{})
+	w, err := b.NewWatcher(ctx, Watch{})
 	require.NoError(t, err)
 
 	select {
 	case e := <-w.Events():
-		require.Equal(t, e.Type, types.OpInit)
+		require.Equal(t, types.OpInit, e.Type)
 	case <-time.After(100 * time.Millisecond):
 		t.Fatalf("Timeout waiting for event.")
 	}
 
-	require.Equal(t, b.watchers.Len(), 1)
+	require.Equal(t, 1, b.watchers.Len())
 	w.(*BufferWatcher).closeAndRemove(removeSync)
-	require.Equal(t, b.watchers.Len(), 0)
+	require.Equal(t, 0, b.watchers.Len())
 }
 
 // TestRemoveRedundantPrefixes removes redundant prefixes
 func TestRemoveRedundantPrefixes(t *testing.T) {
 	type tc struct {
-		in  [][]byte
-		out [][]byte
+		in  []Key
+		out []Key
 	}
 	tcs := []tc{
 		{
-			in:  [][]byte{},
-			out: [][]byte{},
+			in:  []Key{},
+			out: []Key{},
 		},
 		{
-			in:  [][]byte{[]byte("/a")},
-			out: [][]byte{[]byte("/a")},
+			in:  []Key{NewKey("a")},
+			out: []Key{NewKey("a")},
 		},
 		{
-			in:  [][]byte{[]byte("/a"), []byte("/")},
-			out: [][]byte{[]byte("/")},
+			in:  []Key{NewKey("a"), NewKey("")},
+			out: []Key{NewKey("")},
 		},
 		{
-			in:  [][]byte{[]byte("/b"), []byte("/a")},
-			out: [][]byte{[]byte("/a"), []byte("/b")},
+			in:  []Key{NewKey("b"), NewKey("a")},
+			out: []Key{NewKey("a"), NewKey("b")},
 		},
 		{
-			in:  [][]byte{[]byte("/a/b"), []byte("/a"), []byte("/a/b/c"), []byte("/d")},
-			out: [][]byte{[]byte("/a"), []byte("/d")},
+			in:  []Key{NewKey("a", "b"), NewKey("a"), NewKey("a", "b", "c"), NewKey("d")},
+			out: []Key{NewKey("a"), NewKey("d")},
 		},
 	}
 	for _, tc := range tcs {
-		require.Empty(t, cmp.Diff(removeRedundantPrefixes(tc.in), tc.out))
+		require.Empty(t, cmp.Diff(RemoveRedundantPrefixes(tc.in), tc.out, cmp.AllowUnexported(Key{})))
 	}
 }
 
 // TestWatcherMulti makes sure that watcher
 // with multiple matching prefixes will get an event only once
 func TestWatcherMulti(t *testing.T) {
+	ctx := context.Background()
 	b := NewCircularBuffer(
 		BufferCapacity(3),
 	)
 	defer b.Close()
 	b.SetInit()
 
-	w, err := b.NewWatcher(context.TODO(), Watch{Prefixes: [][]byte{[]byte("/a"), []byte("/a/b")}})
+	w, err := b.NewWatcher(ctx, Watch{Prefixes: []Key{NewKey("a"), NewKey("a", "b")}})
 	require.NoError(t, err)
 	defer w.Close()
 
 	select {
 	case e := <-w.Events():
-		require.Equal(t, e.Type, types.OpInit)
+		require.Equal(t, types.OpInit, e.Type)
 	case <-time.After(100 * time.Millisecond):
 		t.Fatalf("Timeout waiting for event.")
 	}
 
-	b.Emit(Event{Item: Item{Key: []byte("/a/b/c"), ID: 1}})
+	b.Emit(Event{Item: Item{Key: NewKey("a", "b", "c")}})
 
 	select {
 	case e := <-w.Events():
-		require.Equal(t, e.Item.ID, int64(1))
+		require.Equal(t, NewKey("a", "b", "c"), e.Item.Key)
 	case <-time.After(100 * time.Millisecond):
 		t.Fatalf("Timeout waiting for event.")
 	}
 
-	require.Equal(t, len(w.Events()), 0)
-
+	require.Empty(t, w.Events())
 }
 
 // TestWatcherReset tests scenarios with watchers and buffer resets
 func TestWatcherReset(t *testing.T) {
+	ctx := context.Background()
 	b := NewCircularBuffer(
 		BufferCapacity(3),
 	)
 	defer b.Close()
 	b.SetInit()
 
-	w, err := b.NewWatcher(context.TODO(), Watch{})
+	w, err := b.NewWatcher(ctx, Watch{})
 	require.NoError(t, err)
 	defer w.Close()
 
 	select {
 	case e := <-w.Events():
-		require.Equal(t, e.Type, types.OpInit)
+		require.Equal(t, types.OpInit, e.Type)
 	case <-time.After(100 * time.Millisecond):
 		t.Fatalf("Timeout waiting for event.")
 	}
 
-	b.Emit(Event{Item: Item{Key: []byte{Separator}, ID: 1}})
+	b.Emit(Event{Item: Item{Key: NewKey("1")}})
 	b.Clear()
 
 	// make sure watcher has been closed
@@ -261,22 +332,22 @@ func TestWatcherReset(t *testing.T) {
 		t.Fatalf("Timeout waiting for close event.")
 	}
 
-	w2, err := b.NewWatcher(context.TODO(), Watch{})
+	w2, err := b.NewWatcher(ctx, Watch{})
 	require.NoError(t, err)
 	defer w2.Close()
 
 	select {
 	case e := <-w2.Events():
-		require.Equal(t, e.Type, types.OpInit)
+		require.Equal(t, types.OpInit, e.Type)
 	case <-time.After(100 * time.Millisecond):
 		t.Fatalf("Timeout waiting for event.")
 	}
 
-	b.Emit(Event{Item: Item{Key: []byte{Separator}, ID: 2}})
+	b.Emit(Event{Item: Item{Key: NewKey("2")}})
 
 	select {
 	case e := <-w2.Events():
-		require.Equal(t, e.Item.ID, int64(2))
+		require.Equal(t, NewKey("2"), e.Item.Key)
 	case <-time.After(100 * time.Millisecond):
 		t.Fatalf("Timeout waiting for event.")
 	}
@@ -285,12 +356,12 @@ func TestWatcherReset(t *testing.T) {
 // TestWatcherTree tests buffer watcher tree
 func TestWatcherTree(t *testing.T) {
 	wt := newWatcherTree()
-	require.Equal(t, wt.rm(nil), false)
+	require.False(t, wt.rm(nil))
 
-	w1 := &BufferWatcher{Watch: Watch{Prefixes: [][]byte{[]byte("/a"), []byte("/a/a1"), []byte("/c")}}}
-	require.Equal(t, wt.rm(w1), false)
+	w1 := &BufferWatcher{Watch: Watch{Prefixes: []Key{NewKey("a"), NewKey("a", "a1"), NewKey("c")}}}
+	require.False(t, wt.rm(w1))
 
-	w2 := &BufferWatcher{Watch: Watch{Prefixes: [][]byte{[]byte("/a")}}}
+	w2 := &BufferWatcher{Watch: Watch{Prefixes: []Key{NewKey("a")}}}
 
 	wt.add(w1)
 	wt.add(w2)
@@ -316,8 +387,8 @@ func TestWatcherTree(t *testing.T) {
 	require.Equal(t, matched[0], w1)
 	require.Equal(t, matched[1], w2)
 
-	require.Equal(t, wt.rm(w1), true)
-	require.Equal(t, wt.rm(w1), false)
+	require.True(t, wt.rm(w1))
+	require.False(t, wt.rm(w1))
 
 	matched = nil
 	wt.walkPath("/a", func(w *BufferWatcher) {
@@ -326,5 +397,5 @@ func TestWatcherTree(t *testing.T) {
 	require.Len(t, matched, 1)
 	require.Equal(t, matched[0], w2)
 
-	require.Equal(t, wt.rm(w2), true)
+	require.True(t, wt.rm(w2))
 }

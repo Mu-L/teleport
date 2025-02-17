@@ -1,18 +1,20 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package alpnproxy
 
@@ -21,7 +23,9 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/base64"
+	"errors"
 	"io"
+	"log/slog"
 	"net"
 	"strings"
 	"sync"
@@ -29,13 +33,16 @@ import (
 
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
-	"github.com/sirupsen/logrus"
 
+	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/api/constants"
-	"github.com/gravitational/teleport/lib/auth"
+	"github.com/gravitational/teleport/api/utils/pingconn"
+	"github.com/gravitational/teleport/lib/auth/authclient"
+	"github.com/gravitational/teleport/lib/authz"
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/srv/alpnproxy/common"
 	"github.com/gravitational/teleport/lib/srv/db/dbutils"
+	"github.com/gravitational/teleport/lib/tlsca"
 	"github.com/gravitational/teleport/lib/utils"
 )
 
@@ -48,7 +55,7 @@ type ProxyConfig struct {
 	// Router contains definition of protocol routing and handlers description.
 	Router *Router
 	// Log is used for logging.
-	Log logrus.FieldLogger
+	Log *slog.Logger
 	// Clock is a clock to override in tests, set to real time clock
 	// by default
 	Clock clockwork.Clock
@@ -59,7 +66,7 @@ type ProxyConfig struct {
 	// IdentityTLSConfig is the TLS ProxyRole identity used in servers with localhost SANs values.
 	IdentityTLSConfig *tls.Config
 	// AccessPoint is the auth server client.
-	AccessPoint auth.ReadProxyAccessPoint
+	AccessPoint authclient.CAGetter
 	// ClusterName is the name of the teleport cluster.
 	ClusterName string
 	// PingInterval defines the ping interval for ping-wrapped connections.
@@ -84,22 +91,18 @@ type Router struct {
 // MatchFunc is a type of the match route functions.
 type MatchFunc func(sni, alpn string) bool
 
-// MatchByProtocol creates match function based on client TLS ALPN protocol.
+// MatchByProtocol creates a match function that matches the client TLS ALPN
+// protocol against the provided list of ALPN protocols and their corresponding
+// Ping protocols.
 func MatchByProtocol(protocols ...common.Protocol) MatchFunc {
 	m := make(map[common.Protocol]struct{})
-	for _, v := range protocols {
+	for _, v := range common.WithPingProtocols(protocols) {
 		m[v] = struct{}{}
 	}
 	return func(sni, alpn string) bool {
 		_, ok := m[common.Protocol(alpn)]
 		return ok
 	}
-}
-
-// MatchByProtocolWithPing creates match function based on client TLS APLN
-// protocol matching also their ping protocol variations.
-func MatchByProtocolWithPing(protocols ...common.Protocol) MatchFunc {
-	return MatchByProtocol(append(protocols, common.ProtocolsWithPing(protocols...)...)...)
 }
 
 // MatchByALPNPrefix creates match function based on client TLS ALPN protocol prefix.
@@ -123,7 +126,7 @@ func ExtractMySQLEngineVersion(fn func(ctx context.Context, conn net.Conn) error
 			}
 			// The version should never be longer than 255 characters including
 			// the prefix, but better to be safe.
-			var versionEnd = 255
+			versionEnd := 255
 			if len(alpn) < versionEnd {
 				versionEnd = len(alpn)
 			}
@@ -152,7 +155,7 @@ func (r *Router) CheckAndSetDefaults() error {
 	return nil
 }
 
-// AddKubeHandler adds the handle for Kubernetes protocol (distinguishable by  "kube." SNI prefix).
+// AddKubeHandler adds the handle for Kubernetes protocol (distinguishable by  "kube-teleport-proxy-alpn." SNI prefix).
 func (r *Router) AddKubeHandler(handler HandlerFunc) {
 	r.mtx.Lock()
 	defer r.mtx.Unlock()
@@ -187,15 +190,21 @@ type HandlerDecs struct {
 	// terminating the TLS connection.
 	HandlerWithConnInfo HandlerFuncWithInfo
 	// ForwardTLS tells is ALPN proxy service should terminate TLS traffic or delegate the
-	// TLS termination to the protocol handler (Used in Kube handler case)
+	// TLS termination to the protocol handler (Used in Kube handler case).
+	//
+	// It is the upstream servers responsibility to provide the appropriate [tls.Config.NextProtos]
+	// to confirm the negotiated protocol.
 	ForwardTLS bool
 	// MatchFunc is a routing route match function based on ALPN SNI TLS values.
 	// If is evaluated to true the current HandleDesc will be used
 	// for connection handling.
 	MatchFunc MatchFunc
 	// TLSConfig is TLS configuration that allows switching TLS settings for the handle.
-	// By default, the ProxyConfig.WebTLSConfig configuration is used to TLS terminate incoming connection
-	// but if HandleDesc.TLSConfig is present it will take precedence over ProxyConfig TLS configuration.
+	// By default, the ProxyConfig.WebTLSConfig configuration is used to TLS terminate incoming connections,
+	// but if [HandlerDecs.TLSConfig] is present, it will take precedence over [ProxyConfig.WebTLSConfig].
+	//
+	// It is the responsibility of the creator of the [tls.Config] to provide the appropriate [tls.Config.NextProtos]
+	// to confirm the negotiated protocol.
 	TLSConfig *tls.Config
 }
 
@@ -232,7 +241,7 @@ type HandlerFunc func(ctx context.Context, conn net.Conn) error
 type Proxy struct {
 	cfg                ProxyConfig
 	supportedProtocols []common.Protocol
-	log                logrus.FieldLogger
+	log                *slog.Logger
 
 	// mu guards cancel
 	mu     sync.Mutex
@@ -248,7 +257,7 @@ func (c *ProxyConfig) CheckAndSetDefaults() error {
 		return trace.BadParameter("listener missing")
 	}
 	if c.Log == nil {
-		c.Log = logrus.WithField(trace.Component, "alpn:proxy")
+		c.Log = slog.With(teleport.ComponentKey, "alpn:proxy")
 	}
 	if c.Clock == nil {
 		c.Clock = clockwork.NewRealClock()
@@ -277,7 +286,7 @@ func (c *ProxyConfig) CheckAndSetDefaults() error {
 	}
 	c.IdentityTLSConfig = c.IdentityTLSConfig.Clone()
 	c.IdentityTLSConfig.ClientAuth = tls.RequireAndVerifyClientCert
-	fn := auth.WithClusterCAs(c.IdentityTLSConfig, c.AccessPoint, c.ClusterName, c.Log)
+	fn := authclient.WithClusterCAs(c.IdentityTLSConfig, c.AccessPoint, c.ClusterName, c.Log)
 	c.IdentityTLSConfig.GetConfigForClient = fn
 
 	return nil
@@ -313,7 +322,7 @@ func (p *Proxy) Serve(ctx context.Context) error {
 	for {
 		clientConn, err := p.cfg.Listener.Accept()
 		if err != nil {
-			if utils.IsOKNetworkError(err) || trace.IsConnectionProblem(err) {
+			if utils.IsOKNetworkError(err) || trace.IsConnectionProblem(err) || ctx.Err() != nil {
 				return nil
 			}
 			return trace.Wrap(err)
@@ -325,13 +334,16 @@ func (p *Proxy) Serve(ctx context.Context) error {
 			// https://github.com/gravitational/teleport/blob/master/lib/sshutils/server.go#L397
 			if err := p.handleConn(ctx, clientConn, nil); err != nil {
 				if cerr := clientConn.Close(); cerr != nil && !utils.IsOKNetworkError(cerr) {
-					p.log.WithError(cerr).Warnf("Failed to close client connection.")
+					p.log.WarnContext(ctx, "Failed to close client connection", "error", cerr)
 				}
-
-				if trace.IsBadParameter(err) {
-					p.log.Warnf("Failed to handle client connection: %v", err)
-				} else if !utils.IsOKNetworkError(err) {
-					p.log.WithError(err).Warnf("Failed to handle client connection.")
+				switch {
+				case trace.IsBadParameter(err):
+					p.log.WarnContext(ctx, "Failed to handle client connection", "error", err)
+				case utils.IsOKNetworkError(err):
+				case isConnRemoteError(err):
+					p.log.DebugContext(ctx, "Connection rejected by client", "error", err, "remote_addr", clientConn.RemoteAddr())
+				default:
+					p.log.WarnContext(ctx, "Failed to handle client connection", "error", err)
 				}
 			}
 		}()
@@ -361,7 +373,7 @@ type HandlerFuncWithInfo func(ctx context.Context, conn net.Conn, info Connectio
 //     was set if yes forward to the generic TLS DB handler.
 //  6. Forward connection to the handler obtained in step 2.
 func (p *Proxy) handleConn(ctx context.Context, clientConn net.Conn, defaultOverride *tls.Config) error {
-	hello, conn, err := p.readHelloMessageWithoutTLSTermination(clientConn)
+	hello, conn, err := p.readHelloMessageWithoutTLSTermination(ctx, clientConn)
 	if err != nil {
 		return trace.Wrap(err)
 	}
@@ -375,6 +387,7 @@ func (p *Proxy) handleConn(ctx context.Context, clientConn net.Conn, defaultOver
 		SNI:  hello.ServerName,
 		ALPN: hello.SupportedProtos,
 	}
+	ctx = authz.ContextWithClientAddrs(ctx, clientConn.RemoteAddr(), clientConn.LocalAddr())
 
 	if handlerDesc.ForwardTLS {
 		return trace.Wrap(handlerDesc.handle(ctx, conn, connInfo))
@@ -384,10 +397,17 @@ func (p *Proxy) handleConn(ctx context.Context, clientConn net.Conn, defaultOver
 	if err := tlsConn.SetReadDeadline(p.cfg.Clock.Now().Add(p.cfg.ReadDeadline)); err != nil {
 		return trace.Wrap(err)
 	}
-	if err := tlsConn.Handshake(); err != nil {
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
 		return trace.Wrap(err)
 	}
 	if err := tlsConn.SetReadDeadline(time.Time{}); err != nil {
+		return trace.Wrap(err)
+	}
+
+	// We try to do quick early IP pinning check, if possible, and stop it on the proxy, without going further.
+	// It's based only on client cert. Client can still fail full IP pinning check later if their role now requires
+	// IP pinning but cert isn't pinned.
+	if err := p.checkCertIPPinning(ctx, tlsConn); err != nil {
 		return trace.Wrap(err)
 	}
 
@@ -399,7 +419,7 @@ func (p *Proxy) handleConn(ctx context.Context, clientConn net.Conn, defaultOver
 
 	isDatabaseConnection, err := dbutils.IsDatabaseConnection(tlsConn.ConnectionState())
 	if err != nil {
-		p.log.WithError(err).Debug("Failed to check if connection is database connection.")
+		p.log.DebugContext(ctx, "Failed to check if connection is database connection", "error", err)
 	}
 	if isDatabaseConnection {
 		return trace.Wrap(p.handleDatabaseConnection(ctx, handlerConn, connInfo))
@@ -407,9 +427,39 @@ func (p *Proxy) handleConn(ctx context.Context, clientConn net.Conn, defaultOver
 	return trace.Wrap(handlerDesc.handle(ctx, handlerConn, connInfo))
 }
 
+func (p *Proxy) checkCertIPPinning(ctx context.Context, tlsConn *tls.Conn) error {
+	state := tlsConn.ConnectionState()
+
+	if len(state.PeerCertificates) == 0 {
+		return nil
+	}
+
+	identity, err := tlsca.FromSubject(state.PeerCertificates[0].Subject, state.PeerCertificates[0].NotAfter)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+
+	clientIP, port, err := net.SplitHostPort(tlsConn.RemoteAddr().String())
+	if err != nil {
+		return trace.Wrap(err)
+	}
+
+	if identity.PinnedIP != "" && (clientIP != identity.PinnedIP || port == "0") {
+		if port == "0" {
+			p.log.DebugContext(ctx, "pinned IP doesn't match observed client IP",
+				"client_ip", clientIP,
+				"pinned_ip", identity.PinnedIP,
+			)
+		}
+		return trace.Wrap(authz.ErrIPPinningMismatch)
+	}
+
+	return nil
+}
+
 // handlePingConnection starts the server ping routine and returns `pingConn`.
-func (p *Proxy) handlePingConnection(ctx context.Context, conn *tls.Conn) net.Conn {
-	pingConn := NewPingConn(conn)
+func (p *Proxy) handlePingConnection(ctx context.Context, conn *tls.Conn) utils.TLSConn {
+	pingConn := pingconn.NewTLS(conn)
 
 	// Start ping routine. It will continuously send pings in a defined
 	// interval.
@@ -424,7 +474,7 @@ func (p *Proxy) handlePingConnection(ctx context.Context, conn *tls.Conn) net.Co
 				err := pingConn.WritePing()
 				if err != nil {
 					if !utils.IsOKNetworkError(err) {
-						p.log.WithError(err).Warn("Failed to write ping message")
+						p.log.WarnContext(ctx, "Failed to write ping message", "error", err)
 					}
 
 					return
@@ -453,7 +503,7 @@ func (p *Proxy) getTLSConfig(desc *HandlerDecs, defaultOverride *tls.Config) *tl
 // readHelloMessageWithoutTLSTermination allows reading a ClientHelloInfo message without termination of
 // incoming TLS connection. After calling readHelloMessageWithoutTLSTermination function a returned
 // net.Conn should be used for further operation.
-func (p *Proxy) readHelloMessageWithoutTLSTermination(conn net.Conn) (*tls.ClientHelloInfo, net.Conn, error) {
+func (p *Proxy) readHelloMessageWithoutTLSTermination(ctx context.Context, conn net.Conn) (*tls.ClientHelloInfo, net.Conn, error) {
 	buff := new(bytes.Buffer)
 	var hello *tls.ClientHelloInfo
 	tlsConn := tls.Server(readOnlyConn{reader: io.TeeReader(conn, buff)}, &tls.Config{
@@ -469,7 +519,7 @@ func (p *Proxy) readHelloMessageWithoutTLSTermination(conn net.Conn) (*tls.Clien
 	// Following TLS handshake fails on the server side with error: "no certificates configured" after server
 	// receives a TLS hello message from the client. If handshake was able to read hello message it indicates successful
 	// flow otherwise TLS handshake error is returned.
-	err := tlsConn.Handshake()
+	err := tlsConn.HandshakeContext(ctx)
 	if hello == nil {
 		return nil, nil, trace.Wrap(err)
 	}
@@ -497,23 +547,23 @@ func (p *Proxy) databaseHandlerWithTLSTermination(ctx context.Context, conn net.
 	tlsConn := tls.Server(conn, p.cfg.IdentityTLSConfig)
 	if err := tlsConn.SetReadDeadline(p.cfg.Clock.Now().Add(p.cfg.ReadDeadline)); err != nil {
 		if err := tlsConn.Close(); err != nil {
-			p.log.WithError(err).Error("Failed to close TLS connection.")
+			p.log.ErrorContext(ctx, "Failed to close TLS connection", "error", err)
 		}
 		return trace.Wrap(err)
 	}
-	if err := tlsConn.Handshake(); err != nil {
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
 		return trace.Wrap(err)
 	}
 	if err := tlsConn.SetReadDeadline(time.Time{}); err != nil {
 		if err := tlsConn.Close(); err != nil {
-			p.log.WithError(err).Error("Failed to close TLS connection.")
+			p.log.ErrorContext(ctx, "Failed to close TLS connection", "error", err)
 		}
 		return trace.Wrap(err)
 	}
 
 	isDatabaseConnection, err := dbutils.IsDatabaseConnection(tlsConn.ConnectionState())
 	if err != nil {
-		p.log.WithError(err).Debug("Failed to check if connection is database connection.")
+		p.log.DebugContext(ctx, "Failed to check if connection is database connection", "error", err)
 	}
 	if !isDatabaseConnection {
 		return trace.BadParameter("not database connection")
@@ -561,11 +611,6 @@ func (p *Proxy) getHandleDescBasedOnALPNVal(clientHelloInfo *tls.ClientHelloInfo
 }
 
 func shouldRouteToKubeService(sni string) bool {
-	// DELETE IN 13.0. Deprecated, use only KubeTeleportProxyALPNPrefix.
-	if strings.HasPrefix(sni, constants.KubeSNIPrefix) {
-		return true
-	}
-
 	return strings.HasPrefix(sni, constants.KubeTeleportProxyALPNPrefix)
 }
 
@@ -611,4 +656,11 @@ func (w *ConnectionHandlerWrapper) HandleConnection(ctx context.Context, conn ne
 		return trace.NotFound("missing ConnectionHandler")
 	}
 	return w.h(ctx, conn)
+}
+
+// isConnRemoteError checks if an error origin is from the client side like:
+// TLS client side handshake error when the telepot proxy CA is not recognized by a client.
+func isConnRemoteError(err error) bool {
+	var opErr *net.OpError
+	return errors.As(err, &opErr) && opErr.Op == "remote error"
 }

@@ -1,18 +1,20 @@
 /*
-Copyright 2018-2019 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package events
 
@@ -23,6 +25,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -32,15 +35,15 @@ import (
 
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
-	log "github.com/sirupsen/logrus"
 
 	"github.com/gravitational/teleport"
-	apidefaults "github.com/gravitational/teleport/api/defaults"
+	auditlogpb "github.com/gravitational/teleport/api/gen/proto/go/teleport/auditlog/v1"
+	"github.com/gravitational/teleport/api/internalutils/stream"
 	"github.com/gravitational/teleport/api/types"
 	apievents "github.com/gravitational/teleport/api/types/events"
 	"github.com/gravitational/teleport/lib/defaults"
-	"github.com/gravitational/teleport/lib/session"
 	"github.com/gravitational/teleport/lib/utils"
+	logutils "github.com/gravitational/teleport/lib/utils/log"
 )
 
 // FileLogConfig is a configuration for file log
@@ -101,9 +104,7 @@ func NewFileLog(cfg FileLogConfig) (*FileLog, error) {
 	}
 	f := &FileLog{
 		FileLogConfig: cfg,
-		Entry: log.WithFields(log.Fields{
-			trace.Component: teleport.ComponentAuditLog,
-		}),
+		logger:        slog.With(teleport.ComponentKey, teleport.ComponentAuditLog),
 	}
 	return f, nil
 }
@@ -111,7 +112,7 @@ func NewFileLog(cfg FileLogConfig) (*FileLog, error) {
 // FileLog is a file local audit events log,
 // logs all events to the local file in json encoded form
 type FileLog struct {
-	*log.Entry
+	logger *slog.Logger
 	FileLogConfig
 	// rw protects the file from rotation during concurrent
 	// event emission.
@@ -145,7 +146,7 @@ func (l *FileLog) EmitAuditEvent(ctx context.Context, event apievents.AuditEvent
 		l.rw.Unlock()
 		l.rw.RLock()
 		if err != nil {
-			log.Error(err)
+			slog.ErrorContext(ctx, "failed to emit audit event", "error", err)
 		}
 	}
 
@@ -160,17 +161,11 @@ func (l *FileLog) EmitAuditEvent(ctx context.Context, event apievents.AuditEvent
 	}
 
 	if len(line) > l.MaxScanTokenSize {
-		switch {
-		case canReduceMessageSize(event):
-			line, err = l.trimSizeAndMarshal(event)
-			if err != nil {
-				return trace.Wrap(err)
-			}
-		default:
-			fields := log.Fields{"event_type": event.GetType(), "event_size": len(line)}
-			l.WithFields(fields).Warnf("Got a event that exceeded max allowed size.")
-			return trace.BadParameter("event size %v exceeds max entry size %v", len(line), l.MaxScanTokenSize)
+		line, err = l.trimSizeAndMarshal(event)
+		if err != nil {
+			return trace.Wrap(err)
 		}
+		MetricStoredTrimmedEvents.Inc()
 	}
 
 	// log it to the main log file:
@@ -178,29 +173,16 @@ func (l *FileLog) EmitAuditEvent(ctx context.Context, event apievents.AuditEvent
 	return trace.ConvertSystemError(err)
 }
 
-func canReduceMessageSize(event apievents.AuditEvent) bool {
-	_, ok := event.(messageSizeTrimmer)
-	return ok
-}
-
 func (l *FileLog) trimSizeAndMarshal(event apievents.AuditEvent) ([]byte, error) {
-	s, ok := event.(messageSizeTrimmer)
-	if !ok {
-		return nil, trace.BadParameter("invalid event type %T", event)
-	}
-	sEvent := s.TrimToMaxSize(l.MaxScanTokenSize)
+	sEvent := event.TrimToMaxSize(l.MaxScanTokenSize)
 	line, err := utils.FastMarshal(sEvent)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 	if len(line) > l.MaxScanTokenSize {
-		return nil, trace.BadParameter("event %T reached max FileLog entry size limit", event.Size())
+		return nil, trace.BadParameter("event %T reached max FileLog entry size limit, current size %v", event, len(line))
 	}
 	return line, nil
-}
-
-type messageSizeTrimmer interface {
-	TrimToMaxSize(int) apievents.AuditEvent
 }
 
 // SearchEvents is a flexible way to find events.
@@ -211,12 +193,12 @@ type messageSizeTrimmer interface {
 // The only mandatory requirement is a date range (UTC).
 //
 // This function may never return more than 1 MiB of event data.
-func (l *FileLog) SearchEvents(fromUTC, toUTC time.Time, namespace string, eventTypes []string, limit int, order types.EventOrder, startAfter string) ([]apievents.AuditEvent, string, error) {
-	l.Debugf("SearchEvents(%v, %v, namespace=%v, eventType=%v, limit=%v)", fromUTC, toUTC, namespace, eventTypes, limit)
-	return l.searchEventsWithFilter(fromUTC, toUTC, namespace, limit, order, startAfter, searchEventsFilter{eventTypes: eventTypes})
+func (l *FileLog) SearchEvents(ctx context.Context, req SearchEventsRequest) ([]apievents.AuditEvent, string, error) {
+	l.logger.DebugContext(ctx, "SearchEvents", "from", req.From, "to", req.To, "event_type", req.EventTypes, "limit", req.Limit)
+	return l.searchEventsWithFilter(req.From, req.To, req.Limit, req.Order, req.StartKey, searchEventsFilter{eventTypes: req.EventTypes})
 }
 
-func (l *FileLog) searchEventsWithFilter(fromUTC, toUTC time.Time, namespace string, limit int, order types.EventOrder, startAfter string, filter searchEventsFilter) ([]apievents.AuditEvent, string, error) {
+func (l *FileLog) searchEventsWithFilter(fromUTC, toUTC time.Time, limit int, order types.EventOrder, startAfter string, filter searchEventsFilter) ([]apievents.AuditEvent, string, error) {
 	if limit <= 0 {
 		limit = defaults.EventsIterationLimit
 	}
@@ -362,18 +344,30 @@ func getCheckpointFromEvent(event apievents.AuditEvent) (string, error) {
 	return event.GetID(), nil
 }
 
-func (l *FileLog) SearchSessionEvents(fromUTC, toUTC time.Time, limit int, order types.EventOrder, startKey string, cond *types.WhereExpr, sessionID string) ([]apievents.AuditEvent, string, error) {
-	l.Debugf("SearchSessionEvents(%v, %v, order=%v, limit=%v, cond=%q)", fromUTC, toUTC, order, limit, cond)
-	filter := searchEventsFilter{eventTypes: []string{SessionEndEvent, WindowsDesktopSessionEndEvent}}
-	if cond != nil {
-		condFn, err := utils.ToFieldsCondition(cond)
+func (l *FileLog) SearchSessionEvents(ctx context.Context, req SearchSessionEventsRequest) ([]apievents.AuditEvent, string, error) {
+	var whereExp types.WhereExpr
+	if req.Cond != nil {
+		whereExp = *req.Cond
+	}
+	l.logger.DebugContext(ctx, "SearchSessionEvents", "from", req.From, "to", req.To, "order", req.Order, "limit", req.Limit, "cond", logutils.StringerAttr(whereExp))
+	filter := searchEventsFilter{eventTypes: SessionRecordingEvents}
+	if req.Cond != nil {
+		condFn, err := utils.ToFieldsCondition(req.Cond)
 		if err != nil {
 			return nil, "", trace.Wrap(err)
 		}
 		filter.condition = condFn
 	}
-	events, lastKey, err := l.searchEventsWithFilter(fromUTC, toUTC, apidefaults.Namespace, limit, order, startKey, filter)
+	events, lastKey, err := l.searchEventsWithFilter(req.From, req.To, req.Limit, req.Order, req.StartKey, filter)
 	return events, lastKey, trace.Wrap(err)
+}
+
+func (l *FileLog) ExportUnstructuredEvents(ctx context.Context, req *auditlogpb.ExportUnstructuredEventsRequest) stream.Stream[*auditlogpb.ExportEventUnstructured] {
+	return stream.Fail[*auditlogpb.ExportEventUnstructured](trace.NotImplemented("FileLog does not implement ExportUnstructuredEvents"))
+}
+
+func (l *FileLog) GetEventExportChunks(ctx context.Context, req *auditlogpb.GetEventExportChunksRequest) stream.Stream[*auditlogpb.EventExportChunk] {
+	return stream.Fail[*auditlogpb.EventExportChunk](trace.NotImplemented("FileLog does not implement GetEventExportChunks"))
 }
 
 type searchEventsFilter struct {
@@ -395,19 +389,10 @@ func (l *FileLog) Close() error {
 	return err
 }
 
-func (l *FileLog) GetSessionChunk(namespace string, sid session.ID, offsetBytes, maxBytes int) ([]byte, error) {
-	return nil, trace.NotImplemented("not implemented")
-}
-
-func (l *FileLog) GetSessionEvents(namespace string, sid session.ID, after int, fetchPrintEvents bool) ([]EventFields, error) {
-	return nil, trace.NotImplemented("not implemented")
-}
-
 // mightNeedRotation checks if the current log file looks older than a given duration,
 // used by rotateLog to decide if it should acquire a write lock.  Must be called under
 // read lock.
 func (l *FileLog) mightNeedRotation() bool {
-
 	if l.file == nil {
 		return true
 	}
@@ -421,7 +406,6 @@ func (l *FileLog) mightNeedRotation() bool {
 // rotateLog checks if the current log file is older than a given duration,
 // and if it is, closes it and opens a new one.  Must be called under write lock.
 func (l *FileLog) rotateLog() (err error) {
-
 	// determine the timestamp for the current log file rounded to the day.
 	fileTime := l.Clock.Now().UTC().Truncate(24 * time.Hour)
 
@@ -429,9 +413,9 @@ func (l *FileLog) rotateLog() (err error) {
 		fileTime.Format(defaults.AuditLogTimeFormat)+LogfileExt)
 
 	openLogFile := func() error {
-		l.file, err = os.OpenFile(logFilename, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0640)
+		l.file, err = os.OpenFile(logFilename, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o640)
 		if err != nil {
-			log.Error(err)
+			l.logger.ErrorContext(context.Background(), "failed to open log file", "error", err, "file", logFilename)
 		}
 		l.fileTime = fileTime
 		return trace.Wrap(err)
@@ -498,9 +482,9 @@ func (l *FileLog) matchingFiles(fromUTC, toUTC time.Time, order types.EventOrder
 			if fi.IsDir() || filepath.Ext(fi.Name()) != LogfileExt {
 				continue
 			}
-			fd, err := parseFileTime(fi.Name())
+			fd, err := ParseFileTime(fi.Name())
 			if err != nil {
-				l.Warningf("Failed to parse audit log file %q format: %v", fi.Name(), err)
+				l.logger.WarnContext(context.Background(), "Failed to parse audit log file format", "file", fi.Name(), "error", err)
 				continue
 			}
 			// File rounding in current logs is non-deterministic,
@@ -532,15 +516,15 @@ func (l *FileLog) matchingFiles(fromUTC, toUTC time.Time, order types.EventOrder
 	return filtered, nil
 }
 
-// parseFileTime parses file's timestamp encoded into filename
-func parseFileTime(filename string) (time.Time, error) {
+// ParseFileTime parses file's timestamp encoded into filename
+func ParseFileTime(filename string) (time.Time, error) {
 	base := strings.TrimSuffix(filename, filepath.Ext(filename))
 	return time.Parse(defaults.AuditLogTimeFormat, base)
 }
 
 // findInFile scans a given log file and returns events that fit the criteria.
 func (l *FileLog) findInFile(path string, filter searchEventsFilter) ([]EventFields, error) {
-	l.Debugf("Called findInFile(%s, %+v).", path, filter)
+	l.logger.DebugContext(context.Background(), "Called findInFile", "path", path, "filter", filter)
 
 	// open the log file:
 	lf, err := os.OpenFile(path, os.O_RDONLY, 0)
@@ -577,7 +561,7 @@ func (l *FileLog) findInFile(path string, filter searchEventsFilter) ([]EventFie
 		// in the query:
 		var ef EventFields
 		if err := utils.FastUnmarshal(scanner.Bytes(), &ef); err != nil {
-			l.Warnf("invalid JSON in %s line %d", path, lineNo)
+			l.logger.WarnContext(context.Background(), "invalid JSON in line found", "file", path, "line_number", lineNo)
 			continue
 		}
 		accepted := len(filter.eventTypes) == 0
@@ -603,25 +587,14 @@ func (l *FileLog) findInFile(path string, filter searchEventsFilter) ([]EventFie
 	if err := scanner.Err(); err != nil {
 		switch {
 		case errors.Is(err, bufio.ErrTooLong):
-			fields := log.Fields{"path": path, "line": lineNo}
-			l.WithFields(fields).
-				Warnf("FileLog contains very large entries. Scan operation will return partial result.")
+			l.logger.WarnContext(context.Background(), "FileLog contains very large entries. Scan operation will return partial result.", "path", path, "line", lineNo)
 		default:
-			l.WithError(err).Errorf("Failed to scan AuditLog.")
+			l.logger.ErrorContext(context.Background(), "Failed to scan AuditLog.", "error", err)
 
 		}
 	}
 
 	return retval, nil
-}
-
-// StreamSessionEvents streams all events from a given session recording. An error is returned on the first
-// channel if one is encountered. Otherwise the event channel is closed when the stream ends.
-// The event channel is not closed on error to prevent race conditions in downstream select statements.
-func (l *FileLog) StreamSessionEvents(ctx context.Context, sessionID session.ID, startIndex int64) (chan apievents.AuditEvent, chan error) {
-	c, e := make(chan apievents.AuditEvent), make(chan error, 1)
-	e <- trace.NotImplemented("not implemented")
-	return c, e
 }
 
 type eventFile struct {

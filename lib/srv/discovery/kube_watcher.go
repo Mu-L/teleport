@@ -1,73 +1,66 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package discovery
 
 import (
 	"context"
 	"sync"
-	"time"
 
 	"github.com/gravitational/trace"
-	"golang.org/x/sync/errgroup"
 
+	usageeventsv1 "github.com/gravitational/teleport/api/gen/proto/go/usageevents/v1"
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/services"
+	"github.com/gravitational/teleport/lib/srv/discovery/common"
+	"github.com/gravitational/teleport/lib/utils"
 )
 
-const (
-	concurrencyLimit = 5
-)
+const kubeEventPrefix = "kube/"
 
 func (s *Server) startKubeWatchers() error {
-	if len(s.kubeFetchers) == 0 {
+	if len(s.getKubeNonIntegrationFetchers()) == 0 && s.dynamicMatcherWatcher == nil {
 		return nil
 	}
+
 	var (
-		kubeResources types.ResourcesWithLabels
+		kubeResources []types.KubeCluster
 		mu            sync.Mutex
 	)
 
-	watcher, err := services.NewReconciler(
-		services.ReconcilerConfig{
-			Matcher: func(_ types.ResourceWithLabels) bool { return true },
-			GetCurrentResources: func() types.ResourcesWithLabelsMap {
+	reconciler, err := services.NewReconciler(
+		services.ReconcilerConfig[types.KubeCluster]{
+			Matcher: func(_ types.KubeCluster) bool { return true },
+			GetCurrentResources: func() map[string]types.KubeCluster {
 				kcs, err := s.AccessPoint.GetKubernetesClusters(s.ctx)
 				if err != nil {
-					s.Log.WithError(err).Warn("Unable to get Kubernetes clusters from cache.")
+					s.Log.WarnContext(s.ctx, "Unable to get Kubernetes clusters from cache", "error", err)
 					return nil
 				}
 
-				// filter only discover clusters.
-				var kubeClusters types.KubeClusters
-				for _, kc := range kcs {
-					if kc.Origin() != types.OriginCloud {
-						continue
-					}
-					kubeClusters = append(kubeClusters, kc)
-				}
-
-				return kubeClusters.AsResources().ToMap()
+				return utils.FromSlice(filterResources(kcs, types.OriginCloud, s.DiscoveryGroup), types.KubeCluster.GetName)
 			},
-			GetNewResources: func() types.ResourcesWithLabelsMap {
+			GetNewResources: func() map[string]types.KubeCluster {
 				mu.Lock()
 				defer mu.Unlock()
-				return kubeResources.ToMap()
+				return utils.FromSlice(kubeResources, types.KubeCluster.GetName)
 			},
-			Log:      s.Log,
+			Logger:   s.Log.With("kind", types.KindKubernetesCluster),
 			OnCreate: s.onKubeCreate,
 			OnUpdate: s.onKubeUpdate,
 			OnDelete: s.onKubeDelete,
@@ -77,21 +70,45 @@ func (s *Server) startKubeWatchers() error {
 		return trace.Wrap(err)
 	}
 
+	watcher, err := common.NewWatcher(s.ctx, common.WatcherConfig{
+		FetchersFn: func() []common.Fetcher {
+			kubeNonIntegrationFetchers := s.getKubeNonIntegrationFetchers()
+			s.submitFetchersEvent(kubeNonIntegrationFetchers)
+			return kubeNonIntegrationFetchers
+		},
+		Logger:         s.Log.With("kind", types.KindKubernetesCluster),
+		DiscoveryGroup: s.DiscoveryGroup,
+		Interval:       s.PollInterval,
+		Origin:         types.OriginCloud,
+	})
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	go watcher.Start()
+
 	go func() {
-		t := time.NewTicker(5 * time.Minute)
-		defer t.Stop()
 		for {
-			newResources := s.fetchFetchersResources()
-			mu.Lock()
-			kubeResources = newResources
-			mu.Unlock()
-
-			if err := watcher.Reconcile(s.ctx); err != nil {
-				s.Log.WithError(err).Warn("Unable to reconcile resources.")
-			}
-
 			select {
-			case <-t.C:
+			case newResources := <-watcher.ResourcesC():
+				clusters := make([]types.KubeCluster, 0, len(newResources))
+				for _, r := range newResources {
+					if cluster, ok := r.(types.DiscoveredEKSCluster); ok {
+						clusters = append(clusters, cluster.GetKubeCluster())
+						continue
+					}
+					if cluster, ok := r.(types.KubeCluster); ok {
+						clusters = append(clusters, cluster)
+						continue
+					}
+				}
+				mu.Lock()
+				kubeResources = clusters
+				mu.Unlock()
+
+				if err := reconciler.Reconcile(s.ctx); err != nil {
+					s.Log.WarnContext(s.ctx, "Unable to reconcile resources", "error", err)
+				}
+
 			case <-s.ctx.Done():
 				return
 			}
@@ -100,57 +117,38 @@ func (s *Server) startKubeWatchers() error {
 	return nil
 }
 
-func (s *Server) fetchFetchersResources() types.ResourcesWithLabels {
-	var (
-		newFetcherResources = make(types.ResourcesWithLabels, 0, 50)
-		fetchersLock        sync.Mutex
-		group, groupCtx     = errgroup.WithContext(s.ctx)
-	)
-	group.SetLimit(concurrencyLimit)
-	for _, fetcher := range s.kubeFetchers {
-		lFetcher := fetcher
-
-		group.Go(func() error {
-			resources, err := lFetcher.Get(groupCtx)
-			if err != nil {
-				s.Log.WithError(err).Warnf("Unable to fetch resources for %s at %s.", lFetcher.ResourceType(), lFetcher.Cloud())
-				// never return the error otherwise it will impact other watchers.
-				return nil
-			}
-			fetchersLock.Lock()
-			newFetcherResources = append(newFetcherResources, resources...)
-			fetchersLock.Unlock()
-			return nil
+func (s *Server) onKubeCreate(ctx context.Context, kubeCluster types.KubeCluster) error {
+	s.Log.DebugContext(ctx, "Creating kube_cluster", "kube_cluster_name", kubeCluster.GetName())
+	err := s.AccessPoint.CreateKubernetesCluster(ctx, kubeCluster)
+	// If the kube already exists but has an empty discovery group, update it.
+	if err != nil {
+		err := s.resolveCreateErr(err, types.OriginCloud, func() (types.ResourceWithLabels, error) {
+			return s.AccessPoint.GetKubernetesCluster(ctx, kubeCluster.GetName())
 		})
+		if err != nil {
+			return trace.Wrap(err)
+		}
+		return trace.Wrap(s.onKubeUpdate(ctx, kubeCluster, nil))
 	}
-	// error is discarded because we must run all fetchers until the end.
-	_ = group.Wait()
-	return newFetcherResources
+	err = s.emitUsageEvents(map[string]*usageeventsv1.ResourceCreateEvent{
+		kubeEventPrefix + kubeCluster.GetName(): {
+			ResourceType:   types.DiscoveredResourceKubernetes,
+			ResourceOrigin: types.OriginCloud,
+			CloudProvider:  kubeCluster.GetCloud(),
+		},
+	})
+	if err != nil {
+		s.Log.DebugContext(ctx, "Error emitting usage event", "error", err)
+	}
+	return nil
 }
 
-func (s *Server) onKubeCreate(ctx context.Context, rwl types.ResourceWithLabels) error {
-	kubeCluster, ok := rwl.(types.KubeCluster)
-	if !ok {
-		return trace.BadParameter("invalid type received; expected types.KubeCluster, received %T", kubeCluster)
-	}
-	s.Log.Debugf("Creating kube_cluster %s.", kubeCluster.GetName())
-	return trace.Wrap(s.AccessPoint.CreateKubernetesCluster(ctx, kubeCluster))
-}
-
-func (s *Server) onKubeUpdate(ctx context.Context, rwl types.ResourceWithLabels) error {
-	kubeCluster, ok := rwl.(types.KubeCluster)
-	if !ok {
-		return trace.BadParameter("invalid type received; expected types.KubeCluster, received %T", kubeCluster)
-	}
-	s.Log.Debugf("Updating kube_cluster %s.", kubeCluster.GetName())
+func (s *Server) onKubeUpdate(ctx context.Context, kubeCluster, _ types.KubeCluster) error {
+	s.Log.DebugContext(ctx, "Updating kube_cluster", "kube_cluster_name", kubeCluster.GetName())
 	return trace.Wrap(s.AccessPoint.UpdateKubernetesCluster(ctx, kubeCluster))
 }
 
-func (s *Server) onKubeDelete(ctx context.Context, rwl types.ResourceWithLabels) error {
-	kubeCluster, ok := rwl.(types.KubeCluster)
-	if !ok {
-		return trace.BadParameter("invalid type received; expected types.KubeCluster, received %T", kubeCluster)
-	}
-	s.Log.Debugf("Deleting kube_cluster %s.", kubeCluster.GetName())
+func (s *Server) onKubeDelete(ctx context.Context, kubeCluster types.KubeCluster) error {
+	s.Log.DebugContext(ctx, "Deleting kube_cluster", "kube_cluster_name", kubeCluster.GetName())
 	return trace.Wrap(s.AccessPoint.DeleteKubernetesCluster(ctx, kubeCluster.GetName()))
 }

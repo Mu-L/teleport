@@ -15,16 +15,15 @@
 package ssh
 
 import (
+	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"net"
-	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/gravitational/trace"
 	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/codes"
 	semconv "go.opentelemetry.io/otel/semconv/v1.10.0"
 	oteltrace "go.opentelemetry.io/otel/trace"
 	"golang.org/x/crypto/ssh"
@@ -35,14 +34,8 @@ import (
 // Client is a wrapper around ssh.Client that adds tracing support.
 type Client struct {
 	*ssh.Client
-	opts []tracing.Option
-
-	// mu protects capability and rejectedError which may change based
-	// on the outcome probing the server for tracing capabilities that
-	// may occur trying to establish a session
-	mu            sync.RWMutex
-	capability    tracingCapability
-	rejectedError error
+	opts       []tracing.Option
+	capability tracingCapability
 }
 
 type tracingCapability int
@@ -56,57 +49,23 @@ const (
 // NewClient creates a new Client.
 //
 // The server being connected to is probed to determine if it supports
-// ssh tracing. This is done by attempting to open a TracingChannel channel.
-// If the channel is successfully opened then all payloads delivered to the
-// server will be wrapped in an Envelope with tracing context. All Session
+// ssh tracing. This is done by inspecting the version the server provides
+// during the handshake, if it comes from a Teleport ssh server, then all
+// payloads will be wrapped in an Envelope with tracing context. All Session
 // and Channel created from the returned Client will honor the clients view
 // of whether they should provide tracing context.
 func NewClient(c ssh.Conn, chans <-chan ssh.NewChannel, reqs <-chan *ssh.Request, opts ...tracing.Option) *Client {
 	clt := &Client{
-		Client: ssh.NewClient(c, chans, reqs),
-		opts:   opts,
+		Client:     ssh.NewClient(c, chans, reqs),
+		opts:       opts,
+		capability: tracingUnsupported,
 	}
 
-	clt.capability, clt.rejectedError = isTracingSupported(clt.Client)
+	if bytes.HasPrefix(clt.ServerVersion(), []byte("SSH-2.0-Teleport")) {
+		clt.capability = tracingSupported
+	}
 
 	return clt
-}
-
-// isTracingSupported determines whether the ssh server supports
-// tracing payloads by trying to open a TracingChannel.
-//
-// Note: a channel is used instead of a global request in order prevent blocking
-// forever in the event that the connection is rejected. In that case, the server
-// doesn't service any global requests and writes the error to the first opened
-// channel.
-func isTracingSupported(clt *ssh.Client) (tracingCapability, error) {
-	srvVer := clt.ServerVersion()
-	if !strings.HasPrefix(string(srvVer), "SSH-2.0-Teleport") {
-		// Tracing is only supported by Teleport Nodes. Skip the check for
-		// all other implementations.
-		// Note: If tracing is not implemented SSH server should return ssh.UnknownChannelType,
-		//       but OpenSSH 7.x returns ssh.Prohibited, hence the check here.
-		return tracingUnsupported, nil
-	}
-
-	ch, _, err := clt.OpenChannel(TracingChannel, nil)
-	if err != nil {
-		var openError *ssh.OpenChannelError
-		// prohibited errors due to locks and session control are expected by callers of NewSession
-		if errors.As(err, &openError) {
-			switch openError.Reason {
-			case ssh.Prohibited:
-				return tracingUnknown, err
-			case ssh.UnknownChannelType:
-				return tracingUnsupported, nil
-			}
-		}
-
-		return tracingUnknown, nil
-	}
-
-	_ = ch.Close()
-	return tracingSupported, nil
 }
 
 // DialContext initiates a connection to the addr from the remote host.
@@ -130,7 +89,6 @@ func (c *Client) DialContext(ctx context.Context, n, addr string) (net.Conn, err
 	)
 	defer span.End()
 
-	c.mu.RLock()
 	// create the wrapper while the lock is held
 	wrapper := &clientWrapper{
 		capability: c.capability,
@@ -139,7 +97,6 @@ func (c *Client) DialContext(ctx context.Context, n, addr string) (net.Conn, err
 		ctx:        ctx,
 		contexts:   make(map[string][]context.Context),
 	}
-	c.mu.RUnlock()
 
 	conn, err := wrapper.Dial(n, addr)
 	return conn, trace.Wrap(err)
@@ -148,7 +105,9 @@ func (c *Client) DialContext(ctx context.Context, n, addr string) (net.Conn, err
 // SendRequest sends a global request, and returns the
 // reply. If tracing is enabled, the provided payload
 // is wrapped in an Envelope to forward any tracing context.
-func (c *Client) SendRequest(ctx context.Context, name string, wantReply bool, payload []byte) (bool, []byte, error) {
+func (c *Client) SendRequest(
+	ctx context.Context, name string, wantReply bool, payload []byte,
+) (_ bool, _ []byte, err error) {
 	config := tracing.NewConfig(c.opts)
 	tracer := config.TracerProvider.Tracer(instrumentationName)
 
@@ -166,38 +125,19 @@ func (c *Client) SendRequest(ctx context.Context, name string, wantReply bool, p
 			)...,
 		),
 	)
-	defer span.End()
+	defer func() { tracing.EndSpan(span, err) }()
 
-	c.mu.RLock()
-	// If the TracingChannel was rejected when the client was created,
-	// the connection was prohibited due to a lock or session control.
-	// Callers to SendRequest are expecting to receive the reason the request
-	// was rejected, so we need to propagate the rejectedError here.
-	if c.rejectedError != nil {
-		err := c.rejectedError
-		c.mu.RUnlock()
-
-		span.SetStatus(codes.Error, err.Error())
-		span.RecordError(err)
-		return false, nil, trace.Wrap(err)
-	}
-
-	capability := c.capability
-	c.mu.RUnlock()
-
-	ok, resp, err := c.Client.SendRequest(name, wantReply, wrapPayload(ctx, capability, config.TextMapPropagator, payload))
-	if err != nil {
-		span.SetStatus(codes.Error, err.Error())
-		span.RecordError(err)
-	}
-
-	return ok, resp, err
+	return c.Client.SendRequest(
+		name, wantReply, wrapPayload(ctx, c.capability, config.TextMapPropagator, payload),
+	)
 }
 
 // OpenChannel tries to open a channel. If tracing is enabled,
 // the provided payload is wrapped in an Envelope to forward
 // any tracing context.
-func (c *Client) OpenChannel(ctx context.Context, name string, data []byte) (*Channel, <-chan *ssh.Request, error) {
+func (c *Client) OpenChannel(
+	ctx context.Context, name string, data []byte,
+) (_ *Channel, _ <-chan *ssh.Request, err error) {
 	config := tracing.NewConfig(c.opts)
 	tracer := config.TracerProvider.Tracer(instrumentationName)
 	ctx, span := tracer.Start(
@@ -213,18 +153,9 @@ func (c *Client) OpenChannel(ctx context.Context, name string, data []byte) (*Ch
 			)...,
 		),
 	)
-	defer span.End()
+	defer func() { tracing.EndSpan(span, err) }()
 
-	c.mu.RLock()
-	capability := c.capability
-	c.mu.RUnlock()
-
-	ch, reqs, err := c.Client.OpenChannel(name, wrapPayload(ctx, capability, config.TextMapPropagator, data))
-	if err != nil {
-		span.SetStatus(codes.Error, err.Error())
-		span.RecordError(err)
-	}
-
+	ch, reqs, err := c.Client.OpenChannel(name, wrapPayload(ctx, c.capability, config.TextMapPropagator, data))
 	return &Channel{
 		Channel: ch,
 		opts:    c.opts,
@@ -234,6 +165,18 @@ func (c *Client) OpenChannel(ctx context.Context, name string, data []byte) (*Ch
 // NewSession creates a new SSH session that is passed tracing context
 // so that spans may be correlated properly over the ssh connection.
 func (c *Client) NewSession(ctx context.Context) (*Session, error) {
+	return c.newSession(ctx, nil)
+}
+
+// NewSessionWithRequestCallback creates a new SSH session that is passed
+// tracing context so that spans may be correlated properly over the ssh
+// connection. The handling of channel requests from the underlying SSH
+// session can be controlled with chanReqCallback.
+func (c *Client) NewSessionWithRequestCallback(ctx context.Context, chanReqCallback ChannelRequestCallback) (*Session, error) {
+	return c.newSession(ctx, chanReqCallback)
+}
+
+func (c *Client) newSession(ctx context.Context, chanReqCallback ChannelRequestCallback) (*Session, error) {
 	tracer := tracing.NewConfig(c.opts).TracerProvider.Tracer(instrumentationName)
 
 	ctx, span := tracer.Start(
@@ -251,39 +194,6 @@ func (c *Client) NewSession(ctx context.Context) (*Session, error) {
 	)
 	defer span.End()
 
-	c.mu.Lock()
-
-	// If the TracingChannel was rejected when the client was created,
-	// the connection was prohibited due to a lock or session control.
-	// Callers to NewSession are expecting to receive the reason the session
-	// was rejected, so we need to propagate the rejectedError here.
-	if c.rejectedError != nil {
-		err := c.rejectedError
-		c.rejectedError = nil
-		c.capability = tracingUnknown
-		c.mu.Unlock()
-
-		span.SetStatus(codes.Error, err.Error())
-		span.RecordError(err)
-		return nil, trace.Wrap(err)
-	}
-
-	// If the tracing capabilities of the server are unknown due to
-	// prohibited errors from previous attempts to check, we need to
-	// do another check to see if our connection will be permitted
-	// this time.
-	if c.capability == tracingUnknown {
-		capability, err := isTracingSupported(c.Client)
-		if err != nil {
-			c.mu.Unlock()
-
-			span.SetStatus(codes.Error, err.Error())
-			span.RecordError(err)
-			return nil, trace.Wrap(err)
-		}
-		c.capability = capability
-	}
-
 	// create the wrapper while the lock is still held
 	wrapper := &clientWrapper{
 		capability: c.capability,
@@ -293,10 +203,8 @@ func (c *Client) NewSession(ctx context.Context) (*Session, error) {
 		contexts:   make(map[string][]context.Context),
 	}
 
-	c.mu.Unlock()
-
 	// get a session from the wrapper
-	session, err := wrapper.NewSession()
+	session, err := wrapper.NewSession(chanReqCallback)
 	return session, trace.Wrap(err)
 }
 
@@ -321,8 +229,13 @@ type clientWrapper struct {
 	contexts map[string][]context.Context
 }
 
+// ChannelRequestCallback allows the handling of channel requests
+// to be customized. nil can be returned if you don't want
+// golang/x/crypto/ssh to handle the request.
+type ChannelRequestCallback func(req *ssh.Request) *ssh.Request
+
 // NewSession opens a new Session for this client.
-func (c *clientWrapper) NewSession() (*Session, error) {
+func (c *clientWrapper) NewSession(callback ChannelRequestCallback) (*Session, error) {
 	// create a client that will defer to us when
 	// opening the "session" channel so that we
 	// can add an Envelope to the request
@@ -330,9 +243,40 @@ func (c *clientWrapper) NewSession() (*Session, error) {
 		Conn: c,
 	}
 
-	session, err := client.NewSession()
-	if err != nil {
-		return nil, trace.Wrap(err)
+	var session *ssh.Session
+	var err error
+	if callback != nil {
+		// open a session manually so we can take ownership of the
+		// requests chan
+		ch, originalReqs, openChannelErr := client.OpenChannel("session", nil)
+		if openChannelErr != nil {
+			return nil, trace.Wrap(openChannelErr)
+		}
+
+		// pass the channel requests to the provided callback and
+		// forward them to another chan so golang.org/x/crypto/ssh
+		// can handle Session exiting correctly
+		reqs := make(chan *ssh.Request, cap(originalReqs))
+		go func() {
+			defer close(reqs)
+
+			for req := range originalReqs {
+				if req := callback(req); req != nil {
+					reqs <- req
+				}
+			}
+		}()
+
+		session, err = newCryptoSSHSession(ch, reqs)
+		if err != nil {
+			_ = ch.Close()
+			return nil, trace.Wrap(err)
+		}
+	} else {
+		session, err = client.NewSession()
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
 	}
 
 	// wrap the session so all session requests on the channel
@@ -341,6 +285,39 @@ func (c *clientWrapper) NewSession() (*Session, error) {
 		Session: session,
 		wrapper: c,
 	}, nil
+}
+
+// wrappedSSHConn allows an SSH session to be created while also allowing
+// callers to take ownership of the SSH channel requests chan.
+type wrappedSSHConn struct {
+	ssh.Conn
+
+	channelOpened atomic.Bool
+
+	ch   ssh.Channel
+	reqs <-chan *ssh.Request
+}
+
+func (f *wrappedSSHConn) OpenChannel(_ string, _ []byte) (ssh.Channel, <-chan *ssh.Request, error) {
+	if !f.channelOpened.CompareAndSwap(false, true) {
+		panic("wrappedSSHConn OpenChannel called more than once")
+	}
+
+	return f.ch, f.reqs, nil
+}
+
+// newCryptoSSHSession allows callers to take ownership of the SSH
+// channel requests chan and allow callers to handle SSH channel requests.
+// golang.org/x/crypto/ssh.(Client).NewSession takes ownership of all
+// SSH channel requests and doesn't allow the caller to view or reply
+// to them, so this workaround is needed.
+func newCryptoSSHSession(ch ssh.Channel, reqs <-chan *ssh.Request) (*ssh.Session, error) {
+	return (&ssh.Client{
+		Conn: &wrappedSSHConn{
+			ch:   ch,
+			reqs: reqs,
+		},
+	}).NewSession()
 }
 
 // Dial initiates a connection to the addr from the remote host.
@@ -386,7 +363,7 @@ func (c *clientWrapper) nextContext(name string) context.Context {
 // OpenChannel tries to open a channel. If tracing is enabled,
 // the provided payload is wrapped in an Envelope to forward
 // any tracing context.
-func (c *clientWrapper) OpenChannel(name string, data []byte) (ssh.Channel, <-chan *ssh.Request, error) {
+func (c *clientWrapper) OpenChannel(name string, data []byte) (_ ssh.Channel, _ <-chan *ssh.Request, err error) {
 	config := tracing.NewConfig(c.opts)
 	tracer := config.TracerProvider.Tracer(instrumentationName)
 	ctx, span := tracer.Start(
@@ -402,14 +379,9 @@ func (c *clientWrapper) OpenChannel(name string, data []byte) (ssh.Channel, <-ch
 			)...,
 		),
 	)
-	defer span.End()
+	defer func() { tracing.EndSpan(span, err) }()
 
 	ch, reqs, err := c.Conn.OpenChannel(name, wrapPayload(ctx, c.capability, config.TextMapPropagator, data))
-	if err != nil {
-		span.SetStatus(codes.Error, err.Error())
-		span.RecordError(err)
-	}
-
 	return channelWrapper{
 		Channel: ch,
 		manager: c,
@@ -430,7 +402,7 @@ type channelWrapper struct {
 // It is the callers' responsibility to ensure that addContext is
 // called with the appropriate context.Context prior to any
 // requests being sent along the channel.
-func (c channelWrapper) SendRequest(name string, wantReply bool, payload []byte) (bool, error) {
+func (c channelWrapper) SendRequest(name string, wantReply bool, payload []byte) (_ bool, err error) {
 	config := tracing.NewConfig(c.manager.opts)
 	ctx, span := config.TracerProvider.Tracer(instrumentationName).Start(
 		c.manager.nextContext(name),
@@ -443,13 +415,7 @@ func (c channelWrapper) SendRequest(name string, wantReply bool, payload []byte)
 			semconv.RPCSystemKey.String("ssh"),
 		),
 	)
-	defer span.End()
+	defer func() { tracing.EndSpan(span, err) }()
 
-	ok, err := c.Channel.SendRequest(name, wantReply, wrapPayload(ctx, c.manager.capability, config.TextMapPropagator, payload))
-	if err != nil {
-		span.SetStatus(codes.Error, err.Error())
-		span.RecordError(err)
-	}
-
-	return ok, err
+	return c.Channel.SendRequest(name, wantReply, wrapPayload(ctx, c.manager.capability, config.TextMapPropagator, payload))
 }

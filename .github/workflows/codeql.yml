@@ -1,23 +1,17 @@
 name: "CodeQL"
 
 on:
-  push:
-    branches:
-      - master
-      - branch/*
+  schedule:
+    - cron: '0 13 * * *' # At 1:00 PM UTC every day
   pull_request:
-    branches:
-      - master
-      - branch/*
-    paths-ignore:
-      - 'docs/**'
-      - 'rfd/**'
-      - '**.md'
+    paths:
+      - '.github/workflows/codeql.yml'
+  # merge_group is intentionally excluded, because we don't require this workflow
 
 jobs:
   analyze:
     name: Analyze
-    runs-on: ubuntu-22.04-32core
+    runs-on: ubuntu-22.04-16core
     permissions:
       actions: read
       contents: read
@@ -30,32 +24,28 @@ jobs:
 
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
 
     - name: Set up Go
-      uses: actions/setup-go@v3
+      uses: actions/setup-go@v5
       with:
-        go-version-file: 'go.mod'
+        cache: false
+        go-version-file: go.mod
       if: ${{ matrix.language == 'go' }}
 
     - name: Initialize the CodeQL tools for scanning
-      uses: github/codeql-action/init@v2
+      uses: github/codeql-action/init@v3
       with:
         languages: ${{ matrix.language }}
-      timeout-minutes: 10
+        queries: security-extended
+      timeout-minutes: 5
 
     - name: Autobuild
-      uses: github/codeql-action/autobuild@v2
-      if: ${{ matrix.language != 'go' }}
+      uses: github/codeql-action/autobuild@v3
       timeout-minutes: 30
-
-    - name: Build Teleport OSS
-      run: |
-        make full
-      if: ${{ matrix.language == 'go' }}
 
     - name: Perform CodeQL Analysis
-      uses: github/codeql-action/analyze@v2
+      uses: github/codeql-action/analyze@v3
       with:
         category: "/language:${{matrix.language}}"
-      timeout-minutes: 30
+      timeout-minutes: 10

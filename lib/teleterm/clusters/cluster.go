@@ -1,100 +1,258 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package clusters
 
 import (
 	"context"
+	"log/slog"
 
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
-	"github.com/sirupsen/logrus"
+	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
 
 	"github.com/gravitational/teleport/api/client/proto"
+	"github.com/gravitational/teleport/api/client/webclient"
+	"github.com/gravitational/teleport/api/constants"
 	"github.com/gravitational/teleport/api/types"
-	"github.com/gravitational/teleport/lib/auth"
+	api "github.com/gravitational/teleport/gen/proto/go/teleport/lib/teleterm/v1"
+	"github.com/gravitational/teleport/lib/auth/authclient"
 	"github.com/gravitational/teleport/lib/client"
-	api "github.com/gravitational/teleport/lib/teleterm/api/protogen/golang/v1"
+	dtauthz "github.com/gravitational/teleport/lib/devicetrust/authz"
+	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/teleterm/api/uri"
+	"github.com/gravitational/teleport/lib/teleterm/clusteridcache"
 )
 
 // Cluster describes user settings and access to various resources.
 type Cluster struct {
 	// URI is the cluster URI
 	URI uri.ResourceURI
-	// Name is the cluster name
+	// Name is the cluster name, AKA SiteName.
 	Name string
 	// ProfileName is the name of the tsh profile
 	ProfileName string
-	// Log is a component logger
-	Log *logrus.Entry
+	// Logger is a component logger
+	Logger *slog.Logger
 	// dir is the directory where cluster certificates are stored
 	dir string
 	// Status is the cluster status
 	status client.ProfileStatus
+	// If not empty, it means that there was a problem with reading the cluster status.
+	// The status filed will contain "empty" values.
+	// The caller should try to sync the cluster again.
+	statusError error
 	// client is the cluster Teleport client
 	clusterClient *client.TeleportClient
 	// clock is a clock for time-related operations
 	clock clockwork.Clock
+	// SSOHost is the host of the SSO provider used to log in.
+	SSOHost string
+}
+
+type ClusterWithDetails struct {
+	*Cluster
 	// Auth server features
-	// only present where the auth client can be queried
-	// and set with GetClusterFeatures
 	Features *proto.Features
+	// AuthClusterID is the unique cluster ID that is set once
+	// during the first auth server startup.
+	AuthClusterID string
+	// SuggestedReviewers for the given user.
+	SuggestedReviewers []string
+	// RequestableRoles for the given user.
+	RequestableRoles []string
+	// ACL contains user access control list.
+	ACL *api.ACL
+	// UserType identifies whether the user is a local user or comes from an SSO provider.
+	UserType types.UserType
+	// ProxyVersion is the cluster proxy's service version.
+	ProxyVersion string
+	// ShowResources tells if the cluster can show requestable resources on the resources page.
+	ShowResources constants.ShowResources
+	// TrustedDeviceRequirement indicates whether access may be hindered by the lack of a trusted device.
+	TrustedDeviceRequirement types.TrustedDeviceRequirement
 }
 
 // Connected indicates if connection to the cluster can be established
 func (c *Cluster) Connected() bool {
-	return c.status.Name != "" && !c.status.IsExpired(c.clock)
+	return c.status.Name != "" && !c.status.IsExpired(c.clock.Now())
 }
 
-// GetClusterFeatures returns a list of features enabled/disabled by the auth server
-func (c *Cluster) GetClusterFeatures(ctx context.Context) (*proto.Features, error) {
-	var authPingResponse proto.PingResponse
+// GetWithDetails makes requests to the auth server to return details of the current
+// Cluster that cannot be found on the disk only, including details about the user
+// and enabled enterprise features. This method requires a valid cert.
+func (c *Cluster) GetWithDetails(ctx context.Context, authClient authclient.ClientI, clusterIDCache *clusteridcache.Cache) (*ClusterWithDetails, error) {
+	group, groupCtx := errgroup.WithContext(ctx)
+	const groupLimit = 8 // Arbitrary. No need to increase for every new goroutine.
+	group.SetLimit(groupLimit)
 
-	err := addMetadataToRetryableError(ctx, func() error {
-		proxyClient, err := c.clusterClient.ConnectToProxy(ctx)
-		if err != nil {
-			return trace.Wrap(err)
-		}
-		defer proxyClient.Close()
-
-		authPingResponse, err = proxyClient.CurrentCluster().Ping(ctx)
+	var webConfig *webclient.WebConfig
+	group.Go(func() error {
+		res, err := c.clusterClient.GetWebConfig(groupCtx)
+		webConfig = res
 		return trace.Wrap(err)
 	})
-	if err != nil {
+
+	var clusterPingResponse *webclient.PingResponse
+	group.Go(func() error {
+		res, err := c.clusterClient.Ping(groupCtx)
+		clusterPingResponse = res
+		return trace.Wrap(err)
+	})
+
+	var authPingResponse proto.PingResponse
+	group.Go(func() error {
+		err := AddMetadataToRetryableError(groupCtx, func() error {
+			res, err := authClient.Ping(groupCtx)
+			authPingResponse = res
+			return trace.Wrap(err)
+		})
+		return trace.Wrap(err)
+	})
+
+	var authPreference types.AuthPreference
+	group.Go(func() error {
+		err := AddMetadataToRetryableError(groupCtx, func() error {
+			res, err := authClient.GetAuthPreference(groupCtx)
+			authPreference = res
+			return trace.Wrap(err)
+		})
+		return trace.Wrap(err)
+	})
+
+	var caps *types.AccessCapabilities
+	group.Go(func() error {
+		err := AddMetadataToRetryableError(groupCtx, func() error {
+			res, err := authClient.GetAccessCapabilities(groupCtx, types.AccessCapabilitiesRequest{
+				RequestableRoles:   true,
+				SuggestedReviewers: true,
+			})
+			caps = res
+			return trace.Wrap(err)
+		})
+		return trace.Wrap(err)
+	})
+
+	var authClusterID string
+	group.Go(func() error {
+		err := AddMetadataToRetryableError(groupCtx, func() error {
+			clusterName, err := authClient.GetClusterName()
+			if err != nil {
+				return trace.Wrap(err)
+			}
+			authClusterID = clusterName.GetClusterID()
+			clusterIDCache.Store(c.URI, authClusterID)
+			return nil
+		})
+		return trace.Wrap(err)
+	})
+
+	var user types.User
+	group.Go(func() error {
+		err := AddMetadataToRetryableError(groupCtx, func() error {
+			res, err := authClient.GetCurrentUser(groupCtx)
+			user = res
+			return trace.Wrap(err)
+		})
+		return trace.Wrap(err)
+	})
+
+	var roles []types.Role
+	group.Go(func() error {
+		err := AddMetadataToRetryableError(groupCtx, func() error {
+			res, err := authClient.GetCurrentUserRoles(groupCtx)
+			roles = res
+			return trace.Wrap(err)
+		})
+		return trace.Wrap(err)
+	})
+
+	if err := group.Wait(); err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	return authPingResponse.ServerFeatures, nil
+	trustedDeviceRequirement, err := dtauthz.CalculateTrustedDeviceRequirement(authPreference.GetDeviceTrust(), func() ([]types.Role, error) {
+		return roles, nil
+	})
+	if err != nil {
+		c.Logger.WarnContext(ctx, "Failed to calculate trusted device requirement", "error", err)
+	}
+
+	roleSet := services.NewRoleSet(roles...)
+	userACL := services.NewUserACL(user, roleSet, *authPingResponse.ServerFeatures, false, false)
+	acl := &api.ACL{
+		RecordedSessions: convertToAPIResourceAccess(userACL.RecordedSessions),
+		ActiveSessions:   convertToAPIResourceAccess(userACL.ActiveSessions),
+		AuthConnectors:   convertToAPIResourceAccess(userACL.AuthConnectors),
+		Roles:            convertToAPIResourceAccess(userACL.Roles),
+		Users:            convertToAPIResourceAccess(userACL.Users),
+		TrustedClusters:  convertToAPIResourceAccess(userACL.TrustedClusters),
+		Events:           convertToAPIResourceAccess(userACL.Events),
+		Tokens:           convertToAPIResourceAccess(userACL.Tokens),
+		Servers:          convertToAPIResourceAccess(userACL.Nodes),
+		Apps:             convertToAPIResourceAccess(userACL.AppServers),
+		Dbs:              convertToAPIResourceAccess(userACL.DBServers),
+		Kubeservers:      convertToAPIResourceAccess(userACL.KubeServers),
+		AccessRequests:   convertToAPIResourceAccess(userACL.AccessRequests),
+		ReviewRequests:   userACL.ReviewRequests,
+	}
+
+	withDetails := &ClusterWithDetails{
+		Cluster:                  c,
+		SuggestedReviewers:       caps.SuggestedReviewers,
+		RequestableRoles:         caps.RequestableRoles,
+		Features:                 authPingResponse.ServerFeatures,
+		AuthClusterID:            authClusterID,
+		ACL:                      acl,
+		UserType:                 user.GetUserType(),
+		ProxyVersion:             clusterPingResponse.ServerVersion,
+		ShowResources:            webConfig.UI.ShowResources,
+		TrustedDeviceRequirement: trustedDeviceRequirement,
+	}
+
+	return withDetails, nil
+}
+
+func convertToAPIResourceAccess(access services.ResourceAccess) *api.ResourceAccess {
+	return &api.ResourceAccess{
+		List:   access.List,
+		Read:   access.Read,
+		Edit:   access.Edit,
+		Create: access.Create,
+		Delete: access.Delete,
+		Use:    access.Use,
+	}
 }
 
 // GetRoles returns currently logged-in user roles
 func (c *Cluster) GetRoles(ctx context.Context) ([]*types.Role, error) {
 	var roles []*types.Role
-	err := addMetadataToRetryableError(ctx, func() error {
-		proxyClient, err := c.clusterClient.ConnectToProxy(ctx)
+	err := AddMetadataToRetryableError(ctx, func() error {
+		clusterClient, err := c.clusterClient.ConnectToCluster(ctx)
 		if err != nil {
 			return trace.Wrap(err)
 		}
-		defer proxyClient.Close()
+		defer clusterClient.Close()
 
 		for _, name := range c.status.Roles {
-			role, err := proxyClient.GetRole(ctx, name)
+			role, err := clusterClient.AuthClient.GetRole(ctx, name)
 			if err != nil {
 				return trace.Wrap(err)
 			}
@@ -111,36 +269,23 @@ func (c *Cluster) GetRoles(ctx context.Context) ([]*types.Role, error) {
 }
 
 // GetRequestableRoles returns the requestable roles for the currently logged-in user
-func (c *Cluster) GetRequestableRoles(ctx context.Context, req *api.GetRequestableRolesRequest) (*types.AccessCapabilities, error) {
+func (c *Cluster) GetRequestableRoles(ctx context.Context, req *api.GetRequestableRolesRequest, authClient authclient.ClientI) (*types.AccessCapabilities, error) {
 	var (
-		authClient  auth.ClientI
-		proxyClient *client.ProxyClient
-		err         error
-		response    *types.AccessCapabilities
+		err      error
+		response *types.AccessCapabilities
 	)
 
 	resourceIds := make([]types.ResourceID, 0, len(req.GetResourceIds()))
 	for _, r := range req.GetResourceIds() {
 		resourceIds = append(resourceIds, types.ResourceID{
-			ClusterName: r.ClusterName,
-			Kind:        r.Kind,
-			Name:        r.Name,
+			ClusterName:     r.ClusterName,
+			Kind:            r.Kind,
+			Name:            r.Name,
+			SubResourceName: r.SubResourceName,
 		})
 	}
 
-	err = addMetadataToRetryableError(ctx, func() error {
-		proxyClient, err = c.clusterClient.ConnectToProxy(ctx)
-		if err != nil {
-			return trace.Wrap(err)
-		}
-		defer proxyClient.Close()
-
-		authClient, err = proxyClient.ConnectToCluster(ctx, c.clusterClient.SiteName)
-		if err != nil {
-			return trace.Wrap(err)
-		}
-		defer authClient.Close()
-
+	err = AddMetadataToRetryableError(ctx, func() error {
 		response, err = authClient.GetAccessCapabilities(ctx, types.AccessCapabilitiesRequest{
 			ResourceIDs:      resourceIds,
 			RequestableRoles: true,
@@ -164,13 +309,36 @@ func (c *Cluster) GetLoggedInUser() LoggedInUser {
 		Name:           c.status.Username,
 		SSHLogins:      c.status.Logins,
 		Roles:          c.status.Roles,
-		ActiveRequests: c.status.ActiveRequests.AccessRequests,
+		ActiveRequests: c.status.ActiveRequests,
 	}
 }
 
-// GetProxyHost returns proxy address (host:port) of the cluster
+// GetProfileStatusError returns a profile status error
+func (c *Cluster) GetProfileStatusError() error {
+	return c.statusError
+}
+
+// GetProxyHost returns proxy address (hostname:port) of the root cluster, even when called on a
+// Cluster that represents a leaf cluster.
 func (c *Cluster) GetProxyHost() string {
 	return c.status.ProxyURL.Host
+}
+
+// HasDeviceTrustExtensions indicates if the cert contains all required
+// device trust extensions.
+func (c *Cluster) HasDeviceTrustExtensions() bool {
+	return dtauthz.HasDeviceTrustExtensions(c.status.Extensions)
+}
+
+// GetProxyHostname returns just the hostname part of the proxy address of the root cluster (without
+// the port number), even when called on a Cluster that represents a leaf cluster.
+func (c *Cluster) GetProxyHostname() string {
+	return c.status.ProxyURL.Hostname()
+}
+
+// GetAWSRolesARNs returns a list of allowed AWS role ARNs user can assume.
+func (c *Cluster) GetAWSRolesARNs() []string {
+	return c.status.AWSRolesARNs
 }
 
 // LoggedInUser is the currently logged-in user
@@ -185,10 +353,10 @@ type LoggedInUser struct {
 	ActiveRequests []string
 }
 
-// addMetadataToRetryableError is Connect's equivalent of client.RetryWithRelogin. By adding the
+// AddMetadataToRetryableError is Connect's equivalent of client.RetryWithRelogin. By adding the
 // metadata to the error, we're letting the Electron app know that the given error was caused by
 // expired certs and letting the user log in again should resolve the error upon another attempt.
-func addMetadataToRetryableError(ctx context.Context, fn func() error) error {
+func AddMetadataToRetryableError(ctx context.Context, fn func() error) error {
 	err := fn()
 	if err == nil {
 		return nil
@@ -200,4 +368,20 @@ func addMetadataToRetryableError(ctx context.Context, fn func() error) error {
 	}
 
 	return trace.Wrap(err)
+}
+
+// UserTypeFromString converts a string representation of UserType used internally by Teleport to
+// a proto representation used by TerminalService.
+func UserTypeFromString(userType types.UserType) (api.LoggedInUser_UserType, error) {
+	switch userType {
+	case "local":
+		return api.LoggedInUser_USER_TYPE_LOCAL, nil
+	case "sso":
+		return api.LoggedInUser_USER_TYPE_SSO, nil
+	case "":
+		return api.LoggedInUser_USER_TYPE_UNSPECIFIED, nil
+	default:
+		return api.LoggedInUser_USER_TYPE_UNSPECIFIED,
+			trace.BadParameter("unknown user type %q", userType)
+	}
 }

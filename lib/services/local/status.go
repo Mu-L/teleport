@@ -1,28 +1,32 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package local
 
 import (
 	"context"
+	"log/slog"
 	"time"
 
 	"github.com/gravitational/trace"
-	"github.com/sirupsen/logrus"
 
+	"github.com/gravitational/teleport"
+	"github.com/gravitational/teleport/api/client/proto"
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/backend"
 	"github.com/gravitational/teleport/lib/utils"
@@ -31,13 +35,13 @@ import (
 // StatusService manages cluster status info.
 type StatusService struct {
 	backend.Backend
-	log logrus.FieldLogger
+	logger *slog.Logger
 }
 
 func NewStatusService(bk backend.Backend) *StatusService {
 	return &StatusService{
 		Backend: bk,
-		log:     logrus.WithField(trace.Component, "status"),
+		logger:  slog.With(teleport.ComponentKey, "status"),
 	}
 }
 
@@ -64,7 +68,7 @@ func (s *StatusService) GetClusterAlerts(ctx context.Context, query types.GetClu
 	filtered := alerts[:0]
 	for _, alert := range alerts {
 		if err := alert.CheckAndSetDefaults(); err != nil {
-			s.log.Warnf("Skipping invalid cluster alert: %v", err)
+			s.logger.WarnContext(ctx, "Skipping invalid cluster alert", "error", err)
 		}
 
 		if !query.Match(alert) {
@@ -78,7 +82,7 @@ func (s *StatusService) GetClusterAlerts(ctx context.Context, query types.GetClu
 }
 
 func (s *StatusService) getAllClusterAlerts(ctx context.Context) ([]types.ClusterAlert, error) {
-	startKey := backend.Key(clusterAlertPrefix, "")
+	startKey := backend.ExactKey(clusterAlertPrefix)
 	result, err := s.Backend.GetRange(ctx, startKey, backend.RangeEnd(startKey), backend.NoLimit)
 	if err != nil {
 		return nil, trace.Wrap(err)
@@ -98,7 +102,7 @@ func (s *StatusService) getAllClusterAlerts(ctx context.Context) ([]types.Cluste
 }
 
 func (s *StatusService) getClusterAlert(ctx context.Context, alertID string) (types.ClusterAlert, error) {
-	key := backend.Key(clusterAlertPrefix, alertID)
+	key := backend.NewKey(clusterAlertPrefix, alertID)
 	item, err := s.Backend.Get(ctx, key)
 	if err != nil {
 		return types.ClusterAlert{}, trace.Wrap(err)
@@ -125,32 +129,98 @@ func (s *StatusService) UpsertClusterAlert(ctx context.Context, alert types.Clus
 		alert.Metadata.SetExpiry(alert.Spec.Created.Add(time.Hour * 24))
 	}
 
+	rev := alert.GetRevision()
 	val, err := utils.FastMarshal(&alert)
 	if err != nil {
 		return trace.Wrap(err)
 	}
 
 	_, err = s.Backend.Put(ctx, backend.Item{
-		Key:     backend.Key(clusterAlertPrefix, alert.Metadata.Name),
-		Value:   val,
-		Expires: alert.Metadata.Expiry(),
+		// Key construction relies on [backend.KeyFromString] for the alert name, because there are existing
+		// alerts that include a / in their name. Without reconstructing the key it would be impossible
+		// for the sanitization layer to analyze the individual components separately.
+		Key:      backend.NewKey(clusterAlertPrefix).AppendKey(backend.KeyFromString(alert.Metadata.Name)),
+		Value:    val,
+		Expires:  alert.Metadata.Expiry(),
+		Revision: rev,
 	})
 	return trace.Wrap(err)
 }
 
 func (s *StatusService) DeleteClusterAlert(ctx context.Context, alertID string) error {
-	err := s.Backend.Delete(ctx, backend.Key(clusterAlertPrefix, alertID))
+	// Key construction relies on [backend.KeyFromString] for the alert name, because there are existing
+	// alerts that include a / in their name. Without reconstructing the key it would be impossible
+	// for the sanitization layer to analyze the individual components separately.
+	err := s.Backend.Delete(ctx, backend.NewKey(clusterAlertPrefix).AppendKey(backend.KeyFromString(alertID)))
 	if trace.IsNotFound(err) {
 		return trace.NotFound("cluster alert %q not found", alertID)
 	}
 	return trace.Wrap(err)
 }
 
+// CreateAlertAck marks a cluster alert as acknowledged.
+func (s *StatusService) CreateAlertAck(ctx context.Context, ack types.AlertAcknowledgement) error {
+	if err := ack.Check(); err != nil {
+		return trace.Wrap(err)
+	}
+
+	val, err := utils.FastMarshal(&ack)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+
+	_, err = s.Backend.Create(ctx, backend.Item{
+		// Key construction relies on [backend.KeyFromString] for the alert name, because there are existing
+		// alerts that include a / in their name. Without reconstructing the key it would be impossible
+		// for the sanitization layer to analyze the individual components separately.
+		Key:     backend.NewKey(alertAckPrefix).AppendKey(backend.KeyFromString(ack.AlertID)),
+		Value:   val,
+		Expires: ack.Expires,
+	})
+	if trace.IsAlreadyExists(err) {
+		return trace.AlreadyExists("alert %q has already been acknowledged", ack.AlertID)
+	}
+	return trace.Wrap(err)
+}
+
+// GetAlertAcks gets active alert ackowledgements.
+func (s *StatusService) GetAlertAcks(ctx context.Context) ([]types.AlertAcknowledgement, error) {
+	startKey := backend.ExactKey(alertAckPrefix)
+	result, err := s.Backend.GetRange(ctx, startKey, backend.RangeEnd(startKey), backend.NoLimit)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	acks := make([]types.AlertAcknowledgement, 0, len(result.Items))
+
+	for _, item := range result.Items {
+		var ack types.AlertAcknowledgement
+		if err := utils.FastUnmarshal(item.Value, &ack); err != nil {
+			return nil, trace.Wrap(err)
+		}
+		acks = append(acks, ack)
+	}
+
+	return acks, nil
+}
+
+// ClearAlertAcks clears alert acknowledgments.
+func (s *StatusService) ClearAlertAcks(ctx context.Context, req proto.ClearAlertAcksRequest) error {
+	if req.AlertID == "" {
+		return trace.BadParameter("missing alert id for ack clear")
+	}
+	if req.AlertID == types.Wildcard {
+		startKey := backend.ExactKey(alertAckPrefix)
+		return trace.Wrap(s.Backend.DeleteRange(ctx, startKey, backend.RangeEnd(startKey)))
+	}
+
+	err := s.Backend.Delete(ctx, backend.NewKey(alertAckPrefix, req.AlertID))
+	if trace.IsNotFound(err) {
+		return nil
+	}
+	return trace.Wrap(err)
+}
+
 const clusterAlertPrefix = "cluster-alerts"
 
-// Status service manages alerts.
-type Status interface {
-	GetClusterAlerts(ctx context.Context, query types.GetClusterAlertsRequest) ([]types.ClusterAlert, error)
-	UpsertClusterAlert(ctx context.Context, alert types.ClusterAlert) error
-	DeleteClusterAlert(ctx context.Context, alertID string) error
-}
+const alertAckPrefix = "alert-ack"
