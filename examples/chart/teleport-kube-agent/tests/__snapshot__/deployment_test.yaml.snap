@@ -18,7 +18,7 @@ sets Deployment annotations when specified if action is Upgrade:
       template:
         metadata:
           annotations:
-            checksum/config: 69e263080e9c222718c7fb92180c7367832071d7efd51e9bd6dcdb6326e6f9a8
+            checksum/config: 310911b3e71e9339802aeca1d182e1acf5153470f507ce4af423a73e6e06eaba
             kubernetes.io/pod: test-annotation
             kubernetes.io/pod-different: 4
           labels:
@@ -27,7 +27,12 @@ sets Deployment annotations when specified if action is Upgrade:
           containers:
           - args:
             - --diag-addr=0.0.0.0:3000
-            image: public.ecr.aws/gravitational/teleport:12.0.0-dev
+            env:
+            - name: TELEPORT_INSTALL_METHOD_HELM_KUBE_AGENT
+              value: "true"
+            - name: TELEPORT_KUBE_CLUSTER_DOMAIN
+              value: cluster.local
+            image: public.ecr.aws/gravitational/teleport-distroless:18.0.0-dev
             imagePullPolicy: IfNotPresent
             livenessProbe:
               failureThreshold: 6
@@ -54,10 +59,12 @@ sets Deployment annotations when specified if action is Upgrade:
               allowPrivilegeEscalation: false
               capabilities:
                 drop:
-                - all
+                - ALL
               readOnlyRootFilesystem: true
               runAsNonRoot: true
               runAsUser: 9807
+              seccompProfile:
+                type: RuntimeDefault
             volumeMounts:
             - mountPath: /etc/teleport
               name: config
@@ -67,6 +74,8 @@ sets Deployment annotations when specified if action is Upgrade:
               readOnly: true
             - mountPath: /var/lib/teleport
               name: data
+          securityContext:
+            fsGroup: 9807
           serviceAccountName: RELEASE-NAME
           volumes:
           - configMap:
@@ -86,7 +95,7 @@ sets Deployment labels when specified if action is Upgrade:
     template:
       metadata:
         annotations:
-          checksum/config: f472b546dffe5369ea3263c8ee806e71ff2782c951b6f8233835606d17eeae12
+          checksum/config: 9e9cb2e4d76c492bccf0b1e2be4a5acffc8fe747484eb62e615c5ed8dc8c3fc6
         labels:
           app: RELEASE-NAME
           app.kubernetes.io/name: teleport-kube-agent
@@ -95,7 +104,12 @@ sets Deployment labels when specified if action is Upgrade:
         containers:
         - args:
           - --diag-addr=0.0.0.0:3000
-          image: public.ecr.aws/gravitational/teleport:12.0.0-dev
+          env:
+          - name: TELEPORT_INSTALL_METHOD_HELM_KUBE_AGENT
+            value: "true"
+          - name: TELEPORT_KUBE_CLUSTER_DOMAIN
+            value: cluster.local
+          image: public.ecr.aws/gravitational/teleport-distroless:18.0.0-dev
           imagePullPolicy: IfNotPresent
           livenessProbe:
             failureThreshold: 6
@@ -122,10 +136,12 @@ sets Deployment labels when specified if action is Upgrade:
             allowPrivilegeEscalation: false
             capabilities:
               drop:
-              - all
+              - ALL
             readOnlyRootFilesystem: true
             runAsNonRoot: true
             runAsUser: 9807
+            seccompProfile:
+              type: RuntimeDefault
           volumeMounts:
           - mountPath: /etc/teleport
             name: config
@@ -135,6 +151,8 @@ sets Deployment labels when specified if action is Upgrade:
             readOnly: true
           - mountPath: /var/lib/teleport
             name: data
+        securityContext:
+          fsGroup: 9807
         serviceAccountName: RELEASE-NAME
         volumes:
         - configMap:
@@ -150,7 +168,12 @@ sets Pod annotations when specified if action is Upgrade:
     containers:
     - args:
       - --diag-addr=0.0.0.0:3000
-      image: public.ecr.aws/gravitational/teleport:12.0.0-dev
+      env:
+      - name: TELEPORT_INSTALL_METHOD_HELM_KUBE_AGENT
+        value: "true"
+      - name: TELEPORT_KUBE_CLUSTER_DOMAIN
+        value: cluster.local
+      image: public.ecr.aws/gravitational/teleport-distroless:18.0.0-dev
       imagePullPolicy: IfNotPresent
       livenessProbe:
         failureThreshold: 6
@@ -177,10 +200,12 @@ sets Pod annotations when specified if action is Upgrade:
         allowPrivilegeEscalation: false
         capabilities:
           drop:
-          - all
+          - ALL
         readOnlyRootFilesystem: true
         runAsNonRoot: true
         runAsUser: 9807
+        seccompProfile:
+          type: RuntimeDefault
       volumeMounts:
       - mountPath: /etc/teleport
         name: config
@@ -190,6 +215,8 @@ sets Pod annotations when specified if action is Upgrade:
         readOnly: true
       - mountPath: /var/lib/teleport
         name: data
+    securityContext:
+      fsGroup: 9807
     serviceAccountName: RELEASE-NAME
     volumes:
     - configMap:
@@ -205,7 +232,12 @@ sets Pod labels when specified if action is Upgrade:
     containers:
     - args:
       - --diag-addr=0.0.0.0:3000
-      image: public.ecr.aws/gravitational/teleport:12.0.0-dev
+      env:
+      - name: TELEPORT_INSTALL_METHOD_HELM_KUBE_AGENT
+        value: "true"
+      - name: TELEPORT_KUBE_CLUSTER_DOMAIN
+        value: cluster.local
+      image: public.ecr.aws/gravitational/teleport-distroless:18.0.0-dev
       imagePullPolicy: IfNotPresent
       livenessProbe:
         failureThreshold: 6
@@ -232,10 +264,12 @@ sets Pod labels when specified if action is Upgrade:
         allowPrivilegeEscalation: false
         capabilities:
           drop:
-          - all
+          - ALL
         readOnlyRootFilesystem: true
         runAsNonRoot: true
         runAsUser: 9807
+        seccompProfile:
+          type: RuntimeDefault
       volumeMounts:
       - mountPath: /etc/teleport
         name: config
@@ -245,6 +279,8 @@ sets Pod labels when specified if action is Upgrade:
         readOnly: true
       - mountPath: /var/lib/teleport
         name: data
+    securityContext:
+      fsGroup: 9807
     serviceAccountName: RELEASE-NAME
     volumes:
     - configMap:
@@ -255,12 +291,38 @@ sets Pod labels when specified if action is Upgrade:
         secretName: teleport-kube-agent-join-token
     - emptyDir: {}
       name: data
+sets by default a container security context if action is Upgrade:
+  1: |
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+      - ALL
+    readOnlyRootFilesystem: true
+    runAsNonRoot: true
+    runAsUser: 9807
+    seccompProfile:
+      type: RuntimeDefault
+  2: |
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+      - ALL
+    readOnlyRootFilesystem: true
+    runAsNonRoot: true
+    runAsUser: 9807
+    seccompProfile:
+      type: RuntimeDefault
 should add emptyDir for data when existingDataVolume is not set if action is Upgrade:
   1: |
     containers:
     - args:
       - --diag-addr=0.0.0.0:3000
-      image: public.ecr.aws/gravitational/teleport:12.0.0-dev
+      env:
+      - name: TELEPORT_INSTALL_METHOD_HELM_KUBE_AGENT
+        value: "true"
+      - name: TELEPORT_KUBE_CLUSTER_DOMAIN
+        value: cluster.local
+      image: public.ecr.aws/gravitational/teleport-distroless:18.0.0-dev
       imagePullPolicy: IfNotPresent
       livenessProbe:
         failureThreshold: 6
@@ -287,10 +349,12 @@ should add emptyDir for data when existingDataVolume is not set if action is Upg
         allowPrivilegeEscalation: false
         capabilities:
           drop:
-          - all
+          - ALL
         readOnlyRootFilesystem: true
         runAsNonRoot: true
         runAsUser: 9807
+        seccompProfile:
+          type: RuntimeDefault
       volumeMounts:
       - mountPath: /etc/teleport
         name: config
@@ -300,6 +364,8 @@ should add emptyDir for data when existingDataVolume is not set if action is Upg
         readOnly: true
       - mountPath: /var/lib/teleport
         name: data
+    securityContext:
+      fsGroup: 9807
     serviceAccountName: RELEASE-NAME
     volumes:
     - configMap:
@@ -316,7 +382,12 @@ should add insecureSkipProxyTLSVerify to args when set in values if action is Up
     - args:
       - --diag-addr=0.0.0.0:3000
       - --insecure
-      image: public.ecr.aws/gravitational/teleport:12.0.0-dev
+      env:
+      - name: TELEPORT_INSTALL_METHOD_HELM_KUBE_AGENT
+        value: "true"
+      - name: TELEPORT_KUBE_CLUSTER_DOMAIN
+        value: cluster.local
+      image: public.ecr.aws/gravitational/teleport-distroless:18.0.0-dev
       imagePullPolicy: IfNotPresent
       livenessProbe:
         failureThreshold: 6
@@ -343,10 +414,12 @@ should add insecureSkipProxyTLSVerify to args when set in values if action is Up
         allowPrivilegeEscalation: false
         capabilities:
           drop:
-          - all
+          - ALL
         readOnlyRootFilesystem: true
         runAsNonRoot: true
         runAsUser: 9807
+        seccompProfile:
+          type: RuntimeDefault
       volumeMounts:
       - mountPath: /etc/teleport
         name: config
@@ -356,6 +429,8 @@ should add insecureSkipProxyTLSVerify to args when set in values if action is Up
         readOnly: true
       - mountPath: /var/lib/teleport
         name: data
+    securityContext:
+      fsGroup: 9807
     serviceAccountName: RELEASE-NAME
     volumes:
     - configMap:
@@ -371,7 +446,12 @@ should correctly configure existingDataVolume when set if action is Upgrade:
     containers:
     - args:
       - --diag-addr=0.0.0.0:3000
-      image: public.ecr.aws/gravitational/teleport:12.0.0-dev
+      env:
+      - name: TELEPORT_INSTALL_METHOD_HELM_KUBE_AGENT
+        value: "true"
+      - name: TELEPORT_KUBE_CLUSTER_DOMAIN
+        value: cluster.local
+      image: public.ecr.aws/gravitational/teleport-distroless:18.0.0-dev
       imagePullPolicy: IfNotPresent
       livenessProbe:
         failureThreshold: 6
@@ -398,10 +478,12 @@ should correctly configure existingDataVolume when set if action is Upgrade:
         allowPrivilegeEscalation: false
         capabilities:
           drop:
-          - all
+          - ALL
         readOnlyRootFilesystem: true
         runAsNonRoot: true
         runAsUser: 9807
+        seccompProfile:
+          type: RuntimeDefault
       volumeMounts:
       - mountPath: /etc/teleport
         name: config
@@ -411,6 +493,8 @@ should correctly configure existingDataVolume when set if action is Upgrade:
         readOnly: true
       - mountPath: /var/lib/teleport
         name: teleport-kube-agent-data
+    securityContext:
+      fsGroup: 9807
     serviceAccountName: RELEASE-NAME
     volumes:
     - configMap:
@@ -424,7 +508,12 @@ should expose diag port if action is Upgrade:
     containers:
     - args:
       - --diag-addr=0.0.0.0:3000
-      image: public.ecr.aws/gravitational/teleport:12.0.0-dev
+      env:
+      - name: TELEPORT_INSTALL_METHOD_HELM_KUBE_AGENT
+        value: "true"
+      - name: TELEPORT_KUBE_CLUSTER_DOMAIN
+        value: cluster.local
+      image: public.ecr.aws/gravitational/teleport-distroless:18.0.0-dev
       imagePullPolicy: IfNotPresent
       livenessProbe:
         failureThreshold: 6
@@ -451,10 +540,12 @@ should expose diag port if action is Upgrade:
         allowPrivilegeEscalation: false
         capabilities:
           drop:
-          - all
+          - ALL
         readOnlyRootFilesystem: true
         runAsNonRoot: true
         runAsUser: 9807
+        seccompProfile:
+          type: RuntimeDefault
       volumeMounts:
       - mountPath: /etc/teleport
         name: config
@@ -464,6 +555,8 @@ should expose diag port if action is Upgrade:
         readOnly: true
       - mountPath: /var/lib/teleport
         name: data
+    securityContext:
+      fsGroup: 9807
     serviceAccountName: RELEASE-NAME
     volumes:
     - configMap:
@@ -491,7 +584,12 @@ should have multiple replicas when replicaCount is set (using .replicaCount, dep
     containers:
     - args:
       - --diag-addr=0.0.0.0:3000
-      image: public.ecr.aws/gravitational/teleport:12.0.0-dev
+      env:
+      - name: TELEPORT_INSTALL_METHOD_HELM_KUBE_AGENT
+        value: "true"
+      - name: TELEPORT_KUBE_CLUSTER_DOMAIN
+        value: cluster.local
+      image: public.ecr.aws/gravitational/teleport-distroless:18.0.0-dev
       imagePullPolicy: IfNotPresent
       livenessProbe:
         failureThreshold: 6
@@ -518,10 +616,12 @@ should have multiple replicas when replicaCount is set (using .replicaCount, dep
         allowPrivilegeEscalation: false
         capabilities:
           drop:
-          - all
+          - ALL
         readOnlyRootFilesystem: true
         runAsNonRoot: true
         runAsUser: 9807
+        seccompProfile:
+          type: RuntimeDefault
       volumeMounts:
       - mountPath: /etc/teleport
         name: config
@@ -531,6 +631,8 @@ should have multiple replicas when replicaCount is set (using .replicaCount, dep
         readOnly: true
       - mountPath: /var/lib/teleport
         name: data
+    securityContext:
+      fsGroup: 9807
     serviceAccountName: RELEASE-NAME
     volumes:
     - configMap:
@@ -558,7 +660,12 @@ should have multiple replicas when replicaCount is set (using highAvailability.r
     containers:
     - args:
       - --diag-addr=0.0.0.0:3000
-      image: public.ecr.aws/gravitational/teleport:12.0.0-dev
+      env:
+      - name: TELEPORT_INSTALL_METHOD_HELM_KUBE_AGENT
+        value: "true"
+      - name: TELEPORT_KUBE_CLUSTER_DOMAIN
+        value: cluster.local
+      image: public.ecr.aws/gravitational/teleport-distroless:18.0.0-dev
       imagePullPolicy: IfNotPresent
       livenessProbe:
         failureThreshold: 6
@@ -585,10 +692,12 @@ should have multiple replicas when replicaCount is set (using highAvailability.r
         allowPrivilegeEscalation: false
         capabilities:
           drop:
-          - all
+          - ALL
         readOnlyRootFilesystem: true
         runAsNonRoot: true
         runAsUser: 9807
+        seccompProfile:
+          type: RuntimeDefault
       volumeMounts:
       - mountPath: /etc/teleport
         name: config
@@ -598,6 +707,8 @@ should have multiple replicas when replicaCount is set (using highAvailability.r
         readOnly: true
       - mountPath: /var/lib/teleport
         name: data
+    securityContext:
+      fsGroup: 9807
     serviceAccountName: RELEASE-NAME
     volumes:
     - configMap:
@@ -613,7 +724,12 @@ should have one replica when replicaCount is not set if action is Upgrade:
     containers:
     - args:
       - --diag-addr=0.0.0.0:3000
-      image: public.ecr.aws/gravitational/teleport:12.0.0-dev
+      env:
+      - name: TELEPORT_INSTALL_METHOD_HELM_KUBE_AGENT
+        value: "true"
+      - name: TELEPORT_KUBE_CLUSTER_DOMAIN
+        value: cluster.local
+      image: public.ecr.aws/gravitational/teleport-distroless:18.0.0-dev
       imagePullPolicy: IfNotPresent
       livenessProbe:
         failureThreshold: 6
@@ -640,10 +756,12 @@ should have one replica when replicaCount is not set if action is Upgrade:
         allowPrivilegeEscalation: false
         capabilities:
           drop:
-          - all
+          - ALL
         readOnlyRootFilesystem: true
         runAsNonRoot: true
         runAsUser: 9807
+        seccompProfile:
+          type: RuntimeDefault
       volumeMounts:
       - mountPath: /etc/teleport
         name: config
@@ -653,6 +771,8 @@ should have one replica when replicaCount is not set if action is Upgrade:
         readOnly: true
       - mountPath: /var/lib/teleport
         name: data
+    securityContext:
+      fsGroup: 9807
     serviceAccountName: RELEASE-NAME
     volumes:
     - configMap:
@@ -668,7 +788,12 @@ should mount extraVolumes and extraVolumeMounts if action is Upgrade:
     containers:
     - args:
       - --diag-addr=0.0.0.0:3000
-      image: public.ecr.aws/gravitational/teleport:12.0.0-dev
+      env:
+      - name: TELEPORT_INSTALL_METHOD_HELM_KUBE_AGENT
+        value: "true"
+      - name: TELEPORT_KUBE_CLUSTER_DOMAIN
+        value: cluster.local
+      image: public.ecr.aws/gravitational/teleport-distroless:18.0.0-dev
       imagePullPolicy: IfNotPresent
       livenessProbe:
         failureThreshold: 6
@@ -695,10 +820,12 @@ should mount extraVolumes and extraVolumeMounts if action is Upgrade:
         allowPrivilegeEscalation: false
         capabilities:
           drop:
-          - all
+          - ALL
         readOnlyRootFilesystem: true
         runAsNonRoot: true
         runAsUser: 9807
+        seccompProfile:
+          type: RuntimeDefault
       volumeMounts:
       - mountPath: /etc/teleport
         name: config
@@ -710,6 +837,8 @@ should mount extraVolumes and extraVolumeMounts if action is Upgrade:
         name: data
       - mountPath: /path/to/mount
         name: my-mount
+    securityContext:
+      fsGroup: 9807
     serviceAccountName: RELEASE-NAME
     volumes:
     - configMap:
@@ -723,15 +852,17 @@ should mount extraVolumes and extraVolumeMounts if action is Upgrade:
     - name: my-mount
       secret:
         secretName: mySecret
-should mount tls.existingCASecretName and set environment when set in values if action is Upgrade:
+should mount jamfCredentialsSecret if it already exists and when role is jamf and action is Upgrade:
   1: |
     containers:
     - args:
       - --diag-addr=0.0.0.0:3000
       env:
-      - name: SSL_CERT_FILE
-        value: /etc/teleport-tls-ca/ca.pem
-      image: public.ecr.aws/gravitational/teleport:12.0.0-dev
+      - name: TELEPORT_INSTALL_METHOD_HELM_KUBE_AGENT
+        value: "true"
+      - name: TELEPORT_KUBE_CLUSTER_DOMAIN
+        value: cluster.local
+      image: public.ecr.aws/gravitational/teleport-distroless:18.0.0-dev
       imagePullPolicy: IfNotPresent
       livenessProbe:
         failureThreshold: 6
@@ -758,10 +889,154 @@ should mount tls.existingCASecretName and set environment when set in values if 
         allowPrivilegeEscalation: false
         capabilities:
           drop:
-          - all
+          - ALL
         readOnlyRootFilesystem: true
         runAsNonRoot: true
         runAsUser: 9807
+        seccompProfile:
+          type: RuntimeDefault
+      volumeMounts:
+      - mountPath: /etc/teleport
+        name: config
+        readOnly: true
+      - mountPath: /etc/teleport-secrets
+        name: auth-token
+        readOnly: true
+      - mountPath: /var/lib/teleport
+        name: data
+      - mountPath: /etc/teleport-jamf-api-credentials
+        name: jamf-api-credentials
+        readOnly: true
+    securityContext:
+      fsGroup: 9807
+    serviceAccountName: RELEASE-NAME
+    volumes:
+    - configMap:
+        name: RELEASE-NAME
+      name: config
+    - name: auth-token
+      secret:
+        secretName: teleport-kube-agent-join-token
+    - emptyDir: {}
+      name: data
+    - name: jamf-api-credentials
+      secret:
+        secretName: existing-teleport-jamf-secret
+should mount jamfCredentialsSecret.name when role is jamf and action is Upgrade:
+  1: |
+    containers:
+    - args:
+      - --diag-addr=0.0.0.0:3000
+      env:
+      - name: TELEPORT_INSTALL_METHOD_HELM_KUBE_AGENT
+        value: "true"
+      - name: TELEPORT_KUBE_CLUSTER_DOMAIN
+        value: cluster.local
+      image: public.ecr.aws/gravitational/teleport-distroless:18.0.0-dev
+      imagePullPolicy: IfNotPresent
+      livenessProbe:
+        failureThreshold: 6
+        httpGet:
+          path: /healthz
+          port: diag
+        initialDelaySeconds: 5
+        periodSeconds: 5
+        timeoutSeconds: 1
+      name: teleport
+      ports:
+      - containerPort: 3000
+        name: diag
+        protocol: TCP
+      readinessProbe:
+        failureThreshold: 12
+        httpGet:
+          path: /readyz
+          port: diag
+        initialDelaySeconds: 5
+        periodSeconds: 5
+        timeoutSeconds: 1
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop:
+          - ALL
+        readOnlyRootFilesystem: true
+        runAsNonRoot: true
+        runAsUser: 9807
+        seccompProfile:
+          type: RuntimeDefault
+      volumeMounts:
+      - mountPath: /etc/teleport
+        name: config
+        readOnly: true
+      - mountPath: /etc/teleport-secrets
+        name: auth-token
+        readOnly: true
+      - mountPath: /var/lib/teleport
+        name: data
+      - mountPath: /etc/teleport-jamf-api-credentials
+        name: jamf-api-credentials
+        readOnly: true
+    securityContext:
+      fsGroup: 9807
+    serviceAccountName: RELEASE-NAME
+    volumes:
+    - configMap:
+        name: RELEASE-NAME
+      name: config
+    - name: auth-token
+      secret:
+        secretName: teleport-kube-agent-join-token
+    - emptyDir: {}
+      name: data
+    - name: jamf-api-credentials
+      secret:
+        secretName: teleport-jamf-api-credentials
+should mount tls.existingCASecretName and set environment when set in values if action is Upgrade:
+  1: |
+    containers:
+    - args:
+      - --diag-addr=0.0.0.0:3000
+      env:
+      - name: TELEPORT_INSTALL_METHOD_HELM_KUBE_AGENT
+        value: "true"
+      - name: TELEPORT_KUBE_CLUSTER_DOMAIN
+        value: cluster.local
+      - name: SSL_CERT_FILE
+        value: /etc/teleport-tls-ca/ca.pem
+      image: public.ecr.aws/gravitational/teleport-distroless:18.0.0-dev
+      imagePullPolicy: IfNotPresent
+      livenessProbe:
+        failureThreshold: 6
+        httpGet:
+          path: /healthz
+          port: diag
+        initialDelaySeconds: 5
+        periodSeconds: 5
+        timeoutSeconds: 1
+      name: teleport
+      ports:
+      - containerPort: 3000
+        name: diag
+        protocol: TCP
+      readinessProbe:
+        failureThreshold: 12
+        httpGet:
+          path: /readyz
+          port: diag
+        initialDelaySeconds: 5
+        periodSeconds: 5
+        timeoutSeconds: 1
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop:
+          - ALL
+        readOnlyRootFilesystem: true
+        runAsNonRoot: true
+        runAsUser: 9807
+        seccompProfile:
+          type: RuntimeDefault
       volumeMounts:
       - mountPath: /etc/teleport
         name: config
@@ -774,6 +1049,8 @@ should mount tls.existingCASecretName and set environment when set in values if 
       - mountPath: /etc/teleport-tls-ca
         name: teleport-tls-ca
         readOnly: true
+    securityContext:
+      fsGroup: 9807
     serviceAccountName: RELEASE-NAME
     volumes:
     - configMap:
@@ -793,11 +1070,15 @@ should mount tls.existingCASecretName and set extra environment when set in valu
     - args:
       - --diag-addr=0.0.0.0:3000
       env:
+      - name: TELEPORT_INSTALL_METHOD_HELM_KUBE_AGENT
+        value: "true"
+      - name: TELEPORT_KUBE_CLUSTER_DOMAIN
+        value: cluster.local
       - name: HTTPS_PROXY
         value: http://username:password@my.proxy.host:3128
       - name: SSL_CERT_FILE
         value: /etc/teleport-tls-ca/ca.pem
-      image: public.ecr.aws/gravitational/teleport:12.0.0-dev
+      image: public.ecr.aws/gravitational/teleport-distroless:18.0.0-dev
       imagePullPolicy: IfNotPresent
       livenessProbe:
         failureThreshold: 6
@@ -824,10 +1105,12 @@ should mount tls.existingCASecretName and set extra environment when set in valu
         allowPrivilegeEscalation: false
         capabilities:
           drop:
-          - all
+          - ALL
         readOnlyRootFilesystem: true
         runAsNonRoot: true
         runAsUser: 9807
+        seccompProfile:
+          type: RuntimeDefault
       volumeMounts:
       - mountPath: /etc/teleport
         name: config
@@ -840,6 +1123,8 @@ should mount tls.existingCASecretName and set extra environment when set in valu
       - mountPath: /etc/teleport-tls-ca
         name: teleport-tls-ca
         readOnly: true
+    securityContext:
+      fsGroup: 9807
     serviceAccountName: RELEASE-NAME
     volumes:
     - configMap:
@@ -858,7 +1143,12 @@ should provision initContainer correctly when set in values if action is Upgrade
     containers:
     - args:
       - --diag-addr=0.0.0.0:3000
-      image: public.ecr.aws/gravitational/teleport:12.0.0-dev
+      env:
+      - name: TELEPORT_INSTALL_METHOD_HELM_KUBE_AGENT
+        value: "true"
+      - name: TELEPORT_KUBE_CLUSTER_DOMAIN
+        value: cluster.local
+      image: public.ecr.aws/gravitational/teleport-distroless:18.0.0-dev
       imagePullPolicy: IfNotPresent
       livenessProbe:
         failureThreshold: 6
@@ -892,10 +1182,12 @@ should provision initContainer correctly when set in values if action is Upgrade
         allowPrivilegeEscalation: false
         capabilities:
           drop:
-          - all
+          - ALL
         readOnlyRootFilesystem: true
         runAsNonRoot: true
         runAsUser: 9807
+        seccompProfile:
+          type: RuntimeDefault
       volumeMounts:
       - mountPath: /etc/teleport
         name: config
@@ -921,10 +1213,12 @@ should provision initContainer correctly when set in values if action is Upgrade
         allowPrivilegeEscalation: false
         capabilities:
           drop:
-          - all
+          - ALL
         readOnlyRootFilesystem: true
         runAsNonRoot: true
         runAsUser: 9807
+        seccompProfile:
+          type: RuntimeDefault
       volumeMounts:
       - mountPath: /etc/teleport
         name: config
@@ -934,61 +1228,8 @@ should provision initContainer correctly when set in values if action is Upgrade
         readOnly: true
       - mountPath: /var/lib/teleport
         name: data
-    serviceAccountName: RELEASE-NAME
-    volumes:
-    - configMap:
-        name: RELEASE-NAME
-      name: config
-    - name: auth-token
-      secret:
-        secretName: teleport-kube-agent-join-token
-    - emptyDir: {}
-      name: data
-should set SecurityContext if action is Upgrade:
-  1: |
-    containers:
-    - args:
-      - --diag-addr=0.0.0.0:3000
-      image: public.ecr.aws/gravitational/teleport:12.0.0-dev
-      imagePullPolicy: IfNotPresent
-      livenessProbe:
-        failureThreshold: 6
-        httpGet:
-          path: /healthz
-          port: diag
-        initialDelaySeconds: 5
-        periodSeconds: 5
-        timeoutSeconds: 1
-      name: teleport
-      ports:
-      - containerPort: 3000
-        name: diag
-        protocol: TCP
-      readinessProbe:
-        failureThreshold: 12
-        httpGet:
-          path: /readyz
-          port: diag
-        initialDelaySeconds: 5
-        periodSeconds: 5
-        timeoutSeconds: 1
-      securityContext:
-        allowPrivilegeEscalation: false
-        capabilities:
-          drop:
-          - all
-        readOnlyRootFilesystem: true
-        runAsNonRoot: true
-        runAsUser: 9807
-      volumeMounts:
-      - mountPath: /etc/teleport
-        name: config
-        readOnly: true
-      - mountPath: /etc/teleport-secrets
-        name: auth-token
-        readOnly: true
-      - mountPath: /var/lib/teleport
-        name: data
+    securityContext:
+      fsGroup: 9807
     serviceAccountName: RELEASE-NAME
     volumes:
     - configMap:
@@ -1024,7 +1265,12 @@ should set affinity when set in values if action is Upgrade:
     containers:
     - args:
       - --diag-addr=0.0.0.0:3000
-      image: public.ecr.aws/gravitational/teleport:12.0.0-dev
+      env:
+      - name: TELEPORT_INSTALL_METHOD_HELM_KUBE_AGENT
+        value: "true"
+      - name: TELEPORT_KUBE_CLUSTER_DOMAIN
+        value: cluster.local
+      image: public.ecr.aws/gravitational/teleport-distroless:18.0.0-dev
       imagePullPolicy: IfNotPresent
       livenessProbe:
         failureThreshold: 6
@@ -1051,10 +1297,12 @@ should set affinity when set in values if action is Upgrade:
         allowPrivilegeEscalation: false
         capabilities:
           drop:
-          - all
+          - ALL
         readOnlyRootFilesystem: true
         runAsNonRoot: true
         runAsUser: 9807
+        seccompProfile:
+          type: RuntimeDefault
       volumeMounts:
       - mountPath: /etc/teleport
         name: config
@@ -1064,6 +1312,8 @@ should set affinity when set in values if action is Upgrade:
         readOnly: true
       - mountPath: /var/lib/teleport
         name: data
+    securityContext:
+      fsGroup: 9807
     serviceAccountName: RELEASE-NAME
     volumes:
     - configMap:
@@ -1079,7 +1329,12 @@ should set default serviceAccountName when not set in values if action is Upgrad
     containers:
     - args:
       - --diag-addr=0.0.0.0:3000
-      image: public.ecr.aws/gravitational/teleport:12.0.0-dev
+      env:
+      - name: TELEPORT_INSTALL_METHOD_HELM_KUBE_AGENT
+        value: "true"
+      - name: TELEPORT_KUBE_CLUSTER_DOMAIN
+        value: cluster.local
+      image: public.ecr.aws/gravitational/teleport-distroless:18.0.0-dev
       imagePullPolicy: IfNotPresent
       livenessProbe:
         failureThreshold: 6
@@ -1106,10 +1361,12 @@ should set default serviceAccountName when not set in values if action is Upgrad
         allowPrivilegeEscalation: false
         capabilities:
           drop:
-          - all
+          - ALL
         readOnlyRootFilesystem: true
         runAsNonRoot: true
         runAsUser: 9807
+        seccompProfile:
+          type: RuntimeDefault
       volumeMounts:
       - mountPath: /etc/teleport
         name: config
@@ -1119,6 +1376,8 @@ should set default serviceAccountName when not set in values if action is Upgrad
         readOnly: true
       - mountPath: /var/lib/teleport
         name: data
+    securityContext:
+      fsGroup: 9807
     serviceAccountName: RELEASE-NAME
     volumes:
     - configMap:
@@ -1129,15 +1388,30 @@ should set default serviceAccountName when not set in values if action is Upgrad
         secretName: teleport-kube-agent-join-token
     - emptyDir: {}
       name: data
+should set dnsConfig when set in values if action is Upgrade:
+  1: |
+    nameservers:
+    - 1.2.3.4
+    options:
+    - name: ndots
+      value: "2"
+    - name: edns0
+    searches:
+    - ns1.svc.cluster-domain.example
+    - my.dns.search.suffix
 should set environment when extraEnv set in values if action is Upgrade:
   1: |
     containers:
     - args:
       - --diag-addr=0.0.0.0:3000
       env:
+      - name: TELEPORT_INSTALL_METHOD_HELM_KUBE_AGENT
+        value: "true"
+      - name: TELEPORT_KUBE_CLUSTER_DOMAIN
+        value: cluster.local
       - name: HTTPS_PROXY
         value: http://username:password@my.proxy.host:3128
-      image: public.ecr.aws/gravitational/teleport:12.0.0-dev
+      image: public.ecr.aws/gravitational/teleport-distroless:18.0.0-dev
       imagePullPolicy: IfNotPresent
       livenessProbe:
         failureThreshold: 6
@@ -1164,10 +1438,12 @@ should set environment when extraEnv set in values if action is Upgrade:
         allowPrivilegeEscalation: false
         capabilities:
           drop:
-          - all
+          - ALL
         readOnlyRootFilesystem: true
         runAsNonRoot: true
         runAsUser: 9807
+        seccompProfile:
+          type: RuntimeDefault
       volumeMounts:
       - mountPath: /etc/teleport
         name: config
@@ -1177,6 +1453,8 @@ should set environment when extraEnv set in values if action is Upgrade:
         readOnly: true
       - mountPath: /var/lib/teleport
         name: data
+    securityContext:
+      fsGroup: 9807
     serviceAccountName: RELEASE-NAME
     volumes:
     - configMap:
@@ -1192,7 +1470,12 @@ should set image and tag correctly if action is Upgrade:
     containers:
     - args:
       - --diag-addr=0.0.0.0:3000
-      image: public.ecr.aws/gravitational/teleport:8.3.4
+      env:
+      - name: TELEPORT_INSTALL_METHOD_HELM_KUBE_AGENT
+        value: "true"
+      - name: TELEPORT_KUBE_CLUSTER_DOMAIN
+        value: cluster.local
+      image: public.ecr.aws/gravitational/teleport-distroless:12.2.1
       imagePullPolicy: IfNotPresent
       livenessProbe:
         failureThreshold: 6
@@ -1219,10 +1502,12 @@ should set image and tag correctly if action is Upgrade:
         allowPrivilegeEscalation: false
         capabilities:
           drop:
-          - all
+          - ALL
         readOnlyRootFilesystem: true
         runAsNonRoot: true
         runAsUser: 9807
+        seccompProfile:
+          type: RuntimeDefault
       volumeMounts:
       - mountPath: /etc/teleport
         name: config
@@ -1232,6 +1517,8 @@ should set image and tag correctly if action is Upgrade:
         readOnly: true
       - mountPath: /var/lib/teleport
         name: data
+    securityContext:
+      fsGroup: 9807
     serviceAccountName: RELEASE-NAME
     volumes:
     - configMap:
@@ -1247,7 +1534,12 @@ should set imagePullPolicy when set in values if action is Upgrade:
     containers:
     - args:
       - --diag-addr=0.0.0.0:3000
-      image: public.ecr.aws/gravitational/teleport:12.0.0-dev
+      env:
+      - name: TELEPORT_INSTALL_METHOD_HELM_KUBE_AGENT
+        value: "true"
+      - name: TELEPORT_KUBE_CLUSTER_DOMAIN
+        value: cluster.local
+      image: public.ecr.aws/gravitational/teleport-distroless:18.0.0-dev
       imagePullPolicy: Always
       livenessProbe:
         failureThreshold: 6
@@ -1274,10 +1566,12 @@ should set imagePullPolicy when set in values if action is Upgrade:
         allowPrivilegeEscalation: false
         capabilities:
           drop:
-          - all
+          - ALL
         readOnlyRootFilesystem: true
         runAsNonRoot: true
         runAsUser: 9807
+        seccompProfile:
+          type: RuntimeDefault
       volumeMounts:
       - mountPath: /etc/teleport
         name: config
@@ -1287,6 +1581,8 @@ should set imagePullPolicy when set in values if action is Upgrade:
         readOnly: true
       - mountPath: /var/lib/teleport
         name: data
+    securityContext:
+      fsGroup: 9807
     serviceAccountName: RELEASE-NAME
     volumes:
     - configMap:
@@ -1302,7 +1598,12 @@ should set nodeSelector if set in values if action is Upgrade:
     containers:
     - args:
       - --diag-addr=0.0.0.0:3000
-      image: public.ecr.aws/gravitational/teleport:12.0.0-dev
+      env:
+      - name: TELEPORT_INSTALL_METHOD_HELM_KUBE_AGENT
+        value: "true"
+      - name: TELEPORT_KUBE_CLUSTER_DOMAIN
+        value: cluster.local
+      image: public.ecr.aws/gravitational/teleport-distroless:18.0.0-dev
       imagePullPolicy: IfNotPresent
       livenessProbe:
         failureThreshold: 6
@@ -1329,10 +1630,12 @@ should set nodeSelector if set in values if action is Upgrade:
         allowPrivilegeEscalation: false
         capabilities:
           drop:
-          - all
+          - ALL
         readOnlyRootFilesystem: true
         runAsNonRoot: true
         runAsUser: 9807
+        seccompProfile:
+          type: RuntimeDefault
       volumeMounts:
       - mountPath: /etc/teleport
         name: config
@@ -1344,6 +1647,8 @@ should set nodeSelector if set in values if action is Upgrade:
         name: data
     nodeSelector:
       gravitational.io/k8s-role: node
+    securityContext:
+      fsGroup: 9807
     serviceAccountName: RELEASE-NAME
     volumes:
     - configMap:
@@ -1359,7 +1664,12 @@ should set not set priorityClassName when not set in values if action is Upgrade
     containers:
     - args:
       - --diag-addr=0.0.0.0:3000
-      image: public.ecr.aws/gravitational/teleport:12.0.0-dev
+      env:
+      - name: TELEPORT_INSTALL_METHOD_HELM_KUBE_AGENT
+        value: "true"
+      - name: TELEPORT_KUBE_CLUSTER_DOMAIN
+        value: cluster.local
+      image: public.ecr.aws/gravitational/teleport-distroless:18.0.0-dev
       imagePullPolicy: IfNotPresent
       livenessProbe:
         failureThreshold: 6
@@ -1386,10 +1696,12 @@ should set not set priorityClassName when not set in values if action is Upgrade
         allowPrivilegeEscalation: false
         capabilities:
           drop:
-          - all
+          - ALL
         readOnlyRootFilesystem: true
         runAsNonRoot: true
         runAsUser: 9807
+        seccompProfile:
+          type: RuntimeDefault
       volumeMounts:
       - mountPath: /etc/teleport
         name: config
@@ -1399,6 +1711,8 @@ should set not set priorityClassName when not set in values if action is Upgrade
         readOnly: true
       - mountPath: /var/lib/teleport
         name: data
+    securityContext:
+      fsGroup: 9807
     serviceAccountName: RELEASE-NAME
     volumes:
     - configMap:
@@ -1426,7 +1740,12 @@ should set preferred affinity when more than one replica is used if action is Up
     containers:
     - args:
       - --diag-addr=0.0.0.0:3000
-      image: public.ecr.aws/gravitational/teleport:12.0.0-dev
+      env:
+      - name: TELEPORT_INSTALL_METHOD_HELM_KUBE_AGENT
+        value: "true"
+      - name: TELEPORT_KUBE_CLUSTER_DOMAIN
+        value: cluster.local
+      image: public.ecr.aws/gravitational/teleport-distroless:18.0.0-dev
       imagePullPolicy: IfNotPresent
       livenessProbe:
         failureThreshold: 6
@@ -1453,10 +1772,12 @@ should set preferred affinity when more than one replica is used if action is Up
         allowPrivilegeEscalation: false
         capabilities:
           drop:
-          - all
+          - ALL
         readOnlyRootFilesystem: true
         runAsNonRoot: true
         runAsUser: 9807
+        seccompProfile:
+          type: RuntimeDefault
       volumeMounts:
       - mountPath: /etc/teleport
         name: config
@@ -1466,6 +1787,8 @@ should set preferred affinity when more than one replica is used if action is Up
         readOnly: true
       - mountPath: /var/lib/teleport
         name: data
+    securityContext:
+      fsGroup: 9807
     serviceAccountName: RELEASE-NAME
     volumes:
     - configMap:
@@ -1481,7 +1804,12 @@ should set priorityClassName when set in values if action is Upgrade:
     containers:
     - args:
       - --diag-addr=0.0.0.0:3000
-      image: public.ecr.aws/gravitational/teleport:12.0.0-dev
+      env:
+      - name: TELEPORT_INSTALL_METHOD_HELM_KUBE_AGENT
+        value: "true"
+      - name: TELEPORT_KUBE_CLUSTER_DOMAIN
+        value: cluster.local
+      image: public.ecr.aws/gravitational/teleport-distroless:18.0.0-dev
       imagePullPolicy: IfNotPresent
       livenessProbe:
         failureThreshold: 6
@@ -1508,10 +1836,12 @@ should set priorityClassName when set in values if action is Upgrade:
         allowPrivilegeEscalation: false
         capabilities:
           drop:
-          - all
+          - ALL
         readOnlyRootFilesystem: true
         runAsNonRoot: true
         runAsUser: 9807
+        seccompProfile:
+          type: RuntimeDefault
       volumeMounts:
       - mountPath: /etc/teleport
         name: config
@@ -1522,6 +1852,8 @@ should set priorityClassName when set in values if action is Upgrade:
       - mountPath: /var/lib/teleport
         name: data
     priorityClassName: teleport-kube-agent
+    securityContext:
+      fsGroup: 9807
     serviceAccountName: RELEASE-NAME
     volumes:
     - configMap:
@@ -1537,7 +1869,12 @@ should set probeTimeoutSeconds when set in values if action is Upgrade:
     containers:
     - args:
       - --diag-addr=0.0.0.0:3000
-      image: public.ecr.aws/gravitational/teleport:12.0.0-dev
+      env:
+      - name: TELEPORT_INSTALL_METHOD_HELM_KUBE_AGENT
+        value: "true"
+      - name: TELEPORT_KUBE_CLUSTER_DOMAIN
+        value: cluster.local
+      image: public.ecr.aws/gravitational/teleport-distroless:18.0.0-dev
       imagePullPolicy: IfNotPresent
       livenessProbe:
         failureThreshold: 6
@@ -1564,10 +1901,12 @@ should set probeTimeoutSeconds when set in values if action is Upgrade:
         allowPrivilegeEscalation: false
         capabilities:
           drop:
-          - all
+          - ALL
         readOnlyRootFilesystem: true
         runAsNonRoot: true
         runAsUser: 9807
+        seccompProfile:
+          type: RuntimeDefault
       volumeMounts:
       - mountPath: /etc/teleport
         name: config
@@ -1577,6 +1916,8 @@ should set probeTimeoutSeconds when set in values if action is Upgrade:
         readOnly: true
       - mountPath: /var/lib/teleport
         name: data
+    securityContext:
+      fsGroup: 9807
     serviceAccountName: RELEASE-NAME
     volumes:
     - configMap:
@@ -1602,7 +1943,12 @@ should set required affinity when highAvailability.requireAntiAffinity is set if
     containers:
     - args:
       - --diag-addr=0.0.0.0:3000
-      image: public.ecr.aws/gravitational/teleport:12.0.0-dev
+      env:
+      - name: TELEPORT_INSTALL_METHOD_HELM_KUBE_AGENT
+        value: "true"
+      - name: TELEPORT_KUBE_CLUSTER_DOMAIN
+        value: cluster.local
+      image: public.ecr.aws/gravitational/teleport-distroless:18.0.0-dev
       imagePullPolicy: IfNotPresent
       livenessProbe:
         failureThreshold: 6
@@ -1629,10 +1975,12 @@ should set required affinity when highAvailability.requireAntiAffinity is set if
         allowPrivilegeEscalation: false
         capabilities:
           drop:
-          - all
+          - ALL
         readOnlyRootFilesystem: true
         runAsNonRoot: true
         runAsUser: 9807
+        seccompProfile:
+          type: RuntimeDefault
       volumeMounts:
       - mountPath: /etc/teleport
         name: config
@@ -1642,6 +1990,8 @@ should set required affinity when highAvailability.requireAntiAffinity is set if
         readOnly: true
       - mountPath: /var/lib/teleport
         name: data
+    securityContext:
+      fsGroup: 9807
     serviceAccountName: RELEASE-NAME
     volumes:
     - configMap:
@@ -1657,7 +2007,12 @@ should set resources when set in values if action is Upgrade:
     containers:
     - args:
       - --diag-addr=0.0.0.0:3000
-      image: public.ecr.aws/gravitational/teleport:12.0.0-dev
+      env:
+      - name: TELEPORT_INSTALL_METHOD_HELM_KUBE_AGENT
+        value: "true"
+      - name: TELEPORT_KUBE_CLUSTER_DOMAIN
+        value: cluster.local
+      image: public.ecr.aws/gravitational/teleport-distroless:18.0.0-dev
       imagePullPolicy: IfNotPresent
       livenessProbe:
         failureThreshold: 6
@@ -1691,10 +2046,12 @@ should set resources when set in values if action is Upgrade:
         allowPrivilegeEscalation: false
         capabilities:
           drop:
-          - all
+          - ALL
         readOnlyRootFilesystem: true
         runAsNonRoot: true
         runAsUser: 9807
+        seccompProfile:
+          type: RuntimeDefault
       volumeMounts:
       - mountPath: /etc/teleport
         name: config
@@ -1704,6 +2061,8 @@ should set resources when set in values if action is Upgrade:
         readOnly: true
       - mountPath: /var/lib/teleport
         name: data
+    securityContext:
+      fsGroup: 9807
     serviceAccountName: RELEASE-NAME
     volumes:
     - configMap:
@@ -1719,7 +2078,12 @@ should set serviceAccountName when set in values if action is Upgrade:
     containers:
     - args:
       - --diag-addr=0.0.0.0:3000
-      image: public.ecr.aws/gravitational/teleport:12.0.0-dev
+      env:
+      - name: TELEPORT_INSTALL_METHOD_HELM_KUBE_AGENT
+        value: "true"
+      - name: TELEPORT_KUBE_CLUSTER_DOMAIN
+        value: cluster.local
+      image: public.ecr.aws/gravitational/teleport-distroless:18.0.0-dev
       imagePullPolicy: IfNotPresent
       livenessProbe:
         failureThreshold: 6
@@ -1746,10 +2110,12 @@ should set serviceAccountName when set in values if action is Upgrade:
         allowPrivilegeEscalation: false
         capabilities:
           drop:
-          - all
+          - ALL
         readOnlyRootFilesystem: true
         runAsNonRoot: true
         runAsUser: 9807
+        seccompProfile:
+          type: RuntimeDefault
       volumeMounts:
       - mountPath: /etc/teleport
         name: config
@@ -1759,6 +2125,8 @@ should set serviceAccountName when set in values if action is Upgrade:
         readOnly: true
       - mountPath: /var/lib/teleport
         name: data
+    securityContext:
+      fsGroup: 9807
     serviceAccountName: teleport-kube-agent-sa
     volumes:
     - configMap:
@@ -1774,7 +2142,12 @@ should set tolerations when set in values if action is Upgrade:
     containers:
     - args:
       - --diag-addr=0.0.0.0:3000
-      image: public.ecr.aws/gravitational/teleport:12.0.0-dev
+      env:
+      - name: TELEPORT_INSTALL_METHOD_HELM_KUBE_AGENT
+        value: "true"
+      - name: TELEPORT_KUBE_CLUSTER_DOMAIN
+        value: cluster.local
+      image: public.ecr.aws/gravitational/teleport-distroless:18.0.0-dev
       imagePullPolicy: IfNotPresent
       livenessProbe:
         failureThreshold: 6
@@ -1801,10 +2174,12 @@ should set tolerations when set in values if action is Upgrade:
         allowPrivilegeEscalation: false
         capabilities:
           drop:
-          - all
+          - ALL
         readOnlyRootFilesystem: true
         runAsNonRoot: true
         runAsUser: 9807
+        seccompProfile:
+          type: RuntimeDefault
       volumeMounts:
       - mountPath: /etc/teleport
         name: config
@@ -1814,6 +2189,8 @@ should set tolerations when set in values if action is Upgrade:
         readOnly: true
       - mountPath: /var/lib/teleport
         name: data
+    securityContext:
+      fsGroup: 9807
     serviceAccountName: RELEASE-NAME
     tolerations:
     - effect: NoExecute

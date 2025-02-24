@@ -1,18 +1,20 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package alpnproxy
 
@@ -154,4 +156,134 @@ func createForwardProxyWithConfig(t *testing.T, config ForwardProxyConfig) *Forw
 		assert.NoError(t, forwardProxy.Start())
 	}()
 	return forwardProxy
+}
+
+func TestMatchGCPRequests(t *testing.T) {
+	mkReq := func(url string) *http.Request {
+		request, err := http.NewRequest("GET", url, nil)
+		require.NoError(t, err)
+		return request
+	}
+
+	tests := []struct {
+		name string
+		req  *http.Request
+		want bool
+	}{
+		{
+			name: "non gcp, no port",
+			req:  mkReq("https://localhost/foo/bar"),
+			want: false,
+		},
+		{
+			name: "non gcp, port",
+			req:  mkReq("https://localhost:8080/foo/bar"),
+			want: false,
+		},
+		{
+			name: "non gcp, port, http",
+			req:  mkReq("http://localhost:1234/foo/bar"),
+			want: false,
+		},
+		{
+			name: "non gcp, port, no schema",
+			req:  mkReq("localhost:1234/foo/bar"),
+			want: false,
+		},
+
+		{
+			name: "gcp, no port",
+			req:  mkReq("https://compute.googleapis.com/foo/bar"),
+			want: true,
+		},
+		{
+			name: "gcp, port",
+			req:  mkReq("https://compute.googleapis.com:8080/foo/bar"),
+			want: true,
+		},
+		{
+			name: "gcp, port, http",
+			req:  mkReq("http://compute.googleapis.com:1234/foo/bar"),
+			want: true,
+		},
+
+		// NOTE: we only want to match XXX.googleapis.com.
+		{
+			name: "top level gcp, no port",
+			req:  mkReq("https://googleapis.com/foo/bar"),
+			want: false,
+		},
+		{
+			name: "top level gcp, port",
+			req:  mkReq("https://googleapis.com:8080/foo/bar"),
+			want: false,
+		},
+		{
+			name: "top level gcp, port, http",
+			req:  mkReq("http://googleapis.com:1234/foo/bar"),
+			want: false,
+		},
+
+		{
+			name: "fake gcp, no port",
+			req:  mkReq("https://compute.googleapis.com.fake.com/foo/bar"),
+			want: false,
+		},
+		{
+			name: "fake gcp, port",
+			req:  mkReq("https://compute.googleapis.com.fake.com:8080/foo/bar"),
+			want: false,
+		},
+		{
+			name: "fake gcp, port, http",
+			req:  mkReq("http://compute.googleapis.com.fake.com:1234/foo/bar"),
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.want, MatchGCPRequests(tt.req))
+		})
+	}
+}
+
+func TestMatchAWSRequests(t *testing.T) {
+	makeRequest := func(url string) *http.Request {
+		// Forward proxy always receives CONNECT requests.
+		request, err := http.NewRequest("CONNECT", url, nil)
+		require.NoError(t, err)
+		return request
+	}
+	tests := []struct {
+		name  string
+		req   *http.Request
+		check require.BoolAssertionFunc
+	}{
+		{
+			name:  "AWS request",
+			req:   makeRequest("http://s3.ca-central-1.amazonaws.com"),
+			check: require.True,
+		},
+		{
+			name:  "non-AWS request",
+			req:   makeRequest("https://registry.terraform.io"),
+			check: require.False,
+		},
+		{
+			name:  "SSM API",
+			req:   makeRequest("https://ssm.ca-central-1.amazonaws.com"),
+			check: require.True,
+		},
+		{
+			name:  "SSM session WebSocket",
+			req:   makeRequest("wss://ssmmessages.ca-central-1.amazonaws.com"),
+			check: require.False,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.check(t, MatchAWSRequests(tt.req))
+		})
+	}
 }

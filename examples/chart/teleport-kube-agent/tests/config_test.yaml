@@ -150,6 +150,26 @@ tests:
           of: ConfigMap
       - matchSnapshot: {}
 
+  - it: matches snapshot for jamf-service.yaml
+    values:
+      - ../.lint/jamf-service.yaml
+    asserts:
+      - hasDocuments:
+          count: 1
+      - isKind:
+          of: ConfigMap
+      - matchSnapshot: {}
+
+  - it: matches snapshot for jamf-service-existing-secret.yaml
+    values:
+      - ../.lint/jamf-service-existing-secret.yaml
+    asserts:
+      - hasDocuments:
+          count: 1
+      - isKind:
+          of: ConfigMap
+      - matchSnapshot: {}
+
   - it: matches snapshot for join-params-iam.yaml
     values:
       - ../.lint/join-params-iam.yaml
@@ -283,6 +303,26 @@ tests:
   - it: matches snapshot for v11.yaml
     values:
       - ../.lint/v11.yaml
+    asserts:
+      - hasDocuments:
+          count: 1
+      - isKind:
+          of: ConfigMap
+      - matchSnapshot: {}
+
+  - it: matches snapshot for app-discovery-minimal.yaml
+    values:
+      - ../.lint/app-discovery-minimal.yaml
+    asserts:
+      - hasDocuments:
+          count: 1
+      - isKind:
+          of: ConfigMap
+      - matchSnapshot: {}
+
+  - it: matches snapshot for app-discovery-full.yaml
+    values:
+      - ../.lint/app-discovery-full.yaml
     asserts:
       - hasDocuments:
           count: 1

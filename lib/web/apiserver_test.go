@@ -1,18 +1,20 @@
 /*
-Copyright 2015-2020 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package web
 
@@ -25,15 +27,13 @@ import (
 	"crypto"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/base32"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
-	"encoding/pem"
 	"errors"
 	"fmt"
-	"image"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/cookiejar"
@@ -42,37 +42,38 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
+	"github.com/coreos/go-semver/semver"
 	"github.com/gogo/protobuf/proto"
 	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/gravitational/roundtrip"
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
 	"github.com/julienschmidt/httprouter"
-	lemma_secret "github.com/mailgun/lemma/secret"
 	"github.com/pquerna/otp/totp"
-	"github.com/sirupsen/logrus"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	commonv1 "go.opentelemetry.io/proto/otlp/common/v1"
 	resourcev1 "go.opentelemetry.io/proto/otlp/resource/v1"
-	otlp "go.opentelemetry.io/proto/otlp/trace/v1"
 	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
 	"golang.org/x/crypto/ssh"
-	"golang.org/x/exp/slices"
-	"golang.org/x/text/encoding/unicode"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/testing/protocmp"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
+	"k8s.io/apimachinery/pkg/util/yaml"
 	authztypes "k8s.io/client-go/kubernetes/typed/authorization/v1"
 	"k8s.io/client-go/tools/clientcmd"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
@@ -80,45 +81,71 @@ import (
 	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/api/breaker"
 	authproto "github.com/gravitational/teleport/api/client/proto"
+	clientproto "github.com/gravitational/teleport/api/client/proto"
 	"github.com/gravitational/teleport/api/client/webclient"
 	"github.com/gravitational/teleport/api/constants"
 	apidefaults "github.com/gravitational/teleport/api/defaults"
+	devicepb "github.com/gravitational/teleport/api/gen/proto/go/teleport/devicetrust/v1"
+	kubeproto "github.com/gravitational/teleport/api/gen/proto/go/teleport/kube/v1"
+	mfav1 "github.com/gravitational/teleport/api/gen/proto/go/teleport/mfa/v1"
+	transportpb "github.com/gravitational/teleport/api/gen/proto/go/teleport/transport/v1"
+	"github.com/gravitational/teleport/api/mfa"
 	"github.com/gravitational/teleport/api/types"
 	apievents "github.com/gravitational/teleport/api/types/events"
 	apiutils "github.com/gravitational/teleport/api/utils"
+	"github.com/gravitational/teleport/api/utils/grpc/interceptors"
 	"github.com/gravitational/teleport/api/utils/keys"
+	apisshutils "github.com/gravitational/teleport/api/utils/sshutils"
+	"github.com/gravitational/teleport/entitlements"
+	"github.com/gravitational/teleport/lib"
+	"github.com/gravitational/teleport/lib/agentless"
 	"github.com/gravitational/teleport/lib/auth"
+	"github.com/gravitational/teleport/lib/auth/authclient"
 	tlsutils "github.com/gravitational/teleport/lib/auth/keygen"
 	"github.com/gravitational/teleport/lib/auth/mocku2f"
-	"github.com/gravitational/teleport/lib/auth/native"
+	"github.com/gravitational/teleport/lib/auth/state"
 	"github.com/gravitational/teleport/lib/auth/testauthority"
-	wanlib "github.com/gravitational/teleport/lib/auth/webauthn"
+	wantypes "github.com/gravitational/teleport/lib/auth/webauthntypes"
+	"github.com/gravitational/teleport/lib/authz"
+	"github.com/gravitational/teleport/lib/automaticupgrades"
 	"github.com/gravitational/teleport/lib/bpf"
 	"github.com/gravitational/teleport/lib/client"
 	"github.com/gravitational/teleport/lib/client/conntest"
+	dbrepl "github.com/gravitational/teleport/lib/client/db/repl"
+	"github.com/gravitational/teleport/lib/cryptosuites"
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/events"
+	"github.com/gravitational/teleport/lib/events/eventstest"
 	"github.com/gravitational/teleport/lib/httplib"
 	"github.com/gravitational/teleport/lib/httplib/csrf"
+	"github.com/gravitational/teleport/lib/inventory"
 	kubeproxy "github.com/gravitational/teleport/lib/kube/proxy"
 	"github.com/gravitational/teleport/lib/limiter"
 	"github.com/gravitational/teleport/lib/modules"
+	"github.com/gravitational/teleport/lib/multiplexer"
 	"github.com/gravitational/teleport/lib/observability/tracing"
-	"github.com/gravitational/teleport/lib/pam"
+	"github.com/gravitational/teleport/lib/player"
 	"github.com/gravitational/teleport/lib/proxy"
-	restricted "github.com/gravitational/teleport/lib/restrictedsession"
 	"github.com/gravitational/teleport/lib/reversetunnel"
+	"github.com/gravitational/teleport/lib/reversetunnelclient"
 	"github.com/gravitational/teleport/lib/secret"
+	"github.com/gravitational/teleport/lib/service/servicecfg"
 	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/session"
 	"github.com/gravitational/teleport/lib/srv"
 	"github.com/gravitational/teleport/lib/srv/desktop"
 	"github.com/gravitational/teleport/lib/srv/desktop/tdp"
 	"github.com/gravitational/teleport/lib/srv/regular"
+	"github.com/gravitational/teleport/lib/srv/transport/transportv1"
 	"github.com/gravitational/teleport/lib/sshutils"
 	"github.com/gravitational/teleport/lib/tlsca"
+	"github.com/gravitational/teleport/lib/ui"
 	"github.com/gravitational/teleport/lib/utils"
-	"github.com/gravitational/teleport/lib/web/ui"
+	utilsaws "github.com/gravitational/teleport/lib/utils/aws"
+	"github.com/gravitational/teleport/lib/web/app"
+	websession "github.com/gravitational/teleport/lib/web/session"
+	"github.com/gravitational/teleport/lib/web/terminal"
+	webui "github.com/gravitational/teleport/lib/web/ui"
 )
 
 const hostID = "00000000-0000-0000-0000-000000000000"
@@ -129,7 +156,7 @@ type WebSuite struct {
 
 	node        *regular.Server
 	proxy       *regular.Server
-	proxyTunnel reversetunnel.Server
+	proxyTunnel reversetunnelclient.Server
 	srvID       string
 
 	user       string
@@ -138,21 +165,22 @@ type WebSuite struct {
 
 	mockU2F     *mocku2f.Key
 	server      *auth.TestServer
-	proxyClient *auth.Client
-	clock       clockwork.FakeClock
+	proxyClient *authclient.Client
+	clock       *clockwork.FakeClock
 }
 
 // TestMain will re-execute Teleport to run a command if "exec" is passed to
 // it as an argument. Otherwise, it will run tests as normal.
 func TestMain(m *testing.M) {
 	utils.InitLoggerForTests()
+	modules.SetInsecureTestMode(true)
 	// If the test is re-executing itself, execute the command that comes over
 	// the pipe.
 	if srv.IsReexec() {
 		srv.RunAndExit(os.Args[1])
 		return
 	}
-	native.PrecomputeTestKeys(m)
+	cryptosuites.PrecomputeRSATestKeys(m)
 
 	// Otherwise run tests as normal.
 	code := m.Run()
@@ -166,6 +194,26 @@ func newWebSuite(t *testing.T) *WebSuite {
 type webSuiteConfig struct {
 	// AuthPreferenceSpec is custom initial AuthPreference spec for the test.
 	authPreferenceSpec *types.AuthPreferenceSpecV2
+
+	disableDiskBasedRecording bool
+
+	uiConfig webclient.UIConfig
+
+	// Custom "HealthCheckAppServer" function. Can be used to avoid dialing app
+	// services.
+	HealthCheckAppServer healthCheckAppServerFunc
+
+	// ClusterFeatures allows overriding default auth server features
+	ClusterFeatures *authproto.Features
+
+	// presenceChecker executes presence prompts for tests
+	presenceChecker PresenceChecker
+
+	// clock to use for all server components
+	clock *clockwork.FakeClock
+
+	// databaseREPLGetter allows setting custom database REPLs.
+	databaseREPLGetter dbrepl.REPLRegistry
 }
 
 func newWebSuiteWithConfig(t *testing.T, cfg webSuiteConfig) *WebSuite {
@@ -176,10 +224,14 @@ func newWebSuiteWithConfig(t *testing.T, cfg webSuiteConfig) *WebSuite {
 	u, err := user.Current()
 	require.NoError(t, err)
 
+	if cfg.clock == nil {
+		cfg.clock = clockwork.NewFakeClock()
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &WebSuite{
 		mockU2F: mockU2F,
-		clock:   clockwork.NewFakeClock(),
+		clock:   cfg.clock,
 		user:    u.Username,
 		ctx:     ctx,
 		cancel:  cancel,
@@ -190,7 +242,7 @@ func newWebSuiteWithConfig(t *testing.T, cfg webSuiteConfig) *WebSuite {
 	})
 	require.NoError(t, err)
 
-	s.server, err = auth.NewTestServer(auth.TestServerConfig{
+	authCfg := auth.TestServerConfig{
 		Auth: auth.TestAuthServerConfig{
 			ClusterName:             "localhost",
 			Dir:                     t.TempDir(),
@@ -198,12 +250,27 @@ func newWebSuiteWithConfig(t *testing.T, cfg webSuiteConfig) *WebSuite {
 			ClusterNetworkingConfig: networkingConfig,
 			AuthPreferenceSpec:      cfg.authPreferenceSpec,
 		},
-	})
+	}
+
+	if cfg.disableDiskBasedRecording {
+		authCfg.Auth.AuditLog = events.NewDiscardAuditLog()
+	}
+
+	s.server, err = auth.NewTestServer(authCfg)
 	require.NoError(t, err)
+
+	if cfg.disableDiskBasedRecording {
+		// use a sync recording mode because the disk-based uploader
+		// that runs in the background introduces races with test cleanup
+		recConfig := types.DefaultSessionRecordingConfig()
+		recConfig.SetMode(types.RecordAtNodeSync)
+		_, err := s.server.AuthServer.AuthServer.UpsertSessionRecordingConfig(context.Background(), recConfig)
+		require.NoError(t, err)
+	}
 
 	// Register the auth server, since test auth server doesn't start its own
 	// heartbeat.
-	err = s.server.Auth().UpsertAuthServer(&types.ServerV2{
+	err = s.server.Auth().UpsertAuthServer(ctx, &types.ServerV2{
 		Kind:    types.KindAuthServer,
 		Version: types.V2,
 		Metadata: types.Metadata{
@@ -241,7 +308,7 @@ func newWebSuiteWithConfig(t *testing.T, cfg webSuiteConfig) *WebSuite {
 	require.NoError(t, err)
 
 	nodeClient, err := s.server.NewClient(auth.TestIdentity{
-		I: auth.BuiltinRole{
+		I: authz.BuiltinRole{
 			Role:     types.RoleNode,
 			Username: nodeID,
 		},
@@ -272,7 +339,7 @@ func newWebSuiteWithConfig(t *testing.T, cfg webSuiteConfig) *WebSuite {
 		ctx,
 		utils.NetAddr{AddrNetwork: "tcp", Addr: "127.0.0.1:0"},
 		nodeID,
-		[]ssh.Signer{signer},
+		sshutils.StaticHostSigners(signer),
 		nodeClient,
 		nodeDataDir,
 		"",
@@ -280,11 +347,9 @@ func newWebSuiteWithConfig(t *testing.T, cfg webSuiteConfig) *WebSuite {
 		nodeClient,
 		regular.SetUUID(nodeID),
 		regular.SetNamespace(apidefaults.Namespace),
-		regular.SetShell("/bin/sh"),
 		regular.SetEmitter(nodeClient),
-		regular.SetPAMConfig(&pam.Config{Enabled: false}),
+		regular.SetPAMConfig(&servicecfg.PAMConfig{Enabled: false}),
 		regular.SetBPF(&bpf.NOP{}),
-		regular.SetRestrictedSessionManager(&restricted.NOP{}),
 		regular.SetClock(s.clock),
 		regular.SetLockWatcher(nodeLockWatcher),
 		regular.SetSessionController(nodeSessionController),
@@ -297,7 +362,7 @@ func newWebSuiteWithConfig(t *testing.T, cfg webSuiteConfig) *WebSuite {
 	// create reverse tunnel service:
 	proxyID := "proxy"
 	s.proxyClient, err = s.server.NewClient(auth.TestIdentity{
-		I: auth.BuiltinRole{
+		I: authz.BuiltinRole{
 			Role:     types.RoleProxy,
 			Username: proxyID,
 		},
@@ -320,6 +385,7 @@ func newWebSuiteWithConfig(t *testing.T, cfg webSuiteConfig) *WebSuite {
 			Component: teleport.ComponentProxy,
 			Client:    s.proxyClient,
 		},
+		NodesGetter: s.proxyClient,
 	})
 	require.NoError(t, err)
 
@@ -333,12 +399,24 @@ func newWebSuiteWithConfig(t *testing.T, cfg webSuiteConfig) *WebSuite {
 	require.NoError(t, err)
 	defer caWatcher.Close()
 
+	proxyGitServerWatcher, err := services.NewGitServerWatcher(ctx, services.GitServerWatcherConfig{
+		ResourceWatcherConfig: services.ResourceWatcherConfig{
+			Component: teleport.ComponentProxy,
+			Client:    s.proxyClient,
+		},
+		GitServerGetter: s.proxyClient.GitServerReadOnlyClient(),
+	})
+	require.NoError(t, err)
+	t.Cleanup(proxyGitServerWatcher.Close)
+
 	revTunServer, err := reversetunnel.NewServer(reversetunnel.Config{
-		ID:                    node.ID(),
-		Listener:              revTunListener,
-		ClientTLS:             s.proxyClient.TLSConfig(),
+		ID:       node.ID(),
+		Listener: revTunListener,
+		GetClientTLSCertificate: func() (*tls.Certificate, error) {
+			return &s.proxyClient.TLSConfig().Certificates[0], nil
+		},
 		ClusterName:           s.server.ClusterName(),
-		HostSigners:           []ssh.Signer{signer},
+		GetHostSigners:        sshutils.StaticHostSigners(signer),
 		LocalAuthClient:       s.proxyClient,
 		LocalAccessPoint:      s.proxyClient,
 		Emitter:               s.proxyClient,
@@ -346,6 +424,7 @@ func newWebSuiteWithConfig(t *testing.T, cfg webSuiteConfig) *WebSuite {
 		DataDir:               t.TempDir(),
 		LockWatcher:           proxyLockWatcher,
 		NodeWatcher:           proxyNodeWatcher,
+		GitServerWatcher:      proxyGitServerWatcher,
 		CertAuthorityWatcher:  caWatcher,
 		CircuitBreakerConfig:  breaker.NoopBreakerConfig(),
 		LocalAuthAddresses:    []string{s.server.TLS.Listener.Addr().String()},
@@ -355,11 +434,10 @@ func newWebSuiteWithConfig(t *testing.T, cfg webSuiteConfig) *WebSuite {
 	s.proxyTunnel = revTunServer
 
 	router, err := proxy.NewRouter(proxy.RouterConfig{
-		ClusterName:         s.server.ClusterName(),
-		Log:                 utils.NewLoggerForTests().WithField(trace.Component, "test"),
-		RemoteClusterGetter: s.proxyClient,
-		SiteGetter:          revTunServer,
-		TracerProvider:      tracing.NoopProvider(),
+		ClusterName:      s.server.ClusterName(),
+		LocalAccessPoint: s.proxyClient,
+		SiteGetter:       revTunServer,
+		TracerProvider:   tracing.NoopProvider(),
 	})
 	require.NoError(t, err)
 
@@ -378,7 +456,7 @@ func newWebSuiteWithConfig(t *testing.T, cfg webSuiteConfig) *WebSuite {
 		ctx,
 		utils.NetAddr{AddrNetwork: "tcp", Addr: "127.0.0.1:0"},
 		s.server.ClusterName(),
-		[]ssh.Signer{signer},
+		sshutils.StaticHostSigners(signer),
 		s.proxyClient,
 		t.TempDir(),
 		"",
@@ -389,24 +467,35 @@ func newWebSuiteWithConfig(t *testing.T, cfg webSuiteConfig) *WebSuite {
 		regular.SetEmitter(s.proxyClient),
 		regular.SetNamespace(apidefaults.Namespace),
 		regular.SetBPF(&bpf.NOP{}),
-		regular.SetRestrictedSessionManager(&restricted.NOP{}),
 		regular.SetClock(s.clock),
 		regular.SetLockWatcher(proxyLockWatcher),
-		regular.SetNodeWatcher(proxyNodeWatcher),
 		regular.SetSessionController(proxySessionController),
 	)
 	require.NoError(t, err)
 
 	// Expired sessions are purged immediately
 	var sessionLingeringThreshold time.Duration
-	fs, err := NewDebugFileSystem("../../webassets/teleport")
+	fs, err := NewDebugFileSystem(false)
 	require.NoError(t, err)
 
-	handler, err := NewHandler(Config{
-		ClusterFeatures:                 *modules.GetModules().Features().ToProto(), // safe to dereference because ToProto creates a struct and return a pointer to it
+	features := *modules.GetModules().Features().ToProto() // safe to dereference because ToProto creates a struct and return a pointer to it
+	if cfg.ClusterFeatures != nil {
+		features = *cfg.ClusterFeatures
+	}
+	authID := state.IdentityID{
+		Role:     types.RoleProxy,
+		HostUUID: proxyID,
+	}
+	dns := []string{"localhost", "127.0.0.1"}
+	proxyIdentity, err := auth.LocalRegister(authID, s.server.Auth(), nil, dns, "", nil)
+	require.NoError(t, err)
+	proxyClientCert, err := keys.X509KeyPair(proxyIdentity.TLSCertBytes, proxyIdentity.KeyBytes)
+	require.NoError(t, err)
+
+	handlerConfig := Config{
+		ClusterFeatures:                 features,
 		Proxy:                           revTunServer,
 		AuthServers:                     utils.FromAddr(s.server.TLS.Addr()),
-		DomainName:                      s.server.ClusterName(),
 		ProxyClient:                     s.proxyClient,
 		CipherSuites:                    utils.DefaultCipherSuites(),
 		AccessPoint:                     s.proxyClient,
@@ -415,10 +504,32 @@ func newWebSuiteWithConfig(t *testing.T, cfg webSuiteConfig) *WebSuite {
 		Emitter:                         s.proxyClient,
 		StaticFS:                        fs,
 		CachedSessionLingeringThreshold: &sessionLingeringThreshold,
-		ProxySettings:                   &mockProxySettings{},
-		SessionControl:                  proxySessionController,
-		Router:                          router,
-	}, SetSessionStreamPollPeriod(200*time.Millisecond), SetClock(s.clock))
+		ProxySettings: &ProxySettings{
+			ServiceConfig: servicecfg.MakeDefaultConfig(),
+			ProxySSHAddr:  "127.0.0.1",
+			AccessPoint:   s.server.Auth(),
+		},
+		SessionControl: SessionControllerFunc(func(ctx context.Context, sctx *SessionContext, login, localAddr, remoteAddr string) (context.Context, error) {
+			controller := srv.WebSessionController(proxySessionController)
+			ctx, err := controller(ctx, sctx, login, localAddr, remoteAddr)
+			return ctx, trace.Wrap(err)
+		}),
+		Router:               router,
+		HealthCheckAppServer: cfg.HealthCheckAppServer,
+		UI:                   cfg.uiConfig,
+		PresenceChecker:      cfg.presenceChecker,
+		GetProxyClientCertificate: func() (*tls.Certificate, error) {
+			return &proxyClientCert, nil
+		},
+		IntegrationAppHandler: &mockIntegrationAppHandler{},
+		DatabaseREPLRegistry:  cfg.databaseREPLGetter,
+	}
+
+	if handlerConfig.HealthCheckAppServer == nil {
+		handlerConfig.HealthCheckAppServer = func(context.Context, string, string) error { return nil }
+	}
+
+	handler, err := NewHandler(handlerConfig, SetClock(s.clock))
 	require.NoError(t, err)
 
 	s.webServer = httptest.NewUnstartedServer(handler)
@@ -496,7 +607,7 @@ func (s *WebSuite) addNode(t *testing.T, uuid string, hostname string, address s
 	require.NoError(t, err)
 
 	nodeClient, err := s.server.NewClient(auth.TestIdentity{
-		I: auth.BuiltinRole{
+		I: authz.BuiltinRole{
 			Role:     types.RoleNode,
 			Username: uuid,
 		},
@@ -526,7 +637,7 @@ func (s *WebSuite) addNode(t *testing.T, uuid string, hostname string, address s
 		context.Background(),
 		utils.NetAddr{AddrNetwork: "tcp", Addr: address},
 		hostname,
-		[]ssh.Signer{signer},
+		sshutils.StaticHostSigners(signer),
 		nodeClient,
 		t.TempDir(),
 		"",
@@ -534,11 +645,9 @@ func (s *WebSuite) addNode(t *testing.T, uuid string, hostname string, address s
 		nodeClient,
 		regular.SetUUID(uuid),
 		regular.SetNamespace(apidefaults.Namespace),
-		regular.SetShell("/bin/sh"),
 		regular.SetEmitter(nodeClient),
-		regular.SetPAMConfig(&pam.Config{Enabled: false}),
+		regular.SetPAMConfig(&servicecfg.PAMConfig{Enabled: false}),
 		regular.SetBPF(&bpf.NOP{}),
-		regular.SetRestrictedSessionManager(&restricted.NOP{}),
 		regular.SetClock(s.clock),
 		regular.SetLockWatcher(nodeLockWatcher),
 		regular.SetSessionController(nodeSessionController),
@@ -554,12 +663,12 @@ func (s *WebSuite) addNode(t *testing.T, uuid string, hostname string, address s
 	return node
 }
 
-func noCache(clt auth.ClientI, cacheName []string) (auth.RemoteProxyAccessPoint, error) {
+func noCache(clt authclient.ClientI, cacheName []string) (authclient.RemoteProxyAccessPoint, error) {
 	return clt, nil
 }
 
 func (r *authPack) renewSession(ctx context.Context, t *testing.T) *roundtrip.Response {
-	resp, err := r.clt.PostJSON(ctx, r.clt.Endpoint("webapi", "sessions", "renew"), nil)
+	resp, err := r.clt.PostJSON(ctx, r.clt.Endpoint("webapi", "sessions", "web", "renew"), nil)
 	require.NoError(t, err)
 	return resp
 }
@@ -577,64 +686,135 @@ type authPack struct {
 	session   *CreateSessionResponse
 	clt       *TestWebClient
 	cookies   []*http.Cookie
+	device    *auth.TestDevice
 }
 
 // authPack returns new authenticated package consisting of created valid
 // user, otp token, created web session and authenticated client.
-func (s *WebSuite) authPack(t *testing.T, user string) *authPack {
+func (s *WebSuite) authPack(t *testing.T, user string, roles ...string) *authPack {
 	login := s.user
-	pass := "abc123"
-	rawSecret := "def456"
-	otpSecret := base32.StdEncoding.EncodeToString([]byte(rawSecret))
+	pass := "abcdef123456"
+	otpSecret := newOTPSharedSecret()
 
 	ap, err := types.NewAuthPreference(types.AuthPreferenceSpecV2{
 		Type:         constants.Local,
 		SecondFactor: constants.SecondFactorOTP,
 	})
 	require.NoError(t, err)
-	err = s.server.Auth().SetAuthPreference(s.ctx, ap)
+	_, err = s.server.Auth().UpsertAuthPreference(s.ctx, ap)
 	require.NoError(t, err)
 
-	s.createUser(t, user, login, pass, otpSecret)
+	s.createUser(t, user, login, pass, otpSecret, roles...)
 
-	// create a valid otp token
-	validToken, err := totp.GenerateCode(otpSecret, s.clock.Now())
-	require.NoError(t, err)
-
-	clt := s.client(t)
-	req := CreateSessionReq{
-		User:              user,
-		Pass:              pass,
-		SecondFactorToken: validToken,
-	}
-
-	csrfToken := "2ebcb768d0090ea4368e42880c970b61865c326172a4a2343b645cf5d7f20992"
-	re, err := s.login(clt, csrfToken, csrfToken, req)
-	require.NoError(t, err)
-
-	var rawSess *CreateSessionResponse
-	require.NoError(t, json.Unmarshal(re.Bytes(), &rawSess))
-
-	sess, err := rawSess.response()
-	require.NoError(t, err)
+	ctx := context.Background()
+	sessionResp, httpResp := loginWebOTP(t, ctx, loginWebOTPParams{
+		webClient: s.client(t),
+		clock:     s.clock,
+		user:      user,
+		password:  pass,
+		otpSecret: otpSecret,
+	})
 
 	jar, err := cookiejar.New(nil)
 	require.NoError(t, err)
 
-	clt = s.client(t, roundtrip.BearerAuth(sess.Token), roundtrip.CookieJar(jar))
-	jar.SetCookies(s.url(), re.Cookies())
+	clt := s.client(t, roundtrip.BearerAuth(sessionResp.Token), roundtrip.CookieJar(jar))
+	jar.SetCookies(s.url(), httpResp.Cookies())
 
 	return &authPack{
 		otpSecret: otpSecret,
 		user:      user,
 		login:     login,
-		session:   sess,
+		session:   sessionResp,
 		clt:       clt,
-		cookies:   re.Cookies(),
+		cookies:   httpResp.Cookies(),
 	}
 }
 
-func (s *WebSuite) createUser(t *testing.T, user string, login string, pass string, otpSecret string) {
+func (s *WebSuite) authPackWithMFA(t *testing.T, name string, roles ...types.Role) *authPack {
+	const password = "testing12345"
+	user, err := types.NewUser(name)
+	require.NoError(t, err)
+
+	userRole := services.RoleForUser(user)
+	userRole.SetLogins(types.Allow, []string{s.user})
+	userRole, err = s.server.Auth().UpsertRole(s.ctx, userRole)
+	require.NoError(t, err)
+
+	for _, role := range roles {
+		role, err = s.server.Auth().UpsertRole(s.ctx, role)
+		require.NoError(t, err)
+		user.AddRole(role.GetName())
+	}
+
+	user.AddRole(userRole.GetName())
+	_, err = s.server.Auth().CreateUser(s.ctx, user)
+	require.NoError(t, err)
+
+	clt := s.client(t)
+
+	// create register challenge
+	token, err := s.server.Auth().CreateResetPasswordToken(s.ctx, authclient.CreateUserTokenRequest{
+		Name: name,
+	})
+	require.NoError(t, err)
+
+	res, err := s.server.Auth().CreateRegisterChallenge(s.ctx, &authproto.CreateRegisterChallengeRequest{
+		TokenID:     token.GetName(),
+		DeviceType:  authproto.DeviceType_DEVICE_TYPE_WEBAUTHN,
+		DeviceUsage: authproto.DeviceUsage_DEVICE_USAGE_PASSWORDLESS,
+	})
+	require.NoError(t, err)
+
+	cc := wantypes.CredentialCreationFromProto(res.GetWebauthn())
+
+	// use passwordless as auth method
+	device, err := mocku2f.Create()
+	require.NoError(t, err)
+
+	device.SetPasswordless()
+
+	const rpID = "localhost"
+	ccr, err := device.SignCredentialCreation("https://"+rpID, cc)
+	require.NoError(t, err)
+
+	_, err = s.server.Auth().ChangeUserAuthentication(s.ctx, &authproto.ChangeUserAuthenticationRequest{
+		TokenID:     token.GetName(),
+		NewPassword: []byte(password),
+		NewMFARegisterResponse: &authproto.MFARegisterResponse{
+			Response: &authproto.MFARegisterResponse_Webauthn{
+				Webauthn: wantypes.CredentialCreationResponseToProto(ccr),
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	sessionResp, httpResp := loginWebMFA(ctx, t, loginWebMFAParams{
+		webClient:     clt,
+		rpID:          rpID,
+		user:          name,
+		password:      password,
+		authenticator: device,
+	})
+
+	jar, err := cookiejar.New(nil)
+	require.NoError(t, err)
+
+	clt = s.client(t, roundtrip.BearerAuth(sessionResp.Token), roundtrip.CookieJar(jar))
+	jar.SetCookies(s.url(), httpResp.Cookies())
+
+	return &authPack{
+		user:    name,
+		login:   s.user,
+		session: sessionResp,
+		clt:     clt,
+		cookies: httpResp.Cookies(),
+		device:  &auth.TestDevice{Key: device},
+	}
+}
+
+func (s *WebSuite) createUser(t *testing.T, user string, login string, pass string, otpSecret string, roles ...string) {
 	teleUser, err := types.NewUser(user)
 	require.NoError(t, err)
 	role := services.RoleForUser(teleUser)
@@ -642,14 +822,18 @@ func (s *WebSuite) createUser(t *testing.T, user string, login string, pass stri
 	options := role.GetOptions()
 	options.ForwardAgent = types.NewBool(true)
 	role.SetOptions(options)
-	err = s.server.Auth().UpsertRole(s.ctx, role)
+	role, err = s.server.Auth().UpsertRole(s.ctx, role)
 	require.NoError(t, err)
 	teleUser.AddRole(role.GetName())
+
+	for _, r := range roles {
+		teleUser.AddRole(r)
+	}
 
 	teleUser.SetCreatedBy(types.CreatedBy{
 		User: types.UserRef{Name: "some-auth-user"},
 	})
-	err = s.server.Auth().CreateUser(s.ctx, teleUser)
+	_, err = s.server.Auth().CreateUser(s.ctx, teleUser)
 	require.NoError(t, err)
 
 	err = s.server.Auth().UpsertPassword(user, []byte(pass))
@@ -735,7 +919,7 @@ func Test_clientMetaFromReq(t *testing.T) {
 	r.Header.Set("User-Agent", ua)
 
 	got := clientMetaFromReq(r)
-	require.Equal(t, &auth.ForwardedClientMetadata{
+	require.Equal(t, &authclient.ForwardedClientMetadata{
 		UserAgent:  ua,
 		RemoteAddr: "192.0.2.1:1234",
 	}, got)
@@ -750,13 +934,13 @@ func TestWebSessionsCRUD(t *testing.T) {
 	re, err := pack.clt.Get(context.Background(), pack.clt.Endpoint("webapi", "sites"), url.Values{})
 	require.NoError(t, err)
 
-	var clusters []ui.Cluster
+	var clusters []webui.Cluster
 	require.NoError(t, json.Unmarshal(re.Bytes(), &clusters))
 
 	// now delete session
 	_, err = pack.clt.Delete(
 		context.Background(),
-		pack.clt.Endpoint("webapi", "sessions"))
+		pack.clt.Endpoint("webapi", "sessions", "web"))
 	require.NoError(t, err)
 
 	// subsequent requests trying to use this session will fail
@@ -768,47 +952,32 @@ func TestWebSessionsCRUD(t *testing.T) {
 func TestCSRF(t *testing.T) {
 	t.Parallel()
 	s := newWebSuite(t)
-	type input struct {
-		reqToken    string
-		cookieToken string
-	}
 
 	// create a valid user
 	user := "csrfuser"
-	pass := "abc123"
-	otpSecret := base32.StdEncoding.EncodeToString([]byte("def456"))
+	pass := "abcdef123456"
+	otpSecret := newOTPSharedSecret()
 	s.createUser(t, user, user, pass, otpSecret)
 
-	// create a valid login form request
-	validToken, err := totp.GenerateCode(otpSecret, time.Now())
-	require.NoError(t, err)
-	loginForm := CreateSessionReq{
-		User:              user,
-		Pass:              pass,
-		SecondFactorToken: validToken,
-	}
-
-	encodedToken1 := "2ebcb768d0090ea4368e42880c970b61865c326172a4a2343b645cf5d7f20992"
-	encodedToken2 := "bf355921bbf3ef3672a03e410d4194077dfa5fe863c652521763b3e7f81e7b11"
-	invalid := []input{
-		{reqToken: encodedToken2, cookieToken: encodedToken1},
-		{reqToken: "", cookieToken: encodedToken1},
-		{reqToken: "", cookieToken: ""},
-		{reqToken: encodedToken1, cookieToken: ""},
-	}
-
 	clt := s.client(t)
+	ctx := context.Background()
 
 	// valid
-	_, err = s.login(clt, encodedToken1, encodedToken1, loginForm)
-	require.NoError(t, err)
-
-	// invalid
-	for i := range invalid {
-		_, err := s.login(clt, invalid[i].cookieToken, invalid[i].reqToken, loginForm)
-		require.Error(t, err)
-		require.True(t, trace.IsAccessDenied(err))
+	validReq := loginWebOTPParams{
+		webClient: clt,
+		clock:     s.clock,
+		user:      user,
+		password:  pass,
+		otpSecret: otpSecret,
 	}
+	loginWebOTP(t, ctx, validReq)
+
+	// invalid - wrong content-type header
+	invalidReq := validReq
+	invalidReq.overrideContentType = "multipart/form-data"
+	httpResp, _, err := rawLoginWebOTP(ctx, invalidReq)
+	require.NoError(t, err, "Login via /webapi/sessions/new failed unexpectedly")
+	require.Equal(t, http.StatusBadRequest, httpResp.StatusCode, "HTTP status code mismatch")
 }
 
 func TestPasswordChange(t *testing.T) {
@@ -822,8 +991,8 @@ func TestPasswordChange(t *testing.T) {
 	require.NoError(t, err)
 
 	req := changePasswordReq{
-		OldPassword:       []byte("abc123"),
-		NewPassword:       []byte("abc1234"),
+		OldPassword:       []byte("abcdef123456"),
+		NewPassword:       []byte("fedcba654321"),
 		SecondFactorToken: validToken,
 	}
 
@@ -856,69 +1025,106 @@ func TestValidateBearerToken(t *testing.T) {
 func TestWebSessionsBadInput(t *testing.T) {
 	t.Parallel()
 	s := newWebSuite(t)
-	user := "bob"
-	pass := "abc123"
-	rawSecret := "def456"
-	otpSecret := base32.StdEncoding.EncodeToString([]byte(rawSecret))
 
-	err := s.server.Auth().UpsertPassword(user, []byte(pass))
+	authServer := s.server.Auth()
+	clock := s.clock
+	ctx := context.Background()
+
+	authPref, err := types.NewAuthPreference(types.AuthPreferenceSpecV2{
+		Type:         constants.Local,
+		SecondFactor: constants.SecondFactorOTP,
+	})
+	require.NoError(t, err, "NewAuthPreference failed")
+	_, err = authServer.UpsertAuthPreference(ctx, authPref)
+	require.NoError(t, err, "UpsertAuthPreference failed")
+
+	const user = "bob"
+	const pass = "abcdef123456"
+	otpSecret := newOTPSharedSecret()
+	badSecret := newOTPSharedSecret()
+
+	u, err := types.NewUser(user)
+	require.NoError(t, err)
+	_, err = authServer.CreateUser(ctx, u)
+	require.NoError(t, err)
+
+	err = authServer.UpsertPassword(user, []byte(pass))
 	require.NoError(t, err)
 
 	dev, err := services.NewTOTPDevice("otp", otpSecret, s.clock.Now())
 	require.NoError(t, err)
-	err = s.server.Auth().UpsertMFADevice(context.Background(), user, dev)
-	require.NoError(t, err)
-
-	// create valid token
-	validToken, err := totp.GenerateCode(otpSecret, time.Now())
+	err = authServer.UpsertMFADevice(context.Background(), user, dev)
 	require.NoError(t, err)
 
 	clt := s.client(t)
 
-	reqs := []CreateSessionReq{
-		// empty request
-		{},
-		// missing user
+	tests := []struct {
+		name                  string
+		user, pass, otpSecret string
+	}{
 		{
-			Pass:              pass,
-			SecondFactorToken: validToken,
+			name: "empty request",
 		},
-		// missing pass
 		{
-			User:              user,
-			SecondFactorToken: validToken,
+			name:      "missing user",
+			pass:      pass,
+			otpSecret: otpSecret,
 		},
-		// bad pass
 		{
-			User:              user,
-			Pass:              "bla bla",
-			SecondFactorToken: validToken,
+			name:      "missing pass",
+			user:      user,
+			otpSecret: otpSecret,
 		},
-		// bad otp token
 		{
-			User:              user,
-			Pass:              pass,
-			SecondFactorToken: "bad token",
+			name:      "bad pass",
+			user:      user,
+			pass:      "bla bla",
+			otpSecret: otpSecret,
 		},
-		// missing otp token
 		{
-			User: user,
-			Pass: pass,
+			name:      "bad otp token",
+			user:      user,
+			pass:      pass,
+			otpSecret: badSecret,
+		},
+		{
+			name: "missing otp token",
+			user: user,
+			pass: pass,
 		},
 	}
-	for i, req := range reqs {
-		t.Run(fmt.Sprintf("tc %v", i), func(t *testing.T) {
-			_, err := clt.PostJSON(s.ctx, clt.Endpoint("webapi", "sessions"), req)
-			require.Error(t, err)
-			require.True(t, trace.IsAccessDenied(err))
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			clock.Advance(1 * time.Minute) // Avoid OTP clashes.
+
+			httpResp, body, err := rawLoginWebOTP(ctx, loginWebOTPParams{
+				webClient: clt,
+				clock:     clock,
+				user:      test.user,
+				password:  test.pass,
+				otpSecret: test.otpSecret,
+			})
+			require.NoError(t, err, "HTTP request errored unexpectedly")
+
+			// Assert HTTP response code.
+			assert.Equal(t, http.StatusForbidden, httpResp.StatusCode, "HTTP status mismatch")
+
+			// Assert body error message.
+			var resp httpErrorResponse
+			require.NoError(t,
+				json.Unmarshal(body, &resp),
+				"HTTP error response unmarshal",
+			)
+			const invalidCredentialsMessage = "invalid credentials"
+			assert.Contains(t, resp.Error.Message, invalidCredentialsMessage, "HTTP error message mismatch")
 		})
 	}
 }
 
 type clusterNodesGetResponse struct {
-	Items      []ui.Server `json:"items"`
-	StartKey   string      `json:"startKey"`
-	TotalCount int         `json:"totalCount"`
+	Items      []webui.Server `json:"items"`
+	StartKey   string         `json:"startKey"`
+	TotalCount int            `json:"totalCount"`
 }
 
 func TestClusterNodesGet(t *testing.T) {
@@ -934,7 +1140,7 @@ func TestClusterNodesGet(t *testing.T) {
 	server1 := servers[0]
 
 	// Add another node.
-	server2, err := types.NewServerWithLabels("server2", types.KindNode, types.ServerSpecV2{}, map[string]string{"test-field": "test-value"})
+	server2, err := types.NewServerWithLabels("server2", types.KindNode, types.ServerSpecV2{Hostname: "server2"}, map[string]string{"test-field": "test-value"})
 	require.NoError(t, err)
 	_, err = env.server.Auth().UpsertNode(context.Background(), server2)
 	require.NoError(t, err)
@@ -954,8 +1160,10 @@ func TestClusterNodesGet(t *testing.T) {
 	require.NoError(t, json.Unmarshal(re.Bytes(), &res))
 	require.Len(t, res.Items, 2)
 	require.Equal(t, 2, res.TotalCount)
-	require.ElementsMatch(t, res.Items, []ui.Server{
+	require.ElementsMatch(t, res.Items, []webui.Server{
 		{
+			Kind:        types.KindNode,
+			SubKind:     types.SubKindTeleportNode,
 			ClusterName: clusterName,
 			Name:        server1.GetName(),
 			Hostname:    server1.GetHostname(),
@@ -964,11 +1172,16 @@ func TestClusterNodesGet(t *testing.T) {
 			Labels:      []ui.Label{},
 			SSHLogins:   []string{pack.login},
 		},
-		{ClusterName: clusterName,
-			Name:      "server2",
-			Labels:    []ui.Label{{Name: "test-field", Value: "test-value"}},
-			Tunnel:    false,
-			SSHLogins: []string{pack.login}},
+		{
+			Kind:        types.KindNode,
+			SubKind:     types.SubKindTeleportNode,
+			ClusterName: clusterName,
+			Name:        server2.GetName(),
+			Hostname:    server2.GetHostname(),
+			Labels:      []ui.Label{{Name: "test-field", Value: "test-value"}},
+			Tunnel:      false,
+			SSHLogins:   []string{pack.login},
+		},
 	})
 
 	// Get nodes using shortcut.
@@ -981,12 +1194,267 @@ func TestClusterNodesGet(t *testing.T) {
 	require.Equal(t, res, res2)
 }
 
+func TestUserGroupsGet(t *testing.T) {
+	ctx := context.Background()
+	env := newWebPack(t, 1)
+
+	proxy := env.proxies[0]
+	pack := proxy.authPack(t, "test-user@example.com", nil /* roles */)
+
+	type testResponse struct {
+		Items      []webui.UserGroup `json:"items"`
+		StartKey   string            `json:"startKey"`
+		TotalCount int               `json:"totalCount"`
+	}
+
+	// add a user group
+	ug, err := types.NewUserGroup(types.Metadata{
+		Name: "ug1", Description: "ug1-description",
+		Labels: map[string]string{"test-field": "test-value"},
+	},
+		types.UserGroupSpecV1{Applications: []string{"appnameonly"}})
+	require.NoError(t, err)
+	err = env.server.Auth().CreateUserGroup(ctx, ug)
+	require.NoError(t, err)
+
+	resource := &types.AppServerV3{
+		Metadata: types.Metadata{Name: "test-app-server"},
+		Kind:     types.KindApp,
+		Version:  types.V2,
+		Spec: types.AppServerSpecV3{
+			HostID: "hostid",
+			App: &types.AppV3{
+				Metadata: types.Metadata{
+					Name:        "appnameonly",
+					Description: "app-description",
+				},
+				Spec: types.AppSpecV3{
+					URI: "appname-uri",
+				},
+			},
+		},
+	}
+
+	// Register app
+	_, err = env.server.Auth().UpsertApplicationServer(ctx, resource)
+	require.NoError(t, err)
+
+	// Make the call.
+	endpoint := pack.clt.Endpoint("webapi", "sites", env.server.ClusterName(), "user-groups")
+	re, err := pack.clt.Get(ctx, endpoint, url.Values{"sort": []string{"name"}})
+	require.NoError(t, err)
+
+	// The correct response should include application names (not app server names)
+	var resp testResponse
+	require.NoError(t, json.Unmarshal(re.Bytes(), &resp))
+	require.Len(t, resp.Items, 1)
+	require.Equal(t, 1, resp.TotalCount)
+	require.ElementsMatch(t, resp.Items, []webui.UserGroup{{
+		Name:        "ug1",
+		Description: ug.GetMetadata().Description,
+		Labels:      []ui.Label{{Name: "test-field", Value: "test-value"}},
+		Applications: []webui.ApplicationAndFriendlyName{
+			{Name: "appnameonly", FriendlyName: ""},
+		},
+	}})
+}
+
+func TestUnifiedResourcesGet(t *testing.T) {
+	t.Parallel()
+	env := newWebPack(t, 1)
+	proxy := env.proxies[0]
+	username := "test-user@example.com"
+
+	u, err := user.Current()
+	require.NoError(t, err)
+	loginUser := u.Username
+
+	role := defaultRoleForNewUser(&types.UserV2{Metadata: types.Metadata{Name: username}}, loginUser)
+	role.SetAWSRoleARNs(types.Allow, []string{"arn:aws:iam::999999999999:role/ProdInstance"})
+	role.SetAppLabels(types.Allow, types.Labels{"env": []string{"prod"}})
+	role.SetGitHubPermissions(types.Allow, []types.GitHubPermission{{Organizations: []string{types.Wildcard}}})
+
+	// This role is used to test that DevInstance AWS Role is only available to AppServices that have env:dev label.
+	roleForDev, err := types.NewRole("dev-access", types.RoleSpecV6{
+		Allow: types.RoleConditions{
+			AWSRoleARNs: []string{"arn:aws:iam::999999999999:role/DevInstance"},
+			AppLabels:   types.Labels{"env": []string{"dev"}},
+		},
+	})
+	require.NoError(t, err)
+
+	pack := proxy.authPack(t, username, []types.Role{role, roleForDev})
+
+	// add aws AppServer
+	awsApp, err := types.NewAppV3(
+		types.Metadata{
+			Name: "my-aws-app",
+			Labels: map[string]string{
+				"env": "prod",
+			},
+		},
+		types.AppSpecV3{
+			URI:   "localhost:8080",
+			Cloud: "AWS",
+		})
+	require.NoError(t, err)
+	awsAppServer, err := types.NewAppServerV3FromApp(
+		awsApp,
+		"localhost",
+		"host-id",
+	)
+	require.NoError(t, err)
+	_, err = env.server.Auth().UpsertApplicationServer(context.Background(), awsAppServer)
+	require.NoError(t, err)
+
+	app, err := types.NewAppV3(
+		types.Metadata{
+			Name: "my-app",
+			Labels: map[string]string{
+				"env": "prod",
+			},
+		},
+		types.AppSpecV3{
+			URI: "localhost:8080",
+		})
+	require.NoError(t, err)
+	appServer, err := types.NewAppServerV3FromApp(
+		app,
+		"localhost",
+		"host-id",
+	)
+	require.NoError(t, err)
+	_, err = env.server.Auth().UpsertApplicationServer(context.Background(), appServer)
+	require.NoError(t, err)
+
+	// Add nodes
+	for i := 0; i < 20; i++ {
+		name := fmt.Sprintf("server-%d", i)
+		node, err := types.NewServer(name, types.KindNode, types.ServerSpecV2{
+			Hostname: name,
+		})
+		require.NoError(t, err)
+		_, err = env.server.Auth().UpsertNode(context.Background(), node)
+		require.NoError(t, err)
+	}
+	// add db
+	db, err := types.NewDatabaseV3(types.Metadata{
+		Name: "dbdb",
+		Labels: map[string]string{
+			"env": "prod",
+		},
+	}, types.DatabaseSpecV3{
+		Protocol: "test-protocol",
+		URI:      "test-uri",
+	})
+	require.NoError(t, err)
+	dbServer, err := types.NewDatabaseServerV3(types.Metadata{
+		Name: "dddb1",
+	}, types.DatabaseServerSpecV3{
+		Hostname: "dddb1",
+		HostID:   uuid.NewString(),
+		Database: db,
+	})
+	require.NoError(t, err)
+	_, err = env.server.Auth().UpsertDatabaseServer(context.Background(), dbServer)
+	require.NoError(t, err)
+
+	// add windows desktop
+	win, err := types.NewWindowsDesktopV3(
+		"zzzz9",
+		nil,
+		types.WindowsDesktopSpecV3{Addr: "localhost", HostID: "win1-host-id"},
+	)
+	require.NoError(t, err)
+	err = env.server.Auth().UpsertWindowsDesktop(context.Background(), win)
+	require.NoError(t, err)
+
+	// add git server
+	gitServer, err := types.NewGitHubServer(types.GitHubServerMetadata{
+		Organization: "org1",
+		Integration:  "org1",
+	})
+	require.NoError(t, err)
+	_, err = env.server.Auth().GitServers.UpsertGitServer(context.Background(), gitServer)
+	require.NoError(t, err)
+
+	clusterName := env.server.ClusterName()
+	endpoint := pack.clt.Endpoint("webapi", "sites", clusterName, "resources")
+
+	// test sort type ascend
+	query := url.Values{"sort": []string{"kind:asc"}}
+	re, err := pack.clt.Get(context.Background(), endpoint, query)
+	require.NoError(t, err)
+	res := clusterNodesGetResponse{}
+	require.NoError(t, json.Unmarshal(re.Bytes(), &res))
+	require.Equal(t, types.KindApp, res.Items[0].Kind)
+	require.Equal(t, types.KindApp, res.Items[1].Kind)
+	require.Equal(t, types.KindDatabase, res.Items[2].Kind)
+
+	// test sort type desc
+	query = url.Values{"sort": []string{"kind:desc"}}
+	re, err = pack.clt.Get(context.Background(), endpoint, query)
+	require.NoError(t, err)
+	res = clusterNodesGetResponse{}
+	require.NoError(t, json.Unmarshal(re.Bytes(), &res))
+	require.Equal(t, types.KindWindowsDesktop, res.Items[0].Kind)
+
+	// test with no access
+	noAccessRole, err := types.NewRole(services.RoleNameForUser("test-no-access@example.com"), types.RoleSpecV6{})
+	require.NoError(t, err)
+	noAccessPack := proxy.authPack(t, "test-no-access@example.com", []types.Role{noAccessRole})
+
+	// shouldnt get any results with no access
+	query = url.Values{"sort": []string{"name:asc"}}
+	re, err = noAccessPack.clt.Get(context.Background(), endpoint, query)
+	require.NoError(t, err)
+	res = clusterNodesGetResponse{}
+	require.NoError(t, json.Unmarshal(re.Bytes(), &res))
+	require.Empty(t, res.Items)
+
+	// should return first page and have a second page
+	query = url.Values{"sort": []string{"name"}, "limit": []string{"15"}}
+	re, err = pack.clt.Get(context.Background(), endpoint, query)
+	require.NoError(t, err)
+	res = clusterNodesGetResponse{}
+	require.NoError(t, json.Unmarshal(re.Bytes(), &res))
+	require.Len(t, res.Items, 15)
+	require.NotEqual(t, "", res.StartKey)
+
+	// should return second page and have no third page
+	query = url.Values{"sort": []string{"name"}, "limit": []string{"15"}}
+	query.Add("startKey", res.StartKey)
+	re, err = pack.clt.Get(context.Background(), endpoint, query)
+	require.NoError(t, err)
+	res = clusterNodesGetResponse{}
+	require.NoError(t, json.Unmarshal(re.Bytes(), &res))
+	require.Len(t, res.Items, 11)
+	require.Equal(t, "", res.StartKey)
+
+	// Only list valid AWS Roles for AWS Apps
+	query = url.Values{
+		"search": []string{"my-aws-app"},
+		"sort":   []string{"name"},
+	}
+	re, err = pack.clt.Get(context.Background(), endpoint, query)
+	require.NoError(t, err)
+	listResp := struct {
+		Items []webui.App `json:"Items"`
+	}{}
+	require.NoError(t, json.Unmarshal(re.Bytes(), &listResp))
+	require.Len(t, listResp.Items, 1)
+	expectedRoles := []utilsaws.Role{
+		{Name: "ProdInstance", Display: "ProdInstance", ARN: "arn:aws:iam::999999999999:role/ProdInstance", AccountID: "999999999999"},
+	}
+	require.Equal(t, expectedRoles, listResp.Items[0].AWSRoles)
+	t.Log(string(re.Bytes()), listResp)
+}
+
 type clusterAlertsGetResponse struct {
 	Alerts []types.ClusterAlert `json:"alerts"`
 }
 
 func TestClusterAlertsGet(t *testing.T) {
-	t.Parallel()
 	env := newWebPack(t, 1)
 
 	// generate alert
@@ -1018,8 +1486,29 @@ func TestClusterAlertsGet(t *testing.T) {
 func TestSiteNodeConnectInvalidSessionID(t *testing.T) {
 	t.Parallel()
 	s := newWebSuite(t)
-	_, _, err := s.makeTerminal(t, s.authPack(t, "foo"), withSessionID("/../../../foo"))
-	require.Error(t, err)
+
+	ctx, cancel := context.WithCancel(s.ctx)
+	t.Cleanup(cancel)
+
+	result := make(chan error)
+
+	_, err := connectToHost(ctx, connectConfig{
+		pack:      s.authPack(t, "foo"),
+		host:      s.node.ID(),
+		proxy:     s.webServer.Listener.Addr().String(),
+		sessionID: "/../../../foo",
+		handlers: map[string]terminal.WSHandlerFunc{
+			defaults.WebsocketError: func(ctx context.Context, e terminal.Envelope) {
+				if e.Payload == "/../../../foo is not a valid UUID" {
+					result <- errors.New(e.Payload)
+				}
+				close(result)
+			},
+		},
+	})
+	require.NoError(t, err)
+	res := <-result
+	require.Error(t, res)
 }
 
 func TestResolveServerHostPort(t *testing.T) {
@@ -1094,6 +1583,107 @@ func TestResolveServerHostPort(t *testing.T) {
 	}
 }
 
+func isFileTransferRequest(e *terminal.Envelope) bool {
+	if e.GetType() != defaults.WebsocketAudit {
+		return false
+	}
+	var ef events.EventFields
+	if err := json.Unmarshal([]byte(e.GetPayload()), &ef); err != nil {
+		return false
+	}
+	return ef.GetType() == string(srv.FileTransferUpdate)
+}
+
+func isFileTransferDecision(e *terminal.Envelope) bool {
+	if e.GetType() != defaults.WebsocketAudit {
+		return false
+	}
+	var ef events.EventFields
+	if err := json.Unmarshal([]byte(e.GetPayload()), &ef); err != nil {
+		return false
+	}
+	return ef.GetType() == string(srv.FileTransferApproved)
+}
+
+func getRequestId(e *terminal.Envelope) (string, error) {
+	var ef events.EventFields
+	if err := json.Unmarshal([]byte(e.GetPayload()), &ef); err != nil {
+		return "", err
+	}
+	return ef.GetString("requestID"), nil
+}
+
+func TestFileTransferEvents(t *testing.T) {
+	t.Parallel()
+	s := newWebSuiteWithConfig(t, webSuiteConfig{disableDiskBasedRecording: true})
+
+	ctx, cancel := context.WithCancel(s.ctx)
+	t.Cleanup(cancel)
+
+	// Create a new user "foo", open a terminal to a new session
+	wsMessages := make(chan *terminal.Envelope)
+	term, err := connectToHost(ctx, connectConfig{
+		pack:  s.authPack(t, "foo"),
+		host:  s.node.ID(),
+		proxy: s.webServer.Listener.Addr().String(),
+		handlers: map[string]terminal.WSHandlerFunc{
+			defaults.WebsocketAudit: func(ctx context.Context, envelope terminal.Envelope) {
+				wsMessages <- &envelope
+			},
+		},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, term.Close()) })
+
+	// Create file transfer event
+	data, err := json.Marshal(events.EventFields{
+		"download": true,
+		"location": "~/myfile.txt",
+	})
+
+	require.NoError(t, err)
+	envelope := &terminal.Envelope{
+		Version: defaults.WebsocketVersion,
+		Type:    defaults.WebsocketFileTransferRequest,
+		Payload: string(data),
+	}
+	envelopeBytes, err := proto.Marshal(envelope)
+	require.NoError(t, err)
+	err = term.ws.WriteMessage(websocket.BinaryMessage, envelopeBytes)
+	require.NoError(t, err)
+
+	done := time.After(5 * time.Second)
+	for {
+		select {
+		case <-done:
+			require.FailNow(t, "expected to receive a file transfer event")
+		case e := <-wsMessages:
+			if isFileTransferRequest(e) {
+				requestId, err := getRequestId(e)
+				require.NoError(t, err)
+				data, err := json.Marshal(events.EventFields{
+					"requestId": requestId,
+					"approved":  true,
+				})
+				require.NoError(t, err)
+				envelope := &terminal.Envelope{
+					Version: defaults.WebsocketVersion,
+					Type:    defaults.WebsocketFileTransferDecision,
+					Payload: string(data),
+				}
+				envelopeBytes, err := proto.Marshal(envelope)
+				require.NoError(t, err)
+				err = term.ws.WriteMessage(websocket.BinaryMessage, envelopeBytes)
+				require.NoError(t, err)
+			}
+
+			if isFileTransferDecision(e) {
+				return
+			}
+		}
+	}
+}
+
 func TestNewTerminalHandler(t *testing.T) {
 	ctx := context.Background()
 
@@ -1108,7 +1698,8 @@ func TestNewTerminalHandler(t *testing.T) {
 					ID: session.ID("not a uuid"),
 				},
 			},
-		}, {
+		},
+		{
 			expectedErr: "login: missing login",
 			cfg: TerminalHandlerConfig{
 				SessionData: session.Session{
@@ -1116,7 +1707,8 @@ func TestNewTerminalHandler(t *testing.T) {
 					Login: "",
 				},
 			},
-		}, {
+		},
+		{
 			expectedErr: "server: missing server",
 			cfg: TerminalHandlerConfig{
 				SessionData: session.Session{
@@ -1158,7 +1750,7 @@ func TestNewTerminalHandler(t *testing.T) {
 
 	for _, testCase := range invalidCases {
 		_, err := NewTerminal(ctx, testCase.cfg)
-		require.Equal(t, err.Error(), testCase.expectedErr)
+		require.Equal(t, testCase.expectedErr, err.Error())
 	}
 
 	validNode := types.ServerV2{}
@@ -1172,9 +1764,10 @@ func TestNewTerminalHandler(t *testing.T) {
 			H: 100,
 		},
 		SessionCtx: &SessionContext{},
-		AuthProvider: authProviderMock{
+		UserAuthClient: authProviderMock{
 			server: validNode,
 		},
+		LocalAccessPoint: authProviderMock{},
 		SessionData: session.Session{
 			ID:       session.NewID(),
 			Login:    "root",
@@ -1191,7 +1784,7 @@ func TestNewTerminalHandler(t *testing.T) {
 	require.NoError(t, err)
 	// passed through
 	require.Equal(t, validCfg.SessionCtx, term.ctx)
-	require.Equal(t, validCfg.AuthProvider, term.authProvider)
+	require.Equal(t, validCfg.UserAuthClient, term.userAuthClient)
 	require.Equal(t, validCfg.SessionData, term.sessionData)
 	require.Equal(t, validCfg.KeepAliveInterval, term.keepAliveInterval)
 	require.Equal(t, validCfg.ProxyHostPort, term.proxyHostPort)
@@ -1199,105 +1792,128 @@ func TestNewTerminalHandler(t *testing.T) {
 	require.Equal(t, validCfg.Term, term.term)
 	require.Equal(t, validCfg.DisplayLogin, term.displayLogin)
 	// newly added
-	require.NotNil(t, term.encoder)
-	require.NotNil(t, term.decoder)
-	require.NotNil(t, term.wsLock)
-	require.NotNil(t, term.log)
+	require.NotNil(t, term.logger)
+}
+
+func TestUIConfig(t *testing.T) {
+	uiConfig := webclient.UIConfig{
+		ScrollbackLines: 555,
+		ShowResources:   constants.ShowResourcesaccessibleOnly,
+	}
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+
+	s := newWebSuiteWithConfig(t, webSuiteConfig{uiConfig: uiConfig})
+	clt := s.client(t)
+	endpoint := clt.Endpoint("web", "config.js")
+	re, err := clt.Get(ctx, endpoint, nil)
+	require.NoError(t, err)
+	require.True(t, strings.HasPrefix(string(re.Bytes()), "var GRV_CONFIG"))
+	t.Cleanup(cancel)
+
+	// Response is type application/javascript, we need to strip off the variable name
+	// and the semicolon at the end, then we are left with json like object.
+	var cfg webclient.WebConfig
+	str := strings.ReplaceAll(string(re.Bytes()), "var GRV_CONFIG = ", "")
+	err = json.Unmarshal([]byte(str[:len(str)-1]), &cfg)
+	require.NoError(t, err)
+	require.Equal(t, uiConfig, cfg.UI)
 }
 
 func TestResizeTerminal(t *testing.T) {
 	t.Parallel()
-	s := newWebSuite(t)
+	s := newWebSuiteWithConfig(t, webSuiteConfig{disableDiskBasedRecording: true})
 	sid := session.NewID()
 
-	errs := make(chan error, 2)
-	readLoop := func(ctx context.Context, ws *websocket.Conn, ch chan<- *Envelope) {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-			}
-
-			typ, b, err := ws.ReadMessage()
-			if err != nil {
-				errs <- err
-				return
-			}
-			if typ != websocket.BinaryMessage {
-				errs <- trace.BadParameter("expected binary message, got %v", typ)
-				return
-			}
-			var envelope Envelope
-			if err := proto.Unmarshal(b, &envelope); err != nil {
-				errs <- trace.Wrap(err)
-				return
-			}
-			ch <- &envelope
-		}
-	}
-
-	// Create a new user "foo", open a terminal to a new session
-	pack1 := s.authPack(t, "foo")
-	ws1, sess, err := s.makeTerminal(t, pack1)
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, ws1.Close()) })
-
-	// Create a new user "bar", open a terminal to the session created above
-	pack2 := s.authPack(t, "bar")
-	ws2, sess2, err := s.makeTerminal(t, pack2, withSessionID(sess.ID))
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, ws2.Close()) })
-
-	require.Equal(t, sess.ID, sess2.ID)
-
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(s.ctx)
 	t.Cleanup(cancel)
-	ws1Messages := make(chan *Envelope)
-	ws2Messages := make(chan *Envelope)
-	go readLoop(ctx, ws1, ws1Messages)
-	go readLoop(ctx, ws2, ws2Messages)
 
-	// consume events from the first terminal
-	// we exect to see at least one raw event with PTY data (indicating terminal ready)
-	// and 2 resize events from the second user joining the session (one for the default
-	// size, and one for the manual resize request)
+	ws1Messages := make(chan *terminal.Envelope)
+	ws1Raw := make(chan []byte)
+	ws2Messages := make(chan *terminal.Envelope)
+	// Create a new user "foo", open a terminal to a new session
+	term, err := connectToHost(ctx, connectConfig{
+		pack:  s.authPack(t, "foo"),
+		host:  s.node.ID(),
+		proxy: s.webServer.Listener.Addr().String(),
+		handlers: map[string]terminal.WSHandlerFunc{
+			defaults.WebsocketAudit: func(ctx context.Context, envelope terminal.Envelope) {
+				ws1Messages <- &envelope
+			},
+		},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, term.Close()) })
+
+	sess := term.GetSession()
+	// Wait for session to have started
+	require.Eventually(t, func() bool {
+		_, err := s.server.Auth().GetSessionTracker(context.Background(), string(sess.ID))
+		return err == nil
+	}, 3*time.Second, 200*time.Millisecond, "session not available")
+
+	// Create a new user "bar" and join the session created above
+	term2, err := connectToHost(ctx, connectConfig{
+		pack:            s.authPack(t, "bar"),
+		host:            s.node.ID(),
+		proxy:           s.webServer.Listener.Addr().String(),
+		sessionID:       sess.ID,
+		participantMode: types.SessionPeerMode,
+		handlers: map[string]terminal.WSHandlerFunc{
+			defaults.WebsocketAudit: func(ctx context.Context, envelope terminal.Envelope) {
+				ws2Messages <- &envelope
+			},
+		},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, term2.Close()) })
+
+	require.Equal(t, sess.ID, term2.GetSession().ID)
+
+	go func() {
+		read, err := io.ReadAll(io.LimitReader(term, 10))
+		if err != nil {
+			return
+		}
+
+		ws1Raw <- read
+	}()
+
+	// Consume events from the first terminal. We expect to see 2 resize events from the second user
+	// joining the session (one for the default size, and one for the manual resize request). We also
+	// validate at least one raw event with PTY data (indicating terminal ready) came through.
 	done := time.After(10 * time.Second)
 	t1ResizeEvents, t1RawEvents := 0, 0
 t1ready:
 	for {
 		select {
 		case <-done:
-			require.FailNowf(t, "", "expected to receive 2 resize events (got %d) and at least 1 raw event (got %d)", t1ResizeEvents, t1RawEvents)
-		case err := <-errs:
-			require.NoError(t, err)
+			require.FailNowf(t, "", "expected to receive 2 resize events (got %d)", t1ResizeEvents)
+		case <-ws1Raw:
+			t1RawEvents++
 		case e := <-ws1Messages:
 			if isResizeEventEnvelope(e) {
 				t1ResizeEvents++
 			}
-			if e.GetType() == defaults.WebsocketRaw {
-				t1RawEvents++
-			}
-			if t1ResizeEvents == 2 && t1RawEvents > 0 {
-				break t1ready
-			}
+		}
+
+		if t1ResizeEvents == 2 && t1RawEvents > 0 {
+			break t1ready
 		}
 	}
 
 	// we should not expect to see a resize event on terminal 2,
-	// since they are not broadcasted back to the originator
+	// since they are not broadcast back to the originator
 	select {
 	case e := <-ws2Messages:
 		if isResizeEventEnvelope(e) {
-			require.FailNow(t, "terminal 2 should not have received a resize event")
+			require.FailNow(t, "terminal 2 should not have received a resize event: %v", e)
 		}
-	case err := <-errs:
-		require.NoError(t, err)
 	case <-time.After(1 * time.Second):
 	}
 
-	// Resize the second terminal. This should be reflected only on the first terminal
-	// because resize events are sent to participants but not the originator..
+	// Resize the second terminal. This should only be reflected in the first terminal
+	// because resize events are sent to participants but not the originator.
 	params, err := session.NewTerminalParamsFromInt(300, 120)
 	require.NoError(t, err)
 	data, err := json.Marshal(events.EventFields{
@@ -1307,14 +1923,14 @@ t1ready:
 		events.TerminalSize:   params.Serialize(),
 	})
 	require.NoError(t, err)
-	envelope := &Envelope{
+	envelope := &terminal.Envelope{
 		Version: defaults.WebsocketVersion,
 		Type:    defaults.WebsocketResize,
 		Payload: string(data),
 	}
 	envelopeBytes, err := proto.Marshal(envelope)
 	require.NoError(t, err)
-	err = ws2.WriteMessage(websocket.BinaryMessage, envelopeBytes)
+	err = term2.ws.WriteMessage(websocket.BinaryMessage, envelopeBytes)
 	require.NoError(t, err)
 
 	// the first terminal should see the resize event
@@ -1323,8 +1939,6 @@ t1ready:
 		select {
 		case <-done:
 			require.FailNow(t, "expected to receive a final resize event")
-		case err := <-errs:
-			require.NoError(t, err)
 		case e := <-ws1Messages:
 			if isResizeEventEnvelope(e) {
 				return
@@ -1333,7 +1947,7 @@ t1ready:
 	}
 }
 
-func isResizeEventEnvelope(e *Envelope) bool {
+func isResizeEventEnvelope(e *terminal.Envelope) bool {
 	if e.GetType() != defaults.WebsocketAudit {
 		return false
 	}
@@ -1348,41 +1962,42 @@ func isResizeEventEnvelope(e *Envelope) bool {
 func TestTerminalPing(t *testing.T) {
 	t.Parallel()
 	s := newWebSuite(t)
-	ws, _, err := s.makeTerminal(t, s.authPack(t, "foo"), withKeepaliveInterval(500*time.Millisecond))
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, ws.Close()) })
+
+	ctx, cancel := context.WithCancel(s.ctx)
+	t.Cleanup(cancel)
 
 	closed := false
 	done := make(chan struct{})
-	ws.SetPingHandler(func(message string) error {
-		if closed == false {
-			close(done)
-			closed = true
-		}
 
-		err := ws.WriteControl(websocket.PongMessage, []byte(message), time.Now().Add(time.Second))
-		if err == websocket.ErrCloseSent {
-			return nil
-		} else if e, ok := err.(net.Error); ok && e.Timeout() {
-			return nil
-		}
-		return err
-	})
-
-	// We need to continuously read incoming messages in order to process ping messages.
-	// We only care about receiving a ping here so dropping them is fine.
-	go func() {
-		for {
-			_, _, err := ws.ReadMessage()
-			if err != nil {
-				return
+	term, err := connectToHost(ctx, connectConfig{
+		pack:              s.authPack(t, "foo"),
+		host:              s.node.ID(),
+		proxy:             s.webServer.Listener.Addr().String(),
+		keepAliveInterval: time.Second,
+		pingHandler: func(ws terminal.WSConn, message string) error {
+			if closed == false {
+				close(done)
+				closed = true
 			}
-		}
-	}()
+
+			err := ws.WriteControl(websocket.PongMessage, []byte(message), time.Now().Add(time.Second))
+			if errors.Is(err, websocket.ErrCloseSent) {
+				return nil
+			} else {
+				var e net.Error
+				if errors.As(err, &e) && e.Timeout() {
+					return nil
+				}
+				return err
+			}
+		},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, term.Close()) })
 
 	select {
 	case <-done:
-	case <-time.After(time.Minute):
+	case <-time.After(6 * time.Second):
 		t.Fatal("timeout waiting for ping")
 	}
 }
@@ -1398,7 +2013,7 @@ func TestTerminal(t *testing.T) {
 			name: "node recording mode",
 			recordingConfig: types.SessionRecordingConfigV2{
 				Spec: types.SessionRecordingConfigSpecV2{
-					Mode: types.RecordAtNode,
+					Mode: types.RecordAtNodeSync,
 				},
 			},
 		},
@@ -1418,20 +2033,35 @@ func TestTerminal(t *testing.T) {
 			t.Parallel()
 			s := newWebSuite(t)
 
-			require.NoError(t, s.server.Auth().SetSessionRecordingConfig(context.Background(), &tt.recordingConfig))
-
-			ws, _, err := s.makeTerminal(t, s.authPack(t, "foo"))
+			// Set the recording config
+			_, err := s.server.Auth().UpsertSessionRecordingConfig(context.Background(), &tt.recordingConfig)
 			require.NoError(t, err)
-			t.Cleanup(func() { require.NoError(t, ws.Close()) })
 
-			termHandler := newTerminalHandler()
-			stream := termHandler.asTerminalStream(ws)
+			ctx, cancel := context.WithCancel(s.ctx)
+			t.Cleanup(cancel)
+			// Create a new session
+			term, err := connectToHost(ctx, connectConfig{
+				pack:  s.authPack(t, "foo"),
+				host:  s.node.ID(),
+				proxy: s.webServer.Listener.Addr().String(),
+			})
 
-			// here we intentionally run a command where the output we're looking
-			// for is not present in the command itself
-			_, err = io.WriteString(stream, "echo txlxport | sed 's/x/e/g'\r\n")
 			require.NoError(t, err)
-			require.NoError(t, waitForOutput(stream, "teleport"))
+			t.Cleanup(func() { require.True(t, utils.IsOKNetworkError(term.Close())) })
+
+			// Send a command and validate the output
+			validateTerminal(t, term)
+
+			// Validate that the session is active on the node
+			require.Equal(t, int32(1), s.node.ActiveConnections())
+
+			// Close the web socket to emulate a user closing the browser window
+			require.NoError(t, term.Close())
+
+			// Validate that the node terminates the session
+			require.EventuallyWithT(t, func(t *assert.CollectT) {
+				assert.Zero(t, s.node.ActiveConnections())
+			}, 30*time.Second, 250*time.Millisecond)
 		})
 	}
 }
@@ -1440,46 +2070,33 @@ func TestTerminalRouting(t *testing.T) {
 	t.Parallel()
 	s := newWebSuite(t)
 
-	// add nodes with various conflicting values
+	// add nodes with conflicting hostnames
 	llama := s.addNode(t, uuid.NewString(), "llama", "127.0.0.1:0")
 	s.addNode(t, uuid.NewString(), "llamas", "127.0.0.1:0")
 	alpaca1 := s.addNode(t, uuid.NewString(), "alpaca", "127.0.0.1:0")
 	s.addNode(t, uuid.NewString(), "alpaca", "127.0.0.1:0")
 
+	closeNoError := func(t *testing.T, err error) {
+		require.NoError(t, err)
+	}
+
 	cases := []struct {
-		name   string
-		target string
-		output string
+		name             string
+		target           *regular.Server
+		output           string
+		wsCloseAssertion func(t *testing.T, err error)
 	}{
 		{
-			name:   "exact match by uuid",
-			target: llama.ID(),
-			output: "teleport",
+			name:             "exact match by uuid",
+			target:           llama,
+			output:           "teleport",
+			wsCloseAssertion: closeNoError,
 		},
 		{
-			name:   "exact match by hostname",
-			target: "llama",
-			output: "teleport",
-		},
-		{
-			name:   "exact match by ip",
-			target: llama.Addr(),
-			output: "teleport",
-		},
-		{
-			name:   "ambiguous host",
-			target: "alpaca",
-			output: "error: ambiguous host could match multiple nodes",
-		},
-		{
-			name:   "connect by uuid successful when multiple hostnames match",
-			target: alpaca1.ID(),
-			output: "teleport",
-		},
-		{
-			name:   "ambiguous ip",
-			target: "127.0.0.1",
-			output: "error: ambiguous host could match multiple nodes",
+			name:             "connect by uuid successful when multiple hostnames match",
+			target:           alpaca1,
+			output:           "teleport",
+			wsCloseAssertion: closeNoError,
 		},
 	}
 
@@ -1488,40 +2105,52 @@ func TestTerminalRouting(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			ws, _, err := s.makeTerminal(t, s.authPack(t, fmt.Sprintf("foo-%d", i)), withServer(tt.target))
-			require.NoError(t, err)
-			t.Cleanup(func() { require.NoError(t, ws.Close()) })
+			ctx, cancel := context.WithCancel(s.ctx)
+			t.Cleanup(cancel)
 
-			termHandler := newTerminalHandler()
-			stream := termHandler.asTerminalStream(ws)
+			term, err := connectToHost(ctx, connectConfig{
+				pack:  s.authPack(t, fmt.Sprintf("foo-%d", i)),
+				host:  tt.target.ID(),
+				proxy: s.webServer.Listener.Addr().String(),
+			})
+			require.NoError(t, err)
+			t.Cleanup(func() { tt.wsCloseAssertion(t, term.Close()) })
+
+			sess := term.GetSession()
+
+			metadata := tt.target.TargetMetadata()
+			require.Equal(t, metadata.ServerID, sess.ServerID)
+			require.Equal(t, metadata.ServerHostname, sess.ServerHostname)
 
 			// here we intentionally run a command where the output we're looking
 			// for is not present in the command itself
-			_, err = io.WriteString(stream, "echo txlxport | sed 's/x/e/g'\r\n")
+			_, err = io.WriteString(term, "echo txlxport | sed 's/x/e/g'\r\n")
 			require.NoError(t, err)
-			require.NoError(t, waitForOutput(stream, tt.output))
+			require.NoError(t, waitForOutput(term, tt.output))
 		})
 	}
 }
 
-func TestTerminalRequireSessionMfa(t *testing.T) {
+func TestTerminalRequireSessionMFA(t *testing.T) {
 	ctx := context.Background()
 	env := newWebPack(t, 1)
 	proxy := env.proxies[0]
-	pack := proxy.authPack(t, "llama", nil /* roles */)
 
-	clt, err := env.server.NewClient(auth.TestUser("llama"))
+	const username = "llama2999"
+	pack := proxy.authPack(t, username, nil /* roles */)
+
+	userClient, err := env.server.NewClient(auth.TestUser(username))
 	require.NoError(t, err)
 
 	cases := []struct {
 		name                      string
-		getAuthPreference         func() types.AuthPreference
-		registerDevice            func() *auth.TestDevice
-		getChallengeResponseBytes func(chals *client.MFAAuthenticateChallenge, dev *auth.TestDevice) []byte
+		getAuthPreference         func(t *testing.T) types.AuthPreference
+		registerDevice            func(t *testing.T) *auth.TestDevice
+		getChallengeResponseBytes func(t *testing.T, chal client.MFAAuthenticateChallenge, testDev *auth.TestDevice) []byte
 	}{
 		{
 			name: "with webauthn",
-			getAuthPreference: func() types.AuthPreference {
+			getAuthPreference: func(t *testing.T) types.AuthPreference {
 				ap, err := types.NewAuthPreference(types.AuthPreferenceSpecV2{
 					Type:         constants.Local,
 					SecondFactor: constants.SecondFactorWebauthn,
@@ -1534,56 +2163,61 @@ func TestTerminalRequireSessionMfa(t *testing.T) {
 
 				return ap
 			},
-			registerDevice: func() *auth.TestDevice {
-				webauthnDev, err := auth.RegisterTestDevice(ctx, clt, "webauthn", authproto.DeviceType_DEVICE_TYPE_WEBAUTHN, nil /* authenticator */)
+			registerDevice: func(t *testing.T) *auth.TestDevice {
+				webauthnDev, err := auth.RegisterTestDevice(
+					ctx,
+					userClient,
+					"webauthn", authproto.DeviceType_DEVICE_TYPE_WEBAUTHN, pack.device /* authenticator */)
 				require.NoError(t, err)
 
 				return webauthnDev
 			},
-			getChallengeResponseBytes: func(chals *client.MFAAuthenticateChallenge, dev *auth.TestDevice) []byte {
-				res, err := dev.SolveAuthn(&authproto.MFAAuthenticateChallenge{
-					WebauthnChallenge: wanlib.CredentialAssertionToProto(chals.WebauthnChallenge),
+			getChallengeResponseBytes: func(t *testing.T, chal client.MFAAuthenticateChallenge, testDev *auth.TestDevice) []byte {
+				res, err := testDev.SolveAuthn(&authproto.MFAAuthenticateChallenge{
+					WebauthnChallenge: wantypes.CredentialAssertionToProto(chal.WebauthnChallenge),
 				})
-				require.Nil(t, err)
+				require.NoError(t, err)
 
-				webauthnResBytes, err := json.Marshal(wanlib.CredentialAssertionResponseFromProto(res.GetWebauthn()))
-				require.Nil(t, err)
+				webauthnResBytes, err := json.Marshal(wantypes.CredentialAssertionResponseFromProto(res.GetWebauthn()))
+				require.NoError(t, err)
 
-				return webauthnResBytes
+				envelope := &terminal.Envelope{
+					Version: defaults.WebsocketVersion,
+					Type:    defaults.WebsocketMFAChallenge,
+					Payload: string(webauthnResBytes),
+				}
+				protoBytes, err := proto.Marshal(envelope)
+				require.NoError(t, err)
+
+				return protoBytes
 			},
 		},
 	}
-
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err = env.server.Auth().SetAuthPreference(ctx, tc.getAuthPreference())
+			_, err = env.server.Auth().UpsertAuthPreference(ctx, tc.getAuthPreference(t))
 			require.NoError(t, err)
 
-			dev := tc.registerDevice()
+			dev := tc.registerDevice(t)
+
+			termCtx, cancel := context.WithCancel(ctx)
+			t.Cleanup(cancel)
 
 			// Open a terminal to a new session.
-			ws, _ := proxy.makeTerminal(t, pack, "")
-
-			// Wait for websocket authn challenge event.
-			ty, raw, err := ws.ReadMessage()
-			require.Nil(t, err)
-			require.Equal(t, websocket.BinaryMessage, ty)
-			var env Envelope
-			require.Nil(t, proto.Unmarshal(raw, &env))
-
-			chals := &client.MFAAuthenticateChallenge{}
-			require.Nil(t, json.Unmarshal([]byte(env.Payload), &chals))
-
-			// Send response over ws.
-			termHandler := newTerminalHandler()
-			_, err = termHandler.write(tc.getChallengeResponseBytes(chals, dev), ws)
-			require.Nil(t, err)
+			term, err := connectToHost(termCtx, connectConfig{
+				pack:  pack,
+				host:  proxy.node.ID(),
+				proxy: proxy.webURL.Host,
+				mfaCeremony: func(challenge client.MFAAuthenticateChallenge) []byte {
+					return tc.getChallengeResponseBytes(t, challenge, dev)
+				},
+			})
+			require.NoError(t, err)
 
 			// Test we can write.
-			stream := termHandler.asTerminalStream(ws)
-			_, err = io.WriteString(stream, "echo alpacas\r\n")
-			require.Nil(t, err)
-			require.Nil(t, waitForOutput(stream, "alpacas"))
+			_, err = io.WriteString(term, "echo txlxport | sed 's/x/e/g'\r\n")
+			require.NoError(t, err)
+			require.NoError(t, waitForOutput(term, "teleport"))
 		})
 	}
 }
@@ -1598,7 +2232,7 @@ func mustStartWindowsDesktopMock(t *testing.T, authClient *auth.Server) *windows
 	t.Cleanup(func() {
 		require.NoError(t, l.Close())
 	})
-	authID := auth.IdentityID{
+	authID := state.IdentityID{
 		Role:     types.RoleWindowsDesktop,
 		HostUUID: "windows_server",
 		NodeName: "windows_server",
@@ -1630,7 +2264,7 @@ func mustStartWindowsDesktopMock(t *testing.T, authClient *auth.Server) *windows
 			return
 		}
 		tlsConn := tls.Server(conn, tlsConfig)
-		if err := tlsConn.Handshake(); err != nil {
+		if err := tlsConn.HandshakeContext(context.Background()); err != nil {
 			t.Errorf("Unexpected error %v", err)
 			return
 		}
@@ -1658,8 +2292,7 @@ func (w *windowsDesktopServiceMock) handleConn(t *testing.T, conn *tls.Conn) {
 	require.NoError(t, err)
 	require.IsType(t, tdp.ClientScreenSpec{}, msg)
 
-	img := image.NewRGBA(image.Rect(0, 0, 100, 100))
-	err = tdpConn.WriteMessage(tdp.NewPNG(img, tdp.PNGEncoder()))
+	err = tdpConn.WriteMessage(tdp.Alert{Message: "test", Severity: tdp.SeverityWarning})
 	require.NoError(t, err)
 }
 
@@ -1668,7 +2301,7 @@ func TestDesktopAccessMFARequiresMfa(t *testing.T) {
 		name           string
 		authPref       types.AuthPreferenceSpecV2
 		mfaHandler     func(t *testing.T, ws *websocket.Conn, dev *auth.TestDevice)
-		registerDevice func(t *testing.T, ctx context.Context, clt *auth.Client) *auth.TestDevice
+		registerDevice func(t *testing.T, ctx context.Context, clt *authclient.Client) *auth.TestDevice
 	}{
 		{
 			name: "webauthn",
@@ -1680,8 +2313,8 @@ func TestDesktopAccessMFARequiresMfa(t *testing.T) {
 				},
 				RequireMFAType: types.RequireMFAType_SESSION,
 			},
-			mfaHandler: handleMFAWebauthnChallenge,
-			registerDevice: func(t *testing.T, ctx context.Context, clt *auth.Client) *auth.TestDevice {
+			mfaHandler: handleDesktopMFAWebauthnChallenge,
+			registerDevice: func(t *testing.T, ctx context.Context, clt *authclient.Client) *auth.TestDevice {
 				webauthnDev, err := auth.RegisterTestDevice(ctx, clt, "webauthn", authproto.DeviceType_DEVICE_TYPE_WEBAUTHN, nil /* authenticator */)
 				require.NoError(t, err)
 				return webauthnDev
@@ -1721,25 +2354,31 @@ func TestDesktopAccessMFARequiresMfa(t *testing.T) {
 
 			ap, err := types.NewAuthPreference(tc.authPref)
 			require.NoError(t, err)
-			err = env.server.Auth().SetAuthPreference(ctx, ap)
+			_, err = env.server.Auth().UpsertAuthPreference(ctx, ap)
 			require.NoError(t, err)
 
 			dev := tc.registerDevice(t, ctx, clt)
 
-			ws := proxy.makeDesktopSession(t, pack, session.NewID(), env.server.TLS.Listener.Addr())
+			ws := proxy.makeDesktopSession(t, pack)
 			tc.mfaHandler(t, ws, dev)
 
 			tdpClient := tdp.NewConn(&WebsocketIO{Conn: ws})
 
 			msg, err := tdpClient.ReadMessage()
 			require.NoError(t, err)
-			require.IsType(t, tdp.PNG2Frame{}, msg)
+			require.IsType(t, tdp.Alert{}, msg)
 		})
 	}
 }
 
-func handleMFAWebauthnChallenge(t *testing.T, ws *websocket.Conn, dev *auth.TestDevice) {
-	br := bufio.NewReader(&WebsocketIO{Conn: ws})
+func handleDesktopMFAWebauthnChallenge(t *testing.T, ws *websocket.Conn, dev *auth.TestDevice) {
+	wsrwc := &WebsocketIO{Conn: ws}
+	tdpConn := tdp.NewConn(wsrwc)
+
+	// desktopConnectHandle first needs a ClientScreenSpec message in order to continue.
+	tdpConn.WriteMessage(tdp.ClientScreenSpec{Width: 100, Height: 100})
+
+	br := bufio.NewReader(wsrwc)
 	mt, err := br.ReadByte()
 	require.NoError(t, err)
 	require.Equal(t, tdp.TypeMFA, tdp.MessageType(mt))
@@ -1747,11 +2386,11 @@ func handleMFAWebauthnChallenge(t *testing.T, ws *websocket.Conn, dev *auth.Test
 	mfaChallange, err := tdp.DecodeMFAChallenge(br)
 	require.NoError(t, err)
 	res, err := dev.SolveAuthn(&authproto.MFAAuthenticateChallenge{
-		WebauthnChallenge: wanlib.CredentialAssertionToProto(mfaChallange.WebauthnChallenge),
+		WebauthnChallenge: wantypes.CredentialAssertionToProto(mfaChallange.WebauthnChallenge),
 	})
 	require.NoError(t, err)
-	err = tdp.NewConn(&WebsocketIO{Conn: ws}).WriteMessage(tdp.MFA{
-		Type: defaults.WebsocketWebauthnChallenge[0],
+	err = tdpConn.WriteMessage(tdp.MFA{
+		Type: defaults.WebsocketMFAChallenge[0],
 		MFAAuthenticateResponse: &authproto.MFAAuthenticateResponse{
 			Response: &authproto.MFAAuthenticateResponse_Webauthn{
 				Webauthn: res.GetWebauthn(),
@@ -1763,23 +2402,30 @@ func handleMFAWebauthnChallenge(t *testing.T, ws *websocket.Conn, dev *auth.Test
 
 func TestWebAgentForward(t *testing.T) {
 	t.Parallel()
-	s := newWebSuite(t)
-	ws, _, err := s.makeTerminal(t, s.authPack(t, "foo"))
+	s := newWebSuiteWithConfig(t, webSuiteConfig{disableDiskBasedRecording: true})
+
+	ctx, cancel := context.WithCancel(s.ctx)
+	t.Cleanup(cancel)
+
+	term, err := connectToHost(ctx, connectConfig{
+		pack:  s.authPack(t, "foo"),
+		host:  s.node.ID(),
+		proxy: s.webServer.Listener.Addr().String(),
+	})
 	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, ws.Close()) })
+	t.Cleanup(func() { require.NoError(t, term.Close()) })
 
-	termHandler := newTerminalHandler()
-	stream := termHandler.asTerminalStream(ws)
-
-	_, err = io.WriteString(stream, "echo $SSH_AUTH_SOCK\r\n")
+	_, err = io.WriteString(term, "echo $SSH_AUTH_SOCK\r\n")
 	require.NoError(t, err)
 
-	err = waitForOutput(stream, "/")
+	err = waitForOutput(term, "/")
 	require.NoError(t, err)
 }
 
 func TestActiveSessions(t *testing.T) {
-	t.Parallel()
+	// Use enterprise license (required for moderated sessions).
+	modules.SetTestModules(t, &modules.TestModules{TestBuildType: modules.BuildEnterprise})
+
 	s := newWebSuite(t)
 	pack := s.authPack(t, "foo")
 
@@ -1809,6 +2455,17 @@ func TestActiveSessions(t *testing.T) {
 			Login:        pack.login,
 			Participants: []types.Participant{
 				{ID: "id", User: "user-1", LastActive: start},
+			},
+			HostPolicies: []*types.SessionTrackerPolicySet{
+				{
+					Name:    "foo",
+					Version: "5",
+					RequireSessionJoin: []*types.SessionRequirePolicy{
+						{
+							Name: "foo",
+						},
+					},
+				},
 			},
 		})
 		require.NoError(t, err)
@@ -1855,6 +2512,7 @@ func TestActiveSessions(t *testing.T) {
 		require.Equal(t, s.node.GetInfo().GetHostname(), session.ServerHostname)
 		require.Equal(t, s.srvID, session.ServerAddr)
 		require.Equal(t, s.server.ClusterName(), session.ClusterName)
+		require.ElementsMatch(t, []types.SessionParticipantMode{"peer"}, session.ParticipantModes)
 	}
 }
 
@@ -1863,33 +2521,38 @@ func TestCloseConnectionsOnLogout(t *testing.T) {
 	s := newWebSuite(t)
 	pack := s.authPack(t, "foo")
 
-	ws, _, err := s.makeTerminal(t, pack)
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, ws.Close()) })
+	ctx, cancel := context.WithCancel(s.ctx)
+	t.Cleanup(cancel)
 
-	termHandler := newTerminalHandler()
-	stream := termHandler.asTerminalStream(ws)
+	term, err := connectToHost(ctx, connectConfig{
+		pack:  pack,
+		host:  s.node.ID(),
+		proxy: s.webServer.Listener.Addr().String(),
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, term.Close()) })
 
 	// to make sure we have a session
-	_, err = io.WriteString(stream, "expr 137 + 39\r\n")
+	_, err = io.WriteString(term, "expr 137 + 39\r\n")
 	require.NoError(t, err)
 
-	// make sure server has replied
+	// make sure the server has replied
 	out := make([]byte, 100)
-	_, err = stream.Read(out)
+	_, err = term.Read(out)
 	require.NoError(t, err)
 
-	_, err = pack.clt.Delete(s.ctx, pack.clt.Endpoint("webapi", "sessions"))
+	_, err = pack.clt.Delete(s.ctx, pack.clt.Endpoint("webapi", "sessions", "web"))
 	require.NoError(t, err)
 
-	// wait until we timeout or detect that connection has been closed
+	// wait until timeout or detect that the connection has been closed.
 	after := time.After(5 * time.Second)
 	errC := make(chan error)
 	go func() {
 		for {
-			_, err := stream.Read(out)
+			_, err := term.Read(out)
 			if err != nil {
 				errC <- err
+				return
 			}
 		}
 	}()
@@ -1902,59 +2565,6 @@ func TestCloseConnectionsOnLogout(t *testing.T) {
 	}
 }
 
-func TestCreateSession(t *testing.T) {
-	t.Parallel()
-	env := newWebPack(t, 1)
-	proxy := env.proxies[0]
-	user := "test-user@example.com"
-	pack := proxy.authPack(t, user, nil /* roles */)
-
-	// get site nodes
-	re, err := pack.clt.Get(context.Background(), pack.clt.Endpoint("webapi", "sites", env.server.ClusterName(), "nodes"), url.Values{})
-	require.NoError(t, err)
-
-	nodes := clusterNodesGetResponse{}
-	require.NoError(t, json.Unmarshal(re.Bytes(), &nodes))
-	node := nodes.Items[0]
-
-	sess := session.Session{
-		TerminalParams: session.TerminalParams{W: 300, H: 120},
-		Login:          user,
-	}
-
-	// test using node UUID
-	sess.ServerID = node.Name
-	re, err = pack.clt.PostJSON(
-		context.Background(),
-		pack.clt.Endpoint("webapi", "sites", env.server.ClusterName(), "sessions"),
-		siteSessionGenerateReq{Session: sess},
-	)
-	require.NoError(t, err)
-
-	var created *siteSessionGenerateResponse
-	require.NoError(t, json.Unmarshal(re.Bytes(), &created))
-	require.NotEmpty(t, created.Session.ID)
-	require.Equal(t, node.Hostname, created.Session.ServerHostname)
-
-	// test empty serverID (older version does not supply serverID)
-	sess.ServerID = ""
-	_, err = pack.clt.PostJSON(
-		context.Background(),
-		pack.clt.Endpoint("webapi", "sites", env.server.ClusterName(), "sessions"),
-		siteSessionGenerateReq{Session: sess},
-	)
-	require.NoError(t, err)
-}
-
-func TestPlayback(t *testing.T) {
-	t.Parallel()
-	s := newWebSuite(t)
-	pack := s.authPack(t, "foo")
-	ws, _, err := s.makeTerminal(t, pack)
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, ws.Close()) })
-}
-
 type httpErrorMessage struct {
 	Message string `json:"message"`
 }
@@ -1965,10 +2575,11 @@ type httpErrorResponse struct {
 
 func TestLogin_PrivateKeyEnabledError(t *testing.T) {
 	modules.SetTestModules(t, &modules.TestModules{
-		MockAttestHardwareKey: func(_ context.Context, _ interface{}, policy keys.PrivateKeyPolicy, _ *keys.AttestationStatement, _ crypto.PublicKey, _ time.Duration) (keys.PrivateKeyPolicy, error) {
-			return "", keys.NewPrivateKeyPolicyError(policy)
+		MockAttestationData: &keys.AttestationData{
+			PrivateKeyPolicy: keys.PrivateKeyPolicyNone,
 		},
 	})
+
 	s := newWebSuite(t)
 	ap, err := types.NewAuthPreference(types.AuthPreferenceSpecV2{
 		Type:           constants.Local,
@@ -1976,34 +2587,28 @@ func TestLogin_PrivateKeyEnabledError(t *testing.T) {
 		RequireMFAType: types.RequireMFAType_HARDWARE_KEY_TOUCH,
 	})
 	require.NoError(t, err)
-	err = s.server.Auth().SetAuthPreference(s.ctx, ap)
+	_, err = s.server.Auth().UpsertAuthPreference(s.ctx, ap)
 	require.NoError(t, err)
 
 	// create user
-	s.createUser(t, "user1", "root", "password", "")
-
-	loginReq, err := json.Marshal(CreateSessionReq{
-		User: "user1",
-		Pass: "password",
-	})
-	require.NoError(t, err)
+	const user = "user1"
+	const pass = "password1234"
+	s.createUser(t, user, "root", pass, "")
 
 	clt := s.client(t)
-	req, err := http.NewRequest("POST", clt.Endpoint("webapi", "sessions"), bytes.NewBuffer(loginReq))
-	require.NoError(t, err)
-	ua := "test-ua"
-	req.Header.Set("User-Agent", ua)
-	csrfToken := "2ebcb768d0090ea4368e42880c970b61865c326172a4a2343b645cf5d7f20992"
-	addCSRFCookieToReq(req, csrfToken)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set(csrf.HeaderName, csrfToken)
+	ctx := context.Background()
 
-	re, err := clt.Client.RoundTrip(func() (*http.Response, error) {
-		return clt.Client.HTTPClient().Do(req)
+	const ua = "test-ua"
+	_, body, err := rawLoginWebOTP(ctx, loginWebOTPParams{
+		webClient: clt,
+		user:      user,
+		password:  pass,
+		userAgent: ua,
 	})
 	require.NoError(t, err)
+
 	var resErr httpErrorResponse
-	require.NoError(t, json.Unmarshal(re.Bytes(), &resErr))
+	require.NoError(t, json.Unmarshal(body, &resErr))
 	require.Contains(t, resErr.Error.Message, keys.PrivateKeyPolicyHardwareKeyTouch)
 }
 
@@ -2015,53 +2620,41 @@ func TestLogin(t *testing.T) {
 		SecondFactor: constants.SecondFactorOff,
 	})
 	require.NoError(t, err)
-	err = s.server.Auth().SetAuthPreference(s.ctx, ap)
+	_, err = s.server.Auth().UpsertAuthPreference(s.ctx, ap)
 	require.NoError(t, err)
 
 	// create user
-	s.createUser(t, "user1", "root", "password", "")
-
-	loginReq, err := json.Marshal(CreateSessionReq{
-		User: "user1",
-		Pass: "password",
-	})
-	require.NoError(t, err)
+	const user = "user1"
+	const pass = "password1234"
+	s.createUser(t, user, "root", pass, "")
 
 	clt := s.client(t)
-	ua := "test-ua"
-	req, err := http.NewRequest("POST", clt.Endpoint("webapi", "sessions"), bytes.NewBuffer(loginReq))
-	require.NoError(t, err)
-	req.Header.Set("User-Agent", ua)
+	ctx := context.Background()
 
-	csrfToken := "2ebcb768d0090ea4368e42880c970b61865c326172a4a2343b645cf5d7f20992"
-	addCSRFCookieToReq(req, csrfToken)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set(csrf.HeaderName, csrfToken)
+	const ua = "test-ua"
+	sessionResp, httpResp := loginWebOTP(t, ctx, loginWebOTPParams{
+		webClient: clt,
+		user:      user,
+		password:  pass,
+		userAgent: ua,
+	})
 
-	re, err := clt.Client.RoundTrip(func() (*http.Response, error) {
-		return clt.Client.HTTPClient().Do(req)
+	events, _, err := s.server.AuthServer.AuditLog.SearchEvents(ctx, events.SearchEventsRequest{
+		From:       s.clock.Now().Add(-time.Hour),
+		To:         s.clock.Now().Add(time.Hour),
+		EventTypes: []string{events.UserLoginEvent},
+		Limit:      1,
+		Order:      types.EventOrderDescending,
 	})
 	require.NoError(t, err)
-
-	events, _, err := s.server.AuthServer.AuditLog.SearchEvents(
-		s.clock.Now().Add(-time.Hour),
-		s.clock.Now().Add(time.Hour),
-		apidefaults.Namespace,
-		[]string{events.UserLoginEvent},
-		1,
-		types.EventOrderDescending,
-		"",
-	)
-	require.NoError(t, err)
 	event := events[0].(*apievents.UserLogin)
-	require.Equal(t, true, event.Success)
+	require.True(t, event.Success)
 	require.Equal(t, ua, event.UserAgent)
 	require.True(t, strings.HasPrefix(event.RemoteAddr, "127.0.0.1:"))
 
-	var rawSess *CreateSessionResponse
-	require.NoError(t, json.Unmarshal(re.Bytes(), &rawSess))
-	cookies := re.Cookies()
+	cookies := httpResp.Cookies()
 	require.Len(t, cookies, 1)
+	require.NotEmpty(t, sessionResp.SessionExpires)
 
 	// now make sure we are logged in by calling authenticated method
 	// we need to supply both session cookie and bearer token for
@@ -2069,19 +2662,19 @@ func TestLogin(t *testing.T) {
 	jar, err := cookiejar.New(nil)
 	require.NoError(t, err)
 
-	clt = s.client(t, roundtrip.BearerAuth(rawSess.Token), roundtrip.CookieJar(jar))
-	jar.SetCookies(s.url(), re.Cookies())
+	clt = s.client(t, roundtrip.BearerAuth(sessionResp.Token), roundtrip.CookieJar(jar))
+	jar.SetCookies(s.url(), cookies)
 
-	re, err = clt.Get(s.ctx, clt.Endpoint("webapi", "sites"), url.Values{})
+	re, err := clt.Get(s.ctx, clt.Endpoint("webapi", "sites"), url.Values{})
 	require.NoError(t, err)
 
-	var clusters []ui.Cluster
+	var clusters []webui.Cluster
 	require.NoError(t, json.Unmarshal(re.Bytes(), &clusters))
 
 	// in absence of session cookie or bearer auth the same request fill fail
 
 	// no session cookie:
-	clt = s.client(t, roundtrip.BearerAuth(rawSess.Token))
+	clt = s.client(t, roundtrip.BearerAuth(sessionResp.Token))
 	_, err = clt.Get(s.ctx, clt.Endpoint("webapi", "sites"), url.Values{})
 	require.Error(t, err)
 	require.True(t, trace.IsAccessDenied(err))
@@ -2134,7 +2727,8 @@ func TestMotD(t *testing.T) {
 	// Given an auth server configured to expose a Message Of The Day...
 	prefs := types.DefaultAuthPreference()
 	prefs.SetMessageOfTheDay(motd)
-	require.NoError(t, s.server.AuthServer.AuthServer.SetAuthPreference(s.ctx, prefs))
+	_, err := s.server.AuthServer.AuthServer.UpsertAuthPreference(s.ctx, prefs)
+	require.NoError(t, err)
 
 	// When I issue a ping request...
 	re, err := wc.Get(s.ctx, wc.Endpoint("webapi", "ping"), url.Values{})
@@ -2154,6 +2748,252 @@ func TestMotD(t *testing.T) {
 	var motdResponse *webclient.MotD
 	require.NoError(t, json.Unmarshal(re.Bytes(), &motdResponse))
 	require.Equal(t, motd, motdResponse.Text)
+}
+
+// TestPingAutomaticUpgrades ensures /webapi/ping returns whether AutomaticUpgrades are enabled.
+func TestPingAutomaticUpgrades(t *testing.T) {
+	t.Run("Automatic Upgrades are enabled", func(t *testing.T) {
+		// Enable Automatic Upgrades
+		modules.SetTestModules(t, &modules.TestModules{TestFeatures: modules.Features{
+			AutomaticUpgrades: true,
+		}})
+
+		// Set up
+		s := newWebSuite(t)
+		wc := s.client(t)
+		var pingResponse *webclient.PingResponse
+
+		// Get Ping response
+		re, err := wc.Get(s.ctx, wc.Endpoint("webapi", "ping"), url.Values{})
+		require.NoError(t, err)
+
+		require.NoError(t, json.Unmarshal(re.Bytes(), &pingResponse))
+		require.True(t, pingResponse.AutomaticUpgrades, "expected automatic upgrades to be enabled")
+	})
+	t.Run("Automatic Upgrades are disabled", func(t *testing.T) {
+		// Disable Automatic Upgrades
+		modules.SetTestModules(t, &modules.TestModules{TestFeatures: modules.Features{
+			AutomaticUpgrades: false,
+		}})
+
+		// Set up
+		s := newWebSuite(t)
+		wc := s.client(t)
+		var pingResponse *webclient.PingResponse
+
+		// Get Ping response
+		re, err := wc.Get(s.ctx, wc.Endpoint("webapi", "ping"), url.Values{})
+		require.NoError(t, err)
+
+		require.NoError(t, json.Unmarshal(re.Bytes(), &pingResponse))
+		require.False(t, pingResponse.AutomaticUpgrades, "expected automatic upgrades to be disabled")
+	})
+}
+
+// TestInstallerRepoChannel ensures the returned installer script has the proper repo channel
+func TestInstallerRepoChannel(t *testing.T) {
+	t.Run("cloud with automatic upgrades", func(t *testing.T) {
+		modules.SetTestModules(t, &modules.TestModules{
+			TestFeatures: modules.Features{
+				Cloud:             true,
+				AutomaticUpgrades: true,
+			},
+		})
+
+		s := newWebSuiteWithConfig(t, webSuiteConfig{
+			authPreferenceSpec: &types.AuthPreferenceSpecV2{
+				Type:         constants.Local,
+				SecondFactor: constants.SecondFactorOn,
+				Webauthn:     &types.Webauthn{RPID: "localhost"},
+			},
+		})
+
+		wc := s.client(t)
+		t.Run("documented variables are injected", func(t *testing.T) {
+			// Variables documented here:
+			// https://goteleport.com/docs/enroll-resources/auto-discovery/servers/ec2-discovery/#step-67-optional-customize-the-default-installer-script
+			err := s.server.Auth().SetInstaller(s.ctx, types.MustNewInstallerV1("custom", `#!/usr/bin/env bash
+echo {{ .PublicProxyAddr }}
+echo Teleport-{{ .MajorVersion }}
+echo Repository Channel: {{ .RepoChannel }}
+echo AutomaticUpgrades: {{ .AutomaticUpgrades }}
+		`))
+			require.NoError(t, err)
+
+			re, err := wc.Get(s.ctx, wc.Endpoint("webapi", "scripts", "installer", "custom"), url.Values{})
+			require.NoError(t, err)
+
+			responseString := string(re.Bytes())
+
+			// Variables must be injected
+			require.Contains(t, responseString, "echo Teleport-v")
+			require.NotContains(t, responseString, "echo Repository Channel: stable/v")
+			require.Contains(t, responseString, "echo Repository Channel: stable/cloud")
+			require.Contains(t, responseString, "echo AutomaticUpgrades: true")
+		})
+
+		t.Run("default-installer", func(t *testing.T) {
+			re, err := wc.Get(s.ctx, wc.Endpoint("webapi", "scripts", "installer", "default-installer"), url.Values{})
+			require.NoError(t, err)
+
+			responseString := string(re.Bytes())
+
+			// The repo's channel to use is stable/cloud
+			require.Contains(t, responseString, "stable/cloud")
+			require.NotContains(t, responseString, "stable/v")
+			require.Contains(t, responseString, "--auto-upgrade=true")
+			require.Contains(t, responseString, "--teleport-package=teleport-ent")
+		})
+
+		t.Run("default-agentless-installer", func(t *testing.T) {
+			re, err := wc.Get(s.ctx, wc.Endpoint("webapi", "scripts", "installer", "default-agentless-installer"), url.Values{})
+			require.NoError(t, err)
+
+			responseString := string(re.Bytes())
+
+			// The repo's channel to use is stable/cloud
+			require.Contains(t, responseString, "stable/cloud")
+			require.NotContains(t, responseString, "stable/v")
+			require.Contains(t, responseString, ""+
+				"    # shellcheck disable=SC2050\n"+
+				"    if [ \"true\" = \"true\" ]; then\n"+
+				"      # automatic upgrades\n",
+			)
+			require.Contains(t, responseString, ""+
+				"  TELEPORT_PACKAGE=\"teleport-ent\"\n"+
+				"  TELEPORT_UPDATER_PACKAGE=\"teleport-ent-updater\"\n",
+			)
+		})
+	})
+
+	t.Run("cloud without automatic upgrades", func(t *testing.T) {
+		modules.SetTestModules(t, &modules.TestModules{
+			TestFeatures: modules.Features{
+				Cloud:             true,
+				AutomaticUpgrades: false,
+			},
+		})
+
+		s := newWebSuiteWithConfig(t, webSuiteConfig{
+			authPreferenceSpec: &types.AuthPreferenceSpecV2{
+				Type:         constants.Local,
+				SecondFactor: constants.SecondFactorOn,
+				Webauthn:     &types.Webauthn{RPID: "localhost"},
+			},
+		})
+
+		wc := s.client(t)
+
+		t.Run("documented variables are injected", func(t *testing.T) {
+			// Variables documented here: https://goteleport.com/docs/enroll-resources/auto-discovery/servers/ec2-discovery/#step-67-optional-customize-the-default-installer-script
+			err := s.server.Auth().SetInstaller(s.ctx, types.MustNewInstallerV1("custom", `#!/usr/bin/env bash
+	echo {{ .PublicProxyAddr }}
+	echo Teleport-{{ .MajorVersion }}
+	echo Repository Channel: {{ .RepoChannel }}
+	echo AutomaticUpgrades: {{ .AutomaticUpgrades }}
+			`))
+			require.NoError(t, err)
+
+			re, err := wc.Get(s.ctx, wc.Endpoint("webapi", "scripts", "installer", "custom"), url.Values{})
+			require.NoError(t, err)
+
+			responseString := string(re.Bytes())
+
+			// Variables must be injected
+			require.Contains(t, responseString, "echo Teleport-v")
+			require.Contains(t, responseString, "echo Repository Channel: stable/v")
+			require.NotContains(t, responseString, "echo Repository Channel: stable/cloud")
+			require.Contains(t, responseString, "echo AutomaticUpgrades: false")
+		})
+		t.Run("default-installer", func(t *testing.T) {
+			re, err := wc.Get(s.ctx, wc.Endpoint("webapi", "scripts", "installer", "default-installer"), url.Values{})
+			require.NoError(t, err)
+
+			responseString := string(re.Bytes())
+
+			require.NotContains(t, responseString, "stable/cloud")
+		})
+		t.Run("default-agentless-installer", func(t *testing.T) {
+			re, err := wc.Get(s.ctx, wc.Endpoint("webapi", "scripts", "installer", "default-agentless-installer"), url.Values{})
+			require.NoError(t, err)
+
+			responseString := string(re.Bytes())
+
+			require.NotContains(t, responseString, "stable/cloud")
+		})
+	})
+
+	t.Run("oss or enterprise with automatic upgrades", func(t *testing.T) {
+		modules.SetTestModules(t, &modules.TestModules{
+			TestBuildType: modules.BuildOSS,
+			TestFeatures: modules.Features{
+				Cloud:             false,
+				AutomaticUpgrades: true,
+			},
+		})
+
+		s := newWebSuiteWithConfig(t, webSuiteConfig{
+			authPreferenceSpec: &types.AuthPreferenceSpecV2{
+				Type:         constants.Local,
+				SecondFactor: constants.SecondFactorOn,
+				Webauthn:     &types.Webauthn{RPID: "localhost"},
+			},
+		})
+
+		wc := s.client(t)
+		t.Run("documented variables are injected", func(t *testing.T) {
+			// Variables documented here: https://goteleport.com/docs/enroll-resources/auto-discovery/servers/ec2-discovery/#step-67-optional-customize-the-default-installer-script
+			err := s.server.Auth().SetInstaller(s.ctx, types.MustNewInstallerV1("custom", `#!/usr/bin/env bash
+echo {{ .PublicProxyAddr }}
+echo Teleport-{{ .MajorVersion }}
+echo Repository Channel: {{ .RepoChannel }}
+echo AutomaticUpgrades: {{ .AutomaticUpgrades }}
+		`))
+			require.NoError(t, err)
+
+			re, err := wc.Get(s.ctx, wc.Endpoint("webapi", "scripts", "installer", "custom"), url.Values{})
+			require.NoError(t, err)
+
+			responseString := string(re.Bytes())
+
+			// Variables must be injected
+			require.Contains(t, responseString, "echo Teleport-v")
+			require.Contains(t, responseString, "echo Repository Channel: stable/v")
+			require.NotContains(t, responseString, "echo Repository Channel: stable/cloud")
+			require.Contains(t, responseString, "echo AutomaticUpgrades: false")
+		})
+		t.Run("default-installer", func(t *testing.T) {
+			re, err := wc.Get(s.ctx, wc.Endpoint("webapi", "scripts", "installer", "default-installer"), url.Values{})
+			require.NoError(t, err)
+
+			responseString := string(re.Bytes())
+
+			// The repo's channel to use is stable/cloud
+			require.NotContains(t, responseString, "stable/cloud")
+			require.Contains(t, responseString, "stable/v")
+			require.Contains(t, responseString, "--auto-upgrade=false")
+			require.Contains(t, responseString, "--teleport-package=teleport ")
+		})
+		t.Run("default-agentless-installer", func(t *testing.T) {
+			re, err := wc.Get(s.ctx, wc.Endpoint("webapi", "scripts", "installer", "default-agentless-installer"), url.Values{})
+			require.NoError(t, err)
+
+			responseString := string(re.Bytes())
+
+			// The repo's channel to use is stable/cloud
+			require.NotContains(t, responseString, "stable/cloud")
+			require.Contains(t, responseString, "stable/v")
+			require.Contains(t, responseString, ""+
+				"    # shellcheck disable=SC2050\n"+
+				"    if [ \"false\" = \"true\" ]; then\n"+
+				"      # automatic upgrades\n",
+			)
+			require.Contains(t, responseString, ""+
+				"  TELEPORT_PACKAGE=\"teleport\"\n"+
+				"  TELEPORT_UPDATER_PACKAGE=\"teleport-updater\"\n",
+			)
+		})
+	})
 }
 
 func TestMultipleConnectors(t *testing.T) {
@@ -2179,19 +3019,21 @@ func TestMultipleConnectors(t *testing.T) {
 	}
 	o, err := types.NewOIDCConnector("foo", oidcConnectorSpec)
 	require.NoError(t, err)
-	err = s.server.Auth().UpsertOIDCConnector(s.ctx, o)
+	upserted, err := s.server.Auth().UpsertOIDCConnector(s.ctx, o)
 	require.NoError(t, err)
+	require.NotNil(t, upserted)
 	o2, err := types.NewOIDCConnector("bar", oidcConnectorSpec)
 	require.NoError(t, err)
-	err = s.server.Auth().UpsertOIDCConnector(s.ctx, o2)
+	upserted, err = s.server.Auth().UpsertOIDCConnector(s.ctx, o2)
 	require.NoError(t, err)
+	require.NotNil(t, upserted)
 
 	// set the auth preferences to oidc with no connector name
 	authPreference, err := types.NewAuthPreference(types.AuthPreferenceSpecV2{
 		Type: "oidc",
 	})
 	require.NoError(t, err)
-	err = s.server.Auth().SetAuthPreference(s.ctx, authPreference)
+	_, err = s.server.Auth().UpsertAuthPreference(s.ctx, authPreference)
 	require.NoError(t, err)
 
 	// hit the ping endpoint to get the auth type and connector name
@@ -2212,7 +3054,7 @@ func TestMultipleConnectors(t *testing.T) {
 		ConnectorName: "foo",
 	})
 	require.NoError(t, err)
-	err = s.server.Auth().SetAuthPreference(s.ctx, authPreference)
+	_, err = s.server.Auth().UpsertAuthPreference(s.ctx, authPreference)
 	require.NoError(t, err)
 
 	// hit the ping endpoing to get the auth type and connector name
@@ -2222,6 +3064,37 @@ func TestMultipleConnectors(t *testing.T) {
 
 	// make sure the connector we get back is "foo"
 	require.Equal(t, "foo", out.Auth.OIDC.Name)
+}
+
+func TestPingSSHDialTimeout(t *testing.T) {
+	t.Parallel()
+	s := newWebSuite(t)
+	wc := s.client(t)
+
+	// hit the ping endpoint to get the ssh dial timeout
+	re, err := wc.Get(s.ctx, wc.Endpoint("webapi", "ping"), url.Values{})
+	require.NoError(t, err)
+	var out webclient.PingResponse
+	require.NoError(t, json.Unmarshal(re.Bytes(), &out))
+
+	// Validate the timeout is the default value.
+	require.Equal(t, apidefaults.DefaultIOTimeout, out.Proxy.SSH.DialTimeout)
+
+	// Update the timeout
+	cnc, err := s.server.Auth().GetClusterNetworkingConfig(s.ctx)
+	require.NoError(t, err)
+
+	cnc.SetSSHDialTimeout(time.Minute)
+	cnc, err = s.server.Auth().UpsertClusterNetworkingConfig(s.ctx, cnc)
+	require.NoError(t, err)
+
+	// hit the ping endpoint again to validate that updated values are returned
+	re, err = wc.Get(s.ctx, wc.Endpoint("webapi", "ping"), url.Values{})
+	require.NoError(t, err)
+	require.NoError(t, json.Unmarshal(re.Bytes(), &out))
+
+	// Validate the timeout is the default value.
+	require.Equal(t, cnc.GetSSHDialTimeout(), out.Proxy.SSH.DialTimeout)
 }
 
 // TestConstructSSHResponse checks if the secret package uses AES-GCM to
@@ -2252,7 +3125,7 @@ func TestConstructSSHResponse(t *testing.T) {
 	plaintext, err := key.Open([]byte(rawresp.Query().Get("response")))
 	require.NoError(t, err)
 
-	var resp *auth.SSHLoginResponse
+	var resp *authclient.SSHLoginResponse
 	err = json.Unmarshal(plaintext, &resp)
 	require.NoError(t, err)
 	require.Equal(t, "foo", resp.Username)
@@ -2260,47 +3133,27 @@ func TestConstructSSHResponse(t *testing.T) {
 	require.EqualValues(t, []byte{0x01}, resp.TLSCert)
 }
 
-// TestConstructSSHResponseLegacy checks if the secret package uses NaCl to
-// encrypt and decrypt data that passes through the ConstructSSHResponse
-// function.
+// TestConstructSSHResponseLegacy checks that the old-style NaCl encryption with
+// a secret query parameter (rather than secret_key, using AES-GCM) is not
+// supported.
 func TestConstructSSHResponseLegacy(t *testing.T) {
-	key, err := lemma_secret.NewKey()
-	require.NoError(t, err)
+	u := &url.URL{
+		Scheme: "http",
+		Host:   "www.example.com",
+		Path:   "/callback",
+		RawQuery: url.Values{
+			// the old-style NaCl key is 32 bytes in base 32
+			"secret": {base64.StdEncoding.EncodeToString(make([]byte, 32))},
+		}.Encode(),
+	}
 
-	lemma, err := lemma_secret.New(&lemma_secret.Config{KeyBytes: key})
-	require.NoError(t, err)
-
-	u, err := url.Parse("http://www.example.com/callback")
-	require.NoError(t, err)
-	query := u.Query()
-	query.Set("secret", lemma_secret.KeyToEncodedString(key))
-	u.RawQuery = query.Encode()
-
-	rawresp, err := ConstructSSHResponse(AuthParams{
+	_, err := ConstructSSHResponse(AuthParams{
 		Username:          "foo",
 		Cert:              []byte{0x00},
 		TLSCert:           []byte{0x01},
 		ClientRedirectURL: u.String(),
 	})
-	require.NoError(t, err)
-
-	require.Empty(t, rawresp.Query().Get("secret"))
-	require.Empty(t, rawresp.Query().Get("secret_key"))
-	require.NotEmpty(t, rawresp.Query().Get("response"))
-
-	var sealedData *lemma_secret.SealedBytes
-	err = json.Unmarshal([]byte(rawresp.Query().Get("response")), &sealedData)
-	require.NoError(t, err)
-
-	plaintext, err := lemma.Open(sealedData)
-	require.NoError(t, err)
-
-	var resp *auth.SSHLoginResponse
-	err = json.Unmarshal(plaintext, &resp)
-	require.NoError(t, err)
-	require.Equal(t, "foo", resp.Username)
-	require.EqualValues(t, []byte{0x00}, resp.Cert)
-	require.EqualValues(t, []byte{0x01}, resp.TLSCert)
+	require.ErrorIs(t, err, &trace.BadParameterError{Message: "missing secret_key"})
 }
 
 type byTimeAndIndex []apievents.AuditEvent
@@ -2328,7 +3181,7 @@ func TestSearchClusterEvents(t *testing.T) {
 
 	s := newWebSuite(t)
 	clock := s.clock
-	sessionEvents := events.GenerateTestSession(events.SessionParams{
+	sessionEvents := eventstest.GenerateTestSession(eventstest.SessionParams{
 		PrintEvents: 3,
 		Clock:       clock,
 		ServerID:    s.proxy.ID(),
@@ -2463,7 +3316,7 @@ func TestGetClusterDetails(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, site)
 
-	cluster, err := ui.GetClusterDetails(s.ctx, site)
+	cluster, err := webui.GetClusterDetails(s.ctx, site)
 	require.NoError(t, err)
 	require.Equal(t, s.server.ClusterName(), cluster.Name)
 	require.Equal(t, teleport.Version, cluster.ProxyVersion)
@@ -2471,16 +3324,12 @@ func TestGetClusterDetails(t *testing.T) {
 	require.Equal(t, teleport.RemoteClusterStatusOnline, cluster.Status)
 	require.NotNil(t, cluster.LastConnected)
 	require.Equal(t, teleport.Version, cluster.AuthVersion)
-
-	nodes, err := s.proxyClient.GetNodes(s.ctx, apidefaults.Namespace)
-	require.NoError(t, err)
-	require.Len(t, nodes, cluster.NodeCount)
 }
 
 func TestTokenGeneration(t *testing.T) {
 	const username = "test-user@example.com"
 	// Users should be able to create Tokens even if they can't update them
-	roleTokenCRD, err := types.NewRole(services.RoleNameForUser(username), types.RoleSpecV5{
+	roleTokenCRD, err := types.NewRole(services.RoleNameForUser(username), types.RoleSpecV6{
 		Allow: types.RoleConditions{
 			Rules: []types.Rule{
 				types.NewRule(types.KindToken,
@@ -2600,11 +3449,204 @@ func TestTokenGeneration(t *testing.T) {
 	}
 }
 
+func TestEndpointNotFoundHandling(t *testing.T) {
+	t.Parallel()
+	const username = "test-user@example.com"
+	// Allow user to create tokens.
+	roleTokenCRD, err := types.NewRole(services.RoleNameForUser(username), types.RoleSpecV6{
+		Allow: types.RoleConditions{
+			Rules: []types.Rule{
+				types.NewRule(types.KindToken,
+					[]string{types.VerbCreate}),
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	env := newWebPack(t, 1)
+	proxy := env.proxies[0]
+	pack := proxy.authPack(t, username, []types.Role{roleTokenCRD})
+
+	tt := []struct {
+		name      string
+		endpoint  string
+		shouldErr bool
+	}{
+		{
+			name:     "valid endpoint without v1 prefix",
+			endpoint: "webapi/token",
+		},
+		{
+			name:     "valid endpoint with v1 prefix",
+			endpoint: "v1/webapi/token",
+		},
+		{
+			name:     "valid endpoint with v2 prefix",
+			endpoint: "v2/webapi/token",
+		},
+		{
+			name:      "invalid double version prefixes",
+			endpoint:  "v1/v2/webapi/token",
+			shouldErr: true,
+		},
+		{
+			name:      "route not matched version prefix",
+			endpoint:  "v9999999/webapi/token",
+			shouldErr: true,
+		},
+		{
+			name:      "non api route with prefix",
+			endpoint:  "v1/something/else",
+			shouldErr: true,
+		},
+		{
+			name:      "invalid triple version prefixes",
+			endpoint:  "v1/v1/v1/webapi/token",
+			shouldErr: true,
+		},
+		{
+			name:      "invalid just prefix",
+			endpoint:  "v1",
+			shouldErr: true,
+		},
+		{
+			name:      "invalid prefix",
+			endpoint:  "v1s/webapi/token",
+			shouldErr: true,
+		},
+	}
+
+	for _, tc := range tt {
+		t.Run(tc.name, func(t *testing.T) {
+			re, err := pack.clt.PostJSON(context.Background(), fmt.Sprintf("%s/%s", proxy.web.URL, tc.endpoint), types.ProvisionTokenSpecV2{
+				Roles:      []types.SystemRole{types.RoleNode},
+				JoinMethod: types.JoinMethodToken,
+			})
+
+			if tc.shouldErr {
+				require.True(t, trace.IsNotFound(err))
+
+				jsonResp := struct {
+					Error struct {
+						Message string
+					}
+					Fields struct {
+						ProxyVersion httplib.ProxyVersion
+					}
+				}{}
+
+				require.NoError(t, json.Unmarshal(re.Bytes(), &jsonResp))
+				require.Equal(t, "path not found", jsonResp.Error.Message)
+				require.Equal(t, teleport.Version, jsonResp.Fields.ProxyVersion.String)
+
+				ver, err := semver.NewVersion(teleport.Version)
+				require.NoError(t, err)
+				require.Equal(t, ver.Major, jsonResp.Fields.ProxyVersion.Major)
+				require.Equal(t, ver.Minor, jsonResp.Fields.ProxyVersion.Minor)
+				require.Equal(t, ver.Patch, jsonResp.Fields.ProxyVersion.Patch)
+				require.Equal(t, string(ver.PreRelease), jsonResp.Fields.ProxyVersion.PreRelease)
+
+			} else {
+				require.NoError(t, err)
+
+				var responseToken nodeJoinToken
+				err = json.Unmarshal(re.Bytes(), &responseToken)
+				require.NoError(t, err)
+				require.Equal(t, types.JoinMethodToken, responseToken.Method)
+			}
+		})
+	}
+}
+
+func TestKnownWebPathsWithAndWithoutV1Prefix(t *testing.T) {
+	t.Parallel()
+	const username = "test-user@example.com"
+	// Allow user to create tokens.
+	roleTokenCRD, err := types.NewRole(services.RoleNameForUser(username), types.RoleSpecV6{
+		Allow: types.RoleConditions{
+			Rules: []types.Rule{
+				types.NewRule(types.KindToken,
+					[]string{types.VerbCreate}),
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	env := newWebPack(t, 1)
+	proxy := env.proxies[0]
+	pack := proxy.authPack(t, username, []types.Role{roleTokenCRD})
+
+	res, err := pack.clt.PostJSON(context.Background(), pack.clt.Endpoint("webapi", "token"), types.ProvisionTokenSpecV2{
+		Roles: types.SystemRoles{types.RoleNode},
+	})
+	require.NoError(t, err)
+
+	var responseToken nodeJoinToken
+	err = json.Unmarshal(res.Bytes(), &responseToken)
+	require.NoError(t, err)
+
+	tt := []struct {
+		name     string
+		endpoint string
+	}{
+		{
+			name:     "web path with prefix",
+			endpoint: "v1/web/config.js",
+		},
+		{
+			name:     "web path without prefix",
+			endpoint: "web/config.js",
+		},
+		{
+			name:     "webapi path with prefix",
+			endpoint: "v1/webapi/spiffe/bundle.json",
+		},
+		{
+			name:     "webapi path without prefix",
+			endpoint: "webapi/spiffe/bundle.json",
+		},
+		{
+			name:     ".well-known path with prefix",
+			endpoint: "v1/.well-known/jwks.json",
+		},
+		{
+			name:     ".well-known path without prefix",
+			endpoint: ".well-known/jwks.json",
+		},
+		{
+			name:     "workload-identity path with prefix",
+			endpoint: "v1/workload-identity/jwt-jwks.json",
+		},
+		{
+			name:     "workload-identity path without prefix",
+			endpoint: "workload-identity/jwt-jwks.json",
+		},
+		{
+			name:     "scripts path with prefix",
+			endpoint: fmt.Sprintf("v1/scripts/%s/install-node.sh", responseToken.ID),
+		},
+		{
+			name:     "scripts path without prefix",
+			endpoint: fmt.Sprintf("scripts/%s/install-node.sh", responseToken.ID),
+		},
+	}
+
+	for _, tc := range tt {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := pack.clt.Get(context.Background(), fmt.Sprintf("%s/%s", proxy.web.URL, tc.endpoint), url.Values{})
+
+			require.NoError(t, err)
+		})
+	}
+}
+
 func TestInstallDatabaseScriptGeneration(t *testing.T) {
 	const username = "test-user@example.com"
+	modules.SetTestModules(t, &modules.TestModules{TestBuildType: modules.BuildCommunity})
 
 	// Users should be able to create Tokens even if they can't update them
-	roleTokenCRD, err := types.NewRole(services.RoleNameForUser(username), types.RoleSpecV5{
+	roleTokenCRD, err := types.NewRole(services.RoleNameForUser(username), types.RoleSpecV6{
 		Allow: types.RoleConditions{
 			Rules: []types.Rule{
 				types.NewRule(types.KindToken,
@@ -2718,12 +3760,12 @@ func TestSignMTLS(t *testing.T) {
 	tarContentFileNames := []string{}
 	for {
 		header, err := tarReader.Next()
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			break
 		}
 		require.NoError(t, err)
 		require.Equal(t, byte(tar.TypeReg), header.Typeflag)
-		require.Equal(t, int64(0600), header.Mode)
+		require.Equal(t, int64(0o600), header.Mode)
 		tarContentFileNames = append(tarContentFileNames, header.Name)
 	}
 
@@ -2747,7 +3789,7 @@ func TestSignMTLS_failsAccessDenied(t *testing.T) {
 	clusterName := env.server.ClusterName()
 	username := "test-user@example.com"
 
-	roleUserUpdate, err := types.NewRole(services.RoleNameForUser(username), types.RoleSpecV5{
+	roleUserUpdate, err := types.NewRole(services.RoleNameForUser(username), types.RoleSpecV6{
 		Allow: types.RoleConditions{
 			Rules: []types.Rule{
 				types.NewRule(types.KindUser, []string{types.VerbUpdate}),
@@ -2806,10 +3848,10 @@ func TestSignMTLS_failsAccessDenied(t *testing.T) {
 
 	// using a user token also returns Forbidden
 	endpointResetToken := pack.clt.Endpoint("webapi", "users", "password", "token")
-	_, err = pack.clt.PostJSON(context.Background(), endpointResetToken, auth.CreateUserTokenRequest{
+	_, err = pack.clt.PostJSON(context.Background(), endpointResetToken, authclient.CreateUserTokenRequest{
 		Name: username,
 		TTL:  time.Minute,
-		Type: auth.UserTokenTypeResetPassword,
+		Type: authclient.UserTokenTypeResetPassword,
 	})
 	require.NoError(t, err)
 
@@ -2825,6 +3867,7 @@ func TestSignMTLS_failsAccessDenied(t *testing.T) {
 
 // TestCheckAccessToRegisteredResource_AccessDenied tests that access denied error
 // is ignored.
+// TODO(kiosion): DELETE in 18.0
 func TestCheckAccessToRegisteredResource_AccessDenied(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -2850,7 +3893,8 @@ func TestCheckAccessToRegisteredResource_AccessDenied(t *testing.T) {
 	fooRole, err := env.server.Auth().GetRole(ctx, "user:foo")
 	require.NoError(t, err)
 	fooRole.SetRules(types.Deny, []types.Rule{types.NewRule(types.KindNode, services.RW())})
-	require.NoError(t, env.server.Auth().UpsertRole(ctx, fooRole))
+	_, err = env.server.Auth().UpsertRole(ctx, fooRole)
+	require.NoError(t, err)
 
 	// Direct querying should return a access denied error.
 	endpoint = pack.clt.Endpoint("webapi", "sites", env.server.ClusterName(), "nodes")
@@ -2866,6 +3910,7 @@ func TestCheckAccessToRegisteredResource_AccessDenied(t *testing.T) {
 	require.False(t, resp.HasResource)
 }
 
+// TODO(kiosion): DELETE in 18.0
 func TestCheckAccessToRegisteredResource(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -2878,7 +3923,7 @@ func TestCheckAccessToRegisteredResource(t *testing.T) {
 	require.NoError(t, env.server.Auth().DeleteNode(ctx, env.node.GetNamespace(), env.node.ID()))
 	n, err := env.server.Auth().GetNodes(ctx, env.node.GetNamespace())
 	require.NoError(t, err)
-	require.Len(t, n, 0)
+	require.Empty(t, n)
 
 	// Double check we start of with no resources.
 	endpoint := pack.clt.Endpoint("webapi", "sites", env.server.ClusterName(), "resources", "check")
@@ -2909,7 +3954,7 @@ func TestCheckAccessToRegisteredResource(t *testing.T) {
 				require.NoError(t, env.server.Auth().DeleteWindowsDesktop(ctx, "hostid", "test-desktop"))
 				wds, err := env.server.Auth().GetWindowsDesktops(ctx, types.WindowsDesktopFilter{})
 				require.NoError(t, err)
-				require.Len(t, wds, 0)
+				require.Empty(t, wds)
 			},
 		},
 		{
@@ -2924,7 +3969,7 @@ func TestCheckAccessToRegisteredResource(t *testing.T) {
 				require.NoError(t, env.server.Auth().DeleteNode(ctx, apidefaults.Namespace, "test-node"))
 				nodes, err := env.server.Auth().GetNodes(ctx, apidefaults.Namespace)
 				require.NoError(t, err)
-				require.Len(t, nodes, 0)
+				require.Empty(t, nodes)
 			},
 		},
 		{
@@ -2932,7 +3977,7 @@ func TestCheckAccessToRegisteredResource(t *testing.T) {
 			insertResource: func() {
 				resource := &types.AppServerV3{
 					Metadata: types.Metadata{Name: "test-app"},
-					Kind:     types.KindAppServer,
+					Kind:     types.KindApp,
 					Version:  types.V2,
 					Spec: types.AppServerSpecV3{
 						HostID: "hostid",
@@ -2953,7 +3998,7 @@ func TestCheckAccessToRegisteredResource(t *testing.T) {
 				require.NoError(t, env.server.Auth().DeleteApplicationServer(ctx, apidefaults.Namespace, "hostid", "test-app"))
 				apps, err := env.server.Auth().GetApplicationServers(ctx, apidefaults.Namespace)
 				require.NoError(t, err)
-				require.Len(t, apps, 0)
+				require.Empty(t, apps)
 			},
 		},
 		{
@@ -2962,8 +4007,7 @@ func TestCheckAccessToRegisteredResource(t *testing.T) {
 				db, err := types.NewDatabaseServerV3(types.Metadata{
 					Name: "test-db",
 				}, types.DatabaseServerSpecV3{
-					Protocol: "test-protocol",
-					URI:      "test-uri",
+					Database: mustCreateDatabase(t, "test-db", "test-protocol", "test-uri"),
 					Hostname: "test-hostname",
 					HostID:   "test-hostID",
 				})
@@ -2975,28 +4019,24 @@ func TestCheckAccessToRegisteredResource(t *testing.T) {
 				require.NoError(t, env.server.Auth().DeleteDatabaseServer(ctx, apidefaults.Namespace, "test-hostID", "test-db"))
 				dbs, err := env.server.Auth().GetDatabaseServers(ctx, apidefaults.Namespace)
 				require.NoError(t, err)
-				require.Len(t, dbs, 0)
+				require.Empty(t, dbs)
 			},
 		},
 		{
-			name: "has registered kube service",
+			name: "has registered kube server",
 			insertResource: func() {
-				_, err := env.server.Auth().UpsertKubeServiceV2(ctx, &types.ServerV2{
-					Metadata: types.Metadata{Name: "test-kube"},
-					Kind:     types.KindKubeService,
-					Version:  types.V2,
-					Spec: types.ServerSpecV2{
-						Addr:               "test",
-						KubernetesClusters: []*types.KubernetesCluster{{Name: "test-kube-name"}},
-					},
-				})
+				kubeCluster, err := types.NewKubernetesClusterV3(types.Metadata{Name: "test-kube-name"}, types.KubernetesClusterSpecV3{})
+				require.NoError(t, err)
+				kubeServer, err := types.NewKubernetesServerV3FromCluster(kubeCluster, "test-kube", "test-kube")
+				require.NoError(t, err)
+				_, err = env.server.Auth().UpsertKubernetesServer(ctx, kubeServer)
 				require.NoError(t, err)
 			},
 			deleteResource: func() {
-				require.NoError(t, env.server.Auth().DeleteKubeService(ctx, "test-kube"))
-				kubes, err := env.server.Auth().GetKubeServices(ctx)
+				require.NoError(t, env.server.Auth().DeleteKubernetesServer(ctx, "test-kube", "test-kube-name"))
+				kubes, err := env.server.Auth().GetKubernetesServers(ctx)
 				require.NoError(t, err)
-				require.Len(t, kubes, 0)
+				require.Empty(t, kubes)
 			},
 		},
 	}
@@ -3016,146 +4056,85 @@ func TestCheckAccessToRegisteredResource(t *testing.T) {
 	}
 }
 
-func TestAuthExport(t *testing.T) {
-	ctx := context.Background()
-
-	env := newWebPack(t, 1)
-	clusterName := env.server.ClusterName()
-
-	proxy := env.proxies[0]
-	pack := proxy.authPack(t, "test-user@example.com", nil)
-
-	validateTLSCertificateDERFunc := func(t *testing.T, b []byte) {
-		cert, err := x509.ParseCertificate(b)
-		require.NoError(t, err)
-		require.NotNil(t, cert, "ParseCertificate failed")
-		require.Equal(t, "localhost", cert.Subject.CommonName, "unexpected certificate subject CN")
-	}
-
-	validateTLSCertificatePEMFunc := func(t *testing.T, b []byte) {
-		pemBlock, _ := pem.Decode(b)
-		require.NotNil(t, pemBlock, "pem.Decode failed")
-
-		validateTLSCertificateDERFunc(t, pemBlock.Bytes)
-	}
-
-	for _, tt := range []struct {
-		name           string
-		authType       string
-		expectedStatus int
-		assertBody     func(t *testing.T, bs []byte)
-	}{
-		{
-			name:           "all",
-			authType:       "",
-			expectedStatus: http.StatusOK,
-			assertBody: func(t *testing.T, b []byte) {
-				require.Contains(t, string(b), "@cert-authority localhost,*.localhost ssh-rsa ")
-				require.Contains(t, string(b), "cert-authority ssh-rsa")
-			},
+func mustCreateDatabase(t *testing.T, name, protocol, uri string) *types.DatabaseV3 {
+	database, err := types.NewDatabaseV3(
+		types.Metadata{
+			Name: name,
 		},
-		{
-			name:           "host",
-			authType:       "host",
-			expectedStatus: http.StatusOK,
-			assertBody: func(t *testing.T, b []byte) {
-				require.Contains(t, string(b), "@cert-authority localhost,*.localhost ssh-rsa ")
-			},
+		types.DatabaseSpecV3{
+			Protocol: protocol,
+			URI:      uri,
 		},
-		{
-			name:           "user",
-			authType:       "user",
-			expectedStatus: http.StatusOK,
-			assertBody: func(t *testing.T, b []byte) {
-				require.Contains(t, string(b), "cert-authority ssh-rsa")
-			},
-		},
-		{
-			name:           "windows",
-			authType:       "windows",
-			expectedStatus: http.StatusOK,
-			assertBody:     validateTLSCertificateDERFunc,
-		},
-		{
-			name:           "db",
-			authType:       "db",
-			expectedStatus: http.StatusOK,
-			assertBody:     validateTLSCertificatePEMFunc,
-		},
-		{
-			name:           "tls",
-			authType:       "tls",
-			expectedStatus: http.StatusOK,
-			assertBody:     validateTLSCertificatePEMFunc,
-		},
-		{
-			name:           "invalid",
-			authType:       "invalid",
-			expectedStatus: http.StatusBadRequest,
-			assertBody: func(t *testing.T, b []byte) {
-				require.Contains(t, string(b), `"invalid" authority type is not supported`)
-			},
-		},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			// export host certificate
-			endpointExport := pack.clt.Endpoint("webapi", "sites", clusterName, "auth", "export")
-
-			if tt.authType != "" {
-				endpointExport = fmt.Sprintf("%s?type=%s", endpointExport, tt.authType)
-			}
-
-			reqCtx, cancel := context.WithTimeout(ctx, time.Second)
-			defer cancel()
-
-			req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, endpointExport, nil)
-			require.NoError(t, err)
-
-			anonHTTPClient := &http.Client{
-				Transport: &http.Transport{
-					TLSClientConfig: &tls.Config{
-						InsecureSkipVerify: true,
-					},
-				},
-			}
-
-			resp, err := anonHTTPClient.Do(req)
-			require.NoError(t, err)
-			defer resp.Body.Close()
-
-			bs, err := io.ReadAll(resp.Body)
-			require.NoError(t, err)
-
-			require.Equal(t, tt.expectedStatus, resp.StatusCode, "invalid status code with body %s", string(bs))
-
-			require.NotEmpty(t, bs, "unexpected empty body from http response")
-			if tt.assertBody != nil {
-				tt.assertBody(t, bs)
-			}
-		})
-	}
+	)
+	require.NoError(t, err)
+	return database
 }
 
-func TestClusterDatabasesGet(t *testing.T) {
+func TestClusterDatabasesGet_NoRole(t *testing.T) {
 	env := newWebPack(t, 1)
 
 	proxy := env.proxies[0]
+
 	pack := proxy.authPack(t, "test-user@example.com", nil /* roles */)
 
 	query := url.Values{"sort": []string{"name"}}
 	endpoint := pack.clt.Endpoint("webapi", "sites", env.server.ClusterName(), "databases")
+
+	type testResponse struct {
+		Items      []webui.Database `json:"items"`
+		TotalCount int              `json:"totalCount"`
+	}
+
+	// add db
+	db, err := types.NewDatabaseV3(types.Metadata{
+		Name: "dbdb",
+		Labels: map[string]string{
+			"env": "prod",
+		},
+	}, types.DatabaseSpecV3{
+		Protocol: "test-protocol",
+		URI:      "test-uri:1234",
+	})
+	require.NoError(t, err)
+	dbServer, err := types.NewDatabaseServerV3(types.Metadata{
+		Name: "dddb1",
+	}, types.DatabaseServerSpecV3{
+		Hostname: "dddb1",
+		HostID:   uuid.NewString(),
+		Database: db,
+	})
+	require.NoError(t, err)
+
+	_, err = env.server.Auth().UpsertDatabaseServer(context.Background(), dbServer)
+	require.NoError(t, err)
+
+	// Test without defined database names or users in role.
 	re, err := pack.clt.Get(context.Background(), endpoint, query)
 	require.NoError(t, err)
 
-	type testResponse struct {
-		Items      []ui.Database `json:"items"`
-		TotalCount int           `json:"totalCount"`
-	}
-
-	// No db registered.
 	resp := testResponse{}
 	require.NoError(t, json.Unmarshal(re.Bytes(), &resp))
-	require.Len(t, resp.Items, 0)
+	require.Len(t, resp.Items, 1)
+	require.ElementsMatch(t, resp.Items, []webui.Database{{
+		Kind:     types.KindDatabase,
+		Name:     "dbdb",
+		Type:     types.DatabaseTypeSelfHosted,
+		Labels:   []ui.Label{{Name: "env", Value: "prod"}},
+		Protocol: "test-protocol",
+		Hostname: "test-uri",
+		URI:      "test-uri:1234",
+	}})
+}
+
+func TestClusterDatabasesGet_WithRole(t *testing.T) {
+	env := newWebPack(t, 1)
+
+	proxy := env.proxies[0]
+
+	type testResponse struct {
+		Items      []webui.Database `json:"items"`
+		TotalCount int              `json:"totalCount"`
+	}
 
 	// Register databases.
 	db, err := types.NewDatabaseServerV3(types.Metadata{
@@ -3167,23 +4146,6 @@ func TestClusterDatabasesGet(t *testing.T) {
 			Metadata: types.Metadata{
 				Name:        "db1",
 				Description: "test-description",
-				Labels:      map[string]string{"test-field": "test-value"},
-			},
-			Spec: types.DatabaseSpecV3{
-				Protocol: "test-protocol",
-				URI:      "test-uri",
-			},
-		},
-	})
-	require.NoError(t, err)
-	db2, err := types.NewDatabaseServerV3(types.Metadata{
-		Name: "dbServer2",
-	}, types.DatabaseServerSpecV3{
-		Hostname: "test-hostname",
-		HostID:   "test-hostID",
-		Database: &types.DatabaseV3{
-			Metadata: types.Metadata{
-				Name: "db2",
 			},
 			Spec: types.DatabaseSpecV3{
 				Protocol: "test-protocol",
@@ -3192,209 +4154,34 @@ func TestClusterDatabasesGet(t *testing.T) {
 		},
 	})
 	require.NoError(t, err)
+	require.NoError(t, err)
 
 	_, err = env.server.Auth().UpsertDatabaseServer(context.Background(), db)
 	require.NoError(t, err)
-	_, err = env.server.Auth().UpsertDatabaseServer(context.Background(), db2)
-	require.NoError(t, err)
 
-	re, err = pack.clt.Get(context.Background(), endpoint, query)
-	require.NoError(t, err)
-
-	resp = testResponse{}
-	require.NoError(t, json.Unmarshal(re.Bytes(), &resp))
-	require.Len(t, resp.Items, 2)
-	require.Equal(t, 2, resp.TotalCount)
-	require.ElementsMatch(t, resp.Items, []ui.Database{{
-		Name:     "db1",
-		Desc:     "test-description",
-		Protocol: "test-protocol",
-		Type:     types.DatabaseTypeSelfHosted,
-		Labels:   []ui.Label{{Name: "test-field", Value: "test-value"}},
-		Hostname: "test-uri",
-	}, {
-		Name:     "db2",
-		Type:     types.DatabaseTypeSelfHosted,
-		Labels:   []ui.Label{},
-		Protocol: "test-protocol",
-		Hostname: "test-uri",
-	}})
-}
-
-func TestClusterDatabaseGet(t *testing.T) {
-	env := newWebPack(t, 1)
-	ctx := context.Background()
-
-	proxy := env.proxies[0]
-
-	dbNames := []string{"db1", "db2"}
-	dbUsers := []string{"user1", "user2"}
-
-	for _, tt := range []struct {
-		name            string
-		preRegisterDB   bool
-		databaseName    string
-		userRoles       func(*testing.T) []types.Role
-		expectedDBUsers []string
-		expectedDBNames []string
-		requireError    require.ErrorAssertionFunc
-	}{
-		{
-			name:          "valid",
-			preRegisterDB: true,
-			databaseName:  "valid",
-			requireError:  require.NoError,
-		},
-		{
-			name:          "notfound",
-			preRegisterDB: true,
-			databaseName:  "otherdb",
-			requireError: func(tt require.TestingT, err error, i ...interface{}) {
-				require.True(tt, trace.IsNotFound(err), "expected a not found error, got %v", err)
+	// Test with a role that defines database names and users.
+	extraRole := &types.RoleV6{
+		Metadata: types.Metadata{Name: "extra-role"},
+		Spec: types.RoleSpecV6{
+			Allow: types.RoleConditions{
+				DatabaseNames: []string{"name1"},
+				DatabaseUsers: []string{"user1"},
+				DatabaseLabels: types.Labels{
+					"*": []string{"*"},
+				},
 			},
 		},
-		{
-			name:          "notauthorized",
-			preRegisterDB: true,
-			databaseName:  "notauthorized",
-			userRoles: func(tt *testing.T) []types.Role {
-				role, err := types.NewRole(
-					"myrole",
-					types.RoleSpecV5{
-						Allow: types.RoleConditions{
-							DatabaseLabels: types.Labels{
-								"env": apiutils.Strings{"staging"},
-							},
-						},
-					},
-				)
-				require.NoError(tt, err)
-				return []types.Role{role}
-			},
-			requireError: func(tt require.TestingT, err error, i ...interface{}) {
-				require.True(tt, trace.IsNotFound(err), "expected a not found error, got %v", err)
-			},
-		},
-		{
-			name:          "nodb",
-			preRegisterDB: false,
-			databaseName:  "nodb",
-			userRoles: func(tt *testing.T) []types.Role {
-				roleWithDBName, err := types.NewRole(
-					"myroleWithDBName",
-					types.RoleSpecV5{
-						Allow: types.RoleConditions{
-							DatabaseLabels: types.Labels{
-								"env": apiutils.Strings{"prod"},
-							},
-							DatabaseNames: dbNames,
-						},
-					},
-				)
-				require.NoError(tt, err)
-
-				return []types.Role{roleWithDBName}
-			},
-			expectedDBNames: dbNames,
-			expectedDBUsers: dbUsers,
-			requireError: func(tt require.TestingT, err error, i ...interface{}) {
-				require.True(tt, trace.IsNotFound(err), "expected a not found error, got %v", err)
-			},
-		},
-		{
-			name:          "authorizedDBNamesUsers",
-			preRegisterDB: true,
-			databaseName:  "authorizedDBNamesUsers",
-			userRoles: func(tt *testing.T) []types.Role {
-				roleWithDBName, err := types.NewRole(
-					"myroleWithDBName",
-					types.RoleSpecV5{
-						Allow: types.RoleConditions{
-							DatabaseLabels: types.Labels{
-								"env": apiutils.Strings{"prod"},
-							},
-							DatabaseNames: dbNames,
-						},
-					},
-				)
-				require.NoError(tt, err)
-
-				roleWithDBUser, err := types.NewRole(
-					"myroleWithDBUser",
-					types.RoleSpecV5{
-						Allow: types.RoleConditions{
-							DatabaseLabels: types.Labels{
-								"env": apiutils.Strings{"prod"},
-							},
-							DatabaseUsers: dbUsers,
-						},
-					},
-				)
-				require.NoError(tt, err)
-
-				return []types.Role{roleWithDBUser, roleWithDBName}
-			},
-			expectedDBNames: dbNames,
-			expectedDBUsers: dbUsers,
-			requireError:    require.NoError,
-		},
-	} {
-		tt := tt
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			// Create default pre-registerDB
-			if tt.preRegisterDB {
-				db, err := types.NewDatabaseV3(types.Metadata{
-					Name: tt.name,
-					Labels: map[string]string{
-						"env": "prod",
-					},
-				}, types.DatabaseSpecV3{
-					Protocol: "test-protocol",
-					URI:      "test-uri",
-				})
-				require.NoError(t, err)
-
-				dbServer, err := types.NewDatabaseServerV3(types.Metadata{
-					Name: tt.name,
-				}, types.DatabaseServerSpecV3{
-					Hostname: tt.name,
-					Protocol: "test-protocol",
-					URI:      "test-uri",
-					HostID:   uuid.NewString(),
-					Database: db,
-				})
-				require.NoError(t, err)
-
-				_, err = env.server.Auth().UpsertDatabaseServer(context.Background(), dbServer)
-				require.NoError(t, err)
-			}
-
-			var roles []types.Role
-			if tt.userRoles != nil {
-				roles = tt.userRoles(t)
-			}
-
-			pack := proxy.authPack(t, tt.name+"_user@example.com", roles)
-
-			endpoint := pack.clt.Endpoint("webapi", "sites", env.server.ClusterName(), "databases", tt.databaseName)
-			re, err := pack.clt.Get(ctx, endpoint, nil)
-			tt.requireError(t, err)
-			if err != nil {
-				return
-			}
-
-			resp := ui.Database{}
-			require.NoError(t, json.Unmarshal(re.Bytes(), &resp))
-
-			require.Equal(t, tt.databaseName, resp.Name, "database name")
-			require.Equal(t, types.DatabaseTypeSelfHosted, resp.Type, "database type")
-			require.EqualValues(t, []ui.Label{{Name: "env", Value: "prod"}}, resp.Labels)
-			require.ElementsMatch(t, tt.expectedDBUsers, resp.DatabaseUsers)
-			require.ElementsMatch(t, tt.expectedDBNames, resp.DatabaseNames)
-		})
 	}
+
+	query := url.Values{"sort": []string{"name"}}
+	pack := proxy.authPack(t, "test-user2@example.com", services.NewRoleSet(extraRole))
+	endpoint := pack.clt.Endpoint("webapi", "sites", env.server.ClusterName(), "databases")
+	re, err := pack.clt.Get(context.Background(), endpoint, query)
+	require.NoError(t, err)
+
+	resp := testResponse{}
+	require.NoError(t, json.Unmarshal(re.Bytes(), &resp))
+	require.Len(t, resp.Items, 1)
 }
 
 func TestClusterKubesGet(t *testing.T) {
@@ -3402,9 +4189,9 @@ func TestClusterKubesGet(t *testing.T) {
 
 	proxy := env.proxies[0]
 
-	extraRole := &types.RoleV5{
+	extraRole := &types.RoleV6{
 		Metadata: types.Metadata{Name: "extra-role"},
-		Spec: types.RoleSpecV5{
+		Spec: types.RoleSpecV6{
 			Allow: types.RoleConditions{
 				KubeUsers:  []string{"user1"},
 				KubeGroups: []string{"group1"},
@@ -3454,20 +4241,20 @@ func TestClusterKubesGet(t *testing.T) {
 	require.NoError(t, err)
 
 	type testResponse struct {
-		Items      []ui.KubeCluster `json:"items"`
-		TotalCount int              `json:"totalCount"`
+		Items      []webui.KubeCluster `json:"items"`
+		TotalCount int                 `json:"totalCount"`
 	}
 
 	tt := []struct {
 		name             string
 		user             string
 		extraRoles       services.RoleSet
-		expectedResponse []ui.KubeCluster
+		expectedResponse []webui.KubeCluster
 	}{
 		{
 			name: "user with no extra roles",
 			user: "test-user@example.com",
-			expectedResponse: []ui.KubeCluster{
+			expectedResponse: []webui.KubeCluster{
 				{
 					Name:       "test-kube1",
 					Labels:     []ui.Label{{Name: "test-field", Value: "test-value"}},
@@ -3486,7 +4273,7 @@ func TestClusterKubesGet(t *testing.T) {
 			name:       "user with extra roles",
 			user:       "test-user2@example.com",
 			extraRoles: services.NewRoleSet(extraRole),
-			expectedResponse: []ui.KubeCluster{
+			expectedResponse: []webui.KubeCluster{
 				{
 					Name:       "test-kube1",
 					Labels:     []ui.Label{{Name: "test-field", Value: "test-value"}},
@@ -3519,32 +4306,180 @@ func TestClusterKubesGet(t *testing.T) {
 	}
 }
 
+func TestClusterKubeResourcesGet(t *testing.T) {
+	t.Parallel()
+	kubeClusterName := "kube_cluster"
+
+	roleWithFullAccess := func(username string) []types.Role {
+		ret, err := types.NewRole(services.RoleNameForUser(username), types.RoleSpecV6{
+			Allow: types.RoleConditions{
+				Namespaces:       []string{apidefaults.Namespace},
+				KubernetesLabels: types.Labels{types.Wildcard: []string{types.Wildcard}},
+				Rules: []types.Rule{
+					types.NewRule(types.KindConnectionDiagnostic, services.RW()),
+				},
+				KubeGroups: []string{"groups"},
+				KubernetesResources: []types.KubernetesResource{
+					{
+						Kind:      types.KindKubePod,
+						Namespace: types.Wildcard,
+						Name:      types.Wildcard,
+					},
+					{
+						Kind: types.KindKubeNamespace,
+						Name: types.Wildcard,
+					},
+				},
+			},
+		})
+		require.NoError(t, err)
+		return []types.Role{ret}
+	}
+	require.NotNil(t, roleWithFullAccess)
+
+	env := newWebPack(t, 1)
+
+	type testResponse struct {
+		Items      []webui.KubeResource `json:"items"`
+		TotalCount int                  `json:"totalCount"`
+	}
+
+	tt := []struct {
+		name             string
+		user             string
+		kind             string
+		kubeCluster      string
+		expectedResponse []webui.KubeResource
+		wantErr          bool
+	}{
+		{
+			name:        "get pods from gRPC server",
+			kind:        types.KindKubePod,
+			kubeCluster: kubeClusterName,
+			expectedResponse: []webui.KubeResource{
+				{
+					Kind:        types.KindKubePod,
+					Name:        "test-pod",
+					Namespace:   "default",
+					Labels:      []ui.Label{{Name: "app", Value: "test"}},
+					KubeCluster: kubeClusterName,
+				},
+				{
+					Kind:        types.KindKubePod,
+					Name:        "test-pod2",
+					Namespace:   "default",
+					Labels:      []ui.Label{{Name: "app", Value: "test2"}},
+					KubeCluster: kubeClusterName,
+				},
+			},
+		},
+		{
+			name:        "get namespaces",
+			kind:        types.KindKubeNamespace,
+			kubeCluster: kubeClusterName,
+			expectedResponse: []webui.KubeResource{
+				{
+					Kind:        types.KindKubeNamespace,
+					Name:        "default",
+					Namespace:   "",
+					Labels:      []ui.Label{{Name: "app", Value: "test"}},
+					KubeCluster: kubeClusterName,
+				},
+			},
+		},
+		{
+			name:        "missing kind",
+			kind:        "",
+			kubeCluster: kubeClusterName,
+			wantErr:     true,
+		},
+		{
+			name:        "invalid kind",
+			kind:        "invalid-kind",
+			kubeCluster: kubeClusterName,
+			wantErr:     true,
+		},
+		{
+			name:        "missing kube cluster",
+			kind:        types.KindKubeNamespace,
+			kubeCluster: "",
+			wantErr:     true,
+		},
+	}
+	proxy := env.proxies[0]
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	// Init fake gRPC Kube service.
+	initGRPCServer(t, env, listener)
+	addr := utils.MustParseAddr(listener.Addr().String())
+	proxy.handler.handler.cfg.ProxyWebAddr = *addr
+
+	user := "test-user@example.com"
+	pack := proxy.authPack(t, user, roleWithFullAccess(user))
+
+	for _, tc := range tt {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			endpoint := pack.clt.Endpoint("webapi", "sites", env.server.ClusterName(), "kubernetes", "resources")
+			params := url.Values{}
+			params.Add("kubeCluster", tc.kubeCluster)
+			params.Add("kind", tc.kind)
+			re, err := pack.clt.Get(context.Background(), endpoint, params)
+
+			if tc.wantErr {
+				require.True(t, trace.IsBadParameter(err))
+			} else {
+				require.NoError(t, err)
+				resp := testResponse{}
+				require.NoError(t, json.Unmarshal(re.Bytes(), &resp))
+				require.ElementsMatch(t, tc.expectedResponse, resp.Items)
+			}
+		})
+	}
+}
+
+// DELETE IN 16.0
 func TestClusterAppsGet(t *testing.T) {
 	env := newWebPack(t, 1)
+
+	// Set license to enterprise in order to be able to list SAML IdP Service Providers.
+	modules.SetTestModules(t, &modules.TestModules{
+		TestBuildType: modules.BuildEnterprise,
+	})
 
 	proxy := env.proxies[0]
 	pack := proxy.authPack(t, "test-user@example.com", nil /* roles */)
 
 	type testResponse struct {
-		Items      []ui.App `json:"items"`
-		TotalCount int      `json:"totalCount"`
+		Items      []webui.App `json:"items"`
+		TotalCount int         `json:"totalCount"`
 	}
+
+	// add a user group
+	ug, err := types.NewUserGroup(types.Metadata{
+		Name: "ug1", Description: "ug1-description",
+	},
+		types.UserGroupSpecV1{Applications: []string{"app1"}})
+	require.NoError(t, err)
+	err = env.server.Auth().CreateUserGroup(context.Background(), ug)
+	require.NoError(t, err)
 
 	resource := &types.AppServerV3{
 		Metadata: types.Metadata{Name: "test-app"},
-		Kind:     types.KindAppServer,
+		Kind:     types.KindApp,
 		Version:  types.V2,
 		Spec: types.AppServerSpecV3{
 			HostID: "hostid",
 			App: &types.AppV3{
 				Metadata: types.Metadata{
-					Name:        "name",
+					Name:        "app1",
 					Description: "description",
 					Labels:      map[string]string{"test-field": "test-value"},
 				},
 				Spec: types.AppSpecV3{
 					URI:        "https://console.aws.amazon.com", // sets field awsConsole to true
 					PublicAddr: "publicaddrs",
+					UserGroups: []string{"ug1", "ug2"}, // ug2 doesn't exist in the backend, so its lookup will fail.
 				},
 			},
 		},
@@ -3555,24 +4490,14 @@ func TestClusterAppsGet(t *testing.T) {
 		App: &types.AppV3{
 			Metadata: types.Metadata{Name: "app2"},
 			Spec:     types.AppSpecV3{URI: "uri", PublicAddr: "publicaddrs"},
-		}})
+		},
+	})
 	require.NoError(t, err)
 
-	// Test URIs with tcp is filtered out of result.
-	resource3, err := types.NewAppServerV3(types.Metadata{Name: "server3"}, types.AppServerSpecV3{
-		HostID: "hostid",
-		App: &types.AppV3{
-			Metadata: types.Metadata{Name: "app3"},
-			Spec:     types.AppSpecV3{URI: "tcp://something", PublicAddr: "publicaddrs"},
-		}})
-	require.NoError(t, err)
-
-	// Register apps.
+	// Register apps and service providers.
 	_, err = env.server.Auth().UpsertApplicationServer(context.Background(), resource)
 	require.NoError(t, err)
 	_, err = env.server.Auth().UpsertApplicationServer(context.Background(), resource2)
-	require.NoError(t, err)
-	_, err = env.server.Auth().UpsertApplicationServer(context.Background(), resource3)
 	require.NoError(t, err)
 
 	// Make the call.
@@ -3585,8 +4510,9 @@ func TestClusterAppsGet(t *testing.T) {
 	require.NoError(t, json.Unmarshal(re.Bytes(), &resp))
 	require.Len(t, resp.Items, 2)
 	require.Equal(t, 2, resp.TotalCount)
-	require.ElementsMatch(t, resp.Items, []ui.App{{
-		Name:        resource.Spec.App.GetName(),
+	require.ElementsMatch(t, resp.Items, []webui.App{{
+		Kind:        types.KindApp,
+		Name:        "app1",
 		Description: resource.Spec.App.GetDescription(),
 		URI:         resource.Spec.App.GetURI(),
 		PublicAddr:  resource.Spec.App.GetPublicAddr(),
@@ -3594,7 +4520,9 @@ func TestClusterAppsGet(t *testing.T) {
 		FQDN:        resource.Spec.App.GetPublicAddr(),
 		ClusterID:   env.server.ClusterName(),
 		AWSConsole:  true,
+		UserGroups:  []webui.UserGroupAndDescription{{Name: "ug1", Description: "ug1-description"}},
 	}, {
+		Kind:       types.KindApp,
 		Name:       "app2",
 		URI:        "uri",
 		Labels:     []ui.Label{},
@@ -3603,7 +4531,6 @@ func TestClusterAppsGet(t *testing.T) {
 		PublicAddr: "publicaddrs",
 		AWSConsole: false,
 	}})
-
 }
 
 // TestApplicationAccessDisabled makes sure application access can be disabled
@@ -3611,7 +4538,9 @@ func TestClusterAppsGet(t *testing.T) {
 func TestApplicationAccessDisabled(t *testing.T) {
 	modules.SetTestModules(t, &modules.TestModules{
 		TestFeatures: modules.Features{
-			App: false,
+			Entitlements: map[entitlements.EntitlementKind]modules.EntitlementInfo{
+				entitlements.App: {Enabled: false},
+			},
 		},
 	})
 
@@ -3635,9 +4564,11 @@ func TestApplicationAccessDisabled(t *testing.T) {
 
 	endpoint := pack.clt.Endpoint("webapi", "sessions", "app")
 	_, err = pack.clt.PostJSON(context.Background(), endpoint, &CreateAppSessionRequest{
-		FQDNHint:    "panel.example.com",
-		PublicAddr:  "panel.example.com",
-		ClusterName: "localhost",
+		ResolveAppParams: ResolveAppParams{
+			FQDNHint:    "panel.example.com",
+			PublicAddr:  "panel.example.com",
+			ClusterName: "localhost",
+		},
 	})
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "this Teleport cluster is not licensed for application access")
@@ -3679,44 +4610,128 @@ func TestApplicationWebSessionsDeletedAfterLogout(t *testing.T) {
 		// Create application session
 		endpoint := pack.clt.Endpoint("webapi", "sessions", "app")
 		_, err = pack.clt.PostJSON(context.Background(), endpoint, &CreateAppSessionRequest{
-			FQDNHint:    application.publicAddr,
-			PublicAddr:  application.publicAddr,
-			ClusterName: "localhost",
+			ResolveAppParams: ResolveAppParams{
+				FQDNHint:    application.publicAddr,
+				PublicAddr:  application.publicAddr,
+				ClusterName: "localhost",
+			},
 		})
 		require.NoError(t, err)
 	}
 
+	collectAppSessions := func(ctx context.Context) []types.WebSession {
+		var (
+			nextToken string
+			sessions  []types.WebSession
+		)
+		for {
+			webSessions, token, err := proxy.client.ListAppSessions(ctx, apidefaults.DefaultChunkSize, nextToken, "")
+			require.NoError(t, err)
+			sessions = append(sessions, webSessions...)
+			if token == "" {
+				break
+			}
+
+			nextToken = token
+		}
+
+		return sessions
+	}
+
 	// List sessions, should have one for each application.
-	sessions, err := proxy.client.GetAppSessions(context.Background())
-	require.NoError(t, err)
-	require.Len(t, sessions, len(applications))
+	require.Len(t, collectAppSessions(context.Background()), len(applications))
 
 	// Logout from Telport.
-	_, err = pack.clt.Delete(context.Background(), pack.clt.Endpoint("webapi", "sessions"))
+	_, err := pack.clt.Delete(context.Background(), pack.clt.Endpoint("webapi", "sessions", "web"))
 	require.NoError(t, err)
 
 	// Check sessions after logout, should be empty.
-	sessions, err = proxy.client.GetAppSessions(context.Background())
-	require.NoError(t, err)
-	require.Len(t, sessions, 0)
+	require.Empty(t, collectAppSessions(context.Background()))
 }
 
-func TestGetWebConfig(t *testing.T) {
-	t.Parallel()
+func TestGetAppDetails(t *testing.T) {
+	ctx := context.Background()
+	s := newWebSuite(t)
+	pack := s.authPack(t, "foo@example.com")
+
+	// Register an application called "api".
+	apiApp, err := types.NewAppV3(types.Metadata{
+		Name: "api",
+	}, types.AppSpecV3{
+		URI:        "http://127.0.0.1:8080",
+		PublicAddr: "api.example.com",
+	})
+	require.NoError(t, err)
+	server, err := types.NewAppServerV3FromApp(apiApp, "host", uuid.New().String())
+	require.NoError(t, err)
+	_, err = s.server.Auth().UpsertApplicationServer(s.ctx, server)
+	require.NoError(t, err)
+
+	// Register an application called "client" and have "api" required.
+	clientApp, err := types.NewAppV3(types.Metadata{
+		Name: "client",
+	}, types.AppSpecV3{
+		URI:              "http://127.0.0.1:8080",
+		PublicAddr:       "client.example.com",
+		RequiredAppNames: []string{"api"},
+	})
+	require.NoError(t, err)
+	server2, err := types.NewAppServerV3FromApp(clientApp, "host", uuid.New().String())
+	require.NoError(t, err)
+	_, err = s.server.Auth().UpsertApplicationServer(s.ctx, server2)
+	require.NoError(t, err)
+
+	clientFQDN := "client.example.com"
+
+	tests := []struct {
+		name     string
+		endpoint string
+	}{
+		{
+			name:     "request app details with clientName and publicAddr",
+			endpoint: pack.clt.Endpoint("webapi", "apps", clientFQDN, s.server.ClusterName(), clientApp.GetPublicAddr()),
+		},
+		{
+			name:     "request app details with fqdn only",
+			endpoint: pack.clt.Endpoint("webapi", "apps", clientFQDN),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			re, err := pack.clt.Get(ctx, tc.endpoint, url.Values{})
+			require.NoError(t, err)
+			resp := GetAppDetailsResponse{}
+
+			require.NoError(t, json.Unmarshal(re.Bytes(), &resp))
+			require.Equal(t, GetAppDetailsResponse{
+				FQDN:             "client.example.com",
+				RequiredAppFQDNs: []string{"api.example.com", "client.example.com"},
+			}, resp)
+		})
+	}
+}
+
+func TestGetWebConfig_WithEntitlements(t *testing.T) {
 	ctx := context.Background()
 	env := newWebPack(t, 1)
+	handler := env.proxies[0].handler.handler
 
 	// Set auth preference with passwordless.
+	const MOTD = "Welcome to cluster, your activity will be recorded."
 	ap, err := types.NewAuthPreference(types.AuthPreferenceSpecV2{
 		Type:          constants.Local,
-		SecondFactor:  constants.SecondFactorOptional,
+		SecondFactor:  constants.SecondFactorOn,
 		ConnectorName: constants.PasswordlessConnector,
 		Webauthn: &types.Webauthn{
 			RPID: "localhost",
 		},
+		MessageOfTheDay: MOTD,
 	})
 	require.NoError(t, err)
-	err = env.server.Auth().SetAuthPreference(ctx, ap)
+	_, err = env.server.Auth().UpsertAuthPreference(ctx, ap)
 	require.NoError(t, err)
 
 	// Add a test connector.
@@ -3730,12 +4745,15 @@ func TestGetWebConfig(t *testing.T) {
 		},
 	})
 	require.NoError(t, err)
-	err = env.server.Auth().UpsertGithubConnector(ctx, github)
+	_, err = env.server.Auth().UpsertGithubConnector(ctx, github)
 	require.NoError(t, err)
+
+	// start the feature watcher so the web config gets new features
+	env.clock.Advance(DefaultFeatureWatchInterval * 2)
 
 	expectedCfg := webclient.WebConfig{
 		Auth: webclient.WebConfigAuthSettings{
-			SecondFactor: constants.SecondFactorOptional,
+			SecondFactor: constants.SecondFactorOn,
 			Providers: []webclient.WebConfigAuthProvider{{
 				Name:      "test-github",
 				Type:      constants.Github,
@@ -3747,10 +4765,52 @@ func TestGetWebConfig(t *testing.T) {
 			PreferredLocalMFA:  constants.SecondFactorWebauthn,
 			LocalConnectorName: constants.PasswordlessConnector,
 			PrivateKeyPolicy:   keys.PrivateKeyPolicyNone,
+			MOTD:               MOTD,
 		},
-		CanJoinSessions:  true,
-		ProxyClusterName: env.server.ClusterName(),
-		IsCloud:          false,
+		CanJoinSessions:    true,
+		ProxyClusterName:   env.server.ClusterName(),
+		IsCloud:            false,
+		AutomaticUpgrades:  false,
+		JoinActiveSessions: true,
+		Edition:            modules.BuildOSS, // testBuildType is empty
+		Entitlements: map[string]webclient.EntitlementInfo{
+			string(entitlements.AccessLists):            {Enabled: false},
+			string(entitlements.AccessMonitoring):       {Enabled: false},
+			string(entitlements.AccessRequests):         {Enabled: false},
+			string(entitlements.App):                    {Enabled: true},
+			string(entitlements.CloudAuditLogRetention): {Enabled: false},
+			string(entitlements.DB):                     {Enabled: true},
+			string(entitlements.Desktop):                {Enabled: true},
+			string(entitlements.DeviceTrust):            {Enabled: false},
+			string(entitlements.ExternalAuditStorage):   {Enabled: false},
+			string(entitlements.FeatureHiding):          {Enabled: false},
+			string(entitlements.HSM):                    {Enabled: false},
+			string(entitlements.Identity):               {Enabled: false},
+			string(entitlements.JoinActiveSessions):     {Enabled: true},
+			string(entitlements.K8s):                    {Enabled: true},
+			string(entitlements.MobileDeviceManagement): {Enabled: false},
+			string(entitlements.OIDC):                   {Enabled: false},
+			string(entitlements.OktaSCIM):               {Enabled: false},
+			string(entitlements.OktaUserSync):           {Enabled: false},
+			string(entitlements.Policy):                 {Enabled: false},
+			string(entitlements.SAML):                   {Enabled: false},
+			string(entitlements.SessionLocks):           {Enabled: false},
+			string(entitlements.UpsellAlert):            {Enabled: false},
+			string(entitlements.UsageReporting):         {Enabled: false},
+			string(entitlements.LicenseAutoUpdate):      {Enabled: false},
+		},
+		TunnelPublicAddress:            "",
+		RecoveryCodesEnabled:           false,
+		UI:                             webclient.UIConfig{},
+		IsPolicyRoleVisualizerEnabled:  true,
+		IsDashboard:                    false,
+		IsUsageBasedBilling:            false,
+		AutomaticUpgradesTargetVersion: "",
+		CustomTheme:                    "",
+		Questionnaire:                  false,
+		IsStripeManaged:                false,
+		PremiumSupport:                 false,
+		PlayableDatabaseProtocols:      player.SupportedDatabaseProtocols,
 	}
 
 	// Make a request.
@@ -3767,6 +4827,186 @@ func TestGetWebConfig(t *testing.T) {
 	err = json.Unmarshal([]byte(str[:len(str)-1]), &cfg)
 	require.NoError(t, err)
 	require.Equal(t, expectedCfg, cfg)
+
+	// update features and assert that it is properly updated on the config object
+	modules.SetTestModules(t, &modules.TestModules{
+		TestFeatures: modules.Features{
+			Cloud:               true,
+			IsUsageBasedBilling: true,
+			AutomaticUpgrades:   true,
+			Entitlements: map[entitlements.EntitlementKind]modules.EntitlementInfo{
+				entitlements.DB:          {Enabled: true, Limit: 22},
+				entitlements.DeviceTrust: {Enabled: true, Limit: 33},
+				entitlements.Desktop:     {Enabled: true, Limit: 44},
+			},
+		},
+	})
+	env.clock.Advance(DefaultFeatureWatchInterval * 2)
+
+	require.NoError(t, err)
+	// This version is too high and MUST NOT be used
+	testVersion := "v99.0.1"
+	channels := automaticupgrades.Channels{
+		automaticupgrades.DefaultCloudChannelName: {
+			StaticVersion: testVersion,
+		},
+	}
+	require.NoError(t, channels.CheckAndSetDefaults())
+	handler.cfg.AutomaticUpgradesChannels = channels
+
+	expectedCfg.IsCloud = true
+	expectedCfg.IsUsageBasedBilling = true
+	expectedCfg.AutomaticUpgrades = true
+	expectedCfg.AutomaticUpgradesTargetVersion = "v" + teleport.Version
+	expectedCfg.JoinActiveSessions = false
+	expectedCfg.Edition = "" // testBuildType is empty
+	expectedCfg.TrustedDevices = true
+	expectedCfg.Entitlements[string(entitlements.App)] = webclient.EntitlementInfo{Enabled: false}
+	expectedCfg.Entitlements[string(entitlements.DB)] = webclient.EntitlementInfo{Enabled: true, Limit: 22}
+	expectedCfg.Entitlements[string(entitlements.DeviceTrust)] = webclient.EntitlementInfo{Enabled: true, Limit: 33}
+	expectedCfg.Entitlements[string(entitlements.Desktop)] = webclient.EntitlementInfo{Enabled: true, Limit: 44}
+	expectedCfg.Entitlements[string(entitlements.JoinActiveSessions)] = webclient.EntitlementInfo{Enabled: false}
+	expectedCfg.Entitlements[string(entitlements.K8s)] = webclient.EntitlementInfo{Enabled: false}
+
+	// request and verify enabled features are eventually enabled.
+	require.EventuallyWithT(t, func(t *assert.CollectT) {
+		re, err := clt.Get(ctx, endpoint, nil)
+		if !assert.NoError(t, err) {
+			return
+		}
+		assert.True(t, bytes.HasPrefix(re.Bytes(), []byte("var GRV_CONFIG")))
+		res := bytes.ReplaceAll(re.Bytes(), []byte("var GRV_CONFIG = "), []byte{})
+		err = json.Unmarshal(res[:len(res)-1], &cfg)
+		assert.NoError(t, err)
+		diff := cmp.Diff(expectedCfg, cfg)
+		assert.Empty(t, diff)
+	}, time.Second*5, time.Millisecond*50)
+
+	// use mock client to assert that if ping returns an error, we'll default to
+	// cluster config
+	mockClient := mockedPingTestProxy{
+		mockedPing: func(ctx context.Context) (authproto.PingResponse, error) {
+			return authproto.PingResponse{}, errors.New("err")
+		},
+	}
+	env.proxies[0].client = mockClient
+	expectedCfg.AutomaticUpgrades = false
+	expectedCfg.TrustedDevices = false
+	expectedCfg.Entitlements[string(entitlements.DB)] = webclient.EntitlementInfo{Enabled: false}
+	expectedCfg.Entitlements[string(entitlements.Desktop)] = webclient.EntitlementInfo{Enabled: false}
+	expectedCfg.Entitlements[string(entitlements.DeviceTrust)] = webclient.EntitlementInfo{Enabled: false}
+
+	// update modules but NOT the expected config
+	modules.SetTestModules(t, &modules.TestModules{
+		TestFeatures: modules.Features{
+			Cloud:               false,
+			IsUsageBasedBilling: false,
+		},
+	})
+	env.clock.Advance(DefaultFeatureWatchInterval * 2)
+
+	// request and verify again
+	require.EventuallyWithT(t, func(t *assert.CollectT) {
+		re, err := clt.Get(ctx, endpoint, nil)
+		if !assert.NoError(t, err) {
+			return
+		}
+		assert.True(t, bytes.HasPrefix(re.Bytes(), []byte("var GRV_CONFIG")))
+		res := bytes.ReplaceAll(re.Bytes(), []byte("var GRV_CONFIG = "), []byte{})
+		err = json.Unmarshal(res[:len(res)-1], &cfg)
+		assert.NoError(t, err)
+		diff := cmp.Diff(expectedCfg, cfg)
+		assert.Empty(t, diff)
+	}, time.Second*5, time.Millisecond*50)
+}
+
+func TestGetWebConfig_LegacyFeatureLimits(t *testing.T) {
+	ctx := context.Background()
+	env := newWebPack(t, 1)
+
+	modules.SetTestModules(t, &modules.TestModules{
+		TestFeatures: modules.Features{
+			ProductType:         modules.ProductTypeTeam,
+			IsUsageBasedBilling: true,
+			IsStripeManaged:     true,
+			Questionnaire:       true,
+			Entitlements: map[entitlements.EntitlementKind]modules.EntitlementInfo{
+				entitlements.Identity:         {Enabled: true},
+				entitlements.AccessLists:      {Enabled: true, Limit: 5},
+				entitlements.AccessMonitoring: {Enabled: true, Limit: 10},
+			},
+		},
+	})
+	// start the feature watcher so the web config gets new features
+	env.clock.Advance(DefaultFeatureWatchInterval * 2)
+
+	expectedCfg := webclient.WebConfig{
+		Auth: webclient.WebConfigAuthSettings{
+			SecondFactor:     constants.SecondFactorOff,
+			LocalAuthEnabled: true,
+			AuthType:         constants.Local,
+			PrivateKeyPolicy: keys.PrivateKeyPolicyNone,
+		},
+		CanJoinSessions:  true,
+		ProxyClusterName: env.server.ClusterName(),
+		FeatureLimits: webclient.FeatureLimits{
+			AccessListCreateLimit:               5,
+			AccessMonitoringMaxReportRangeLimit: 10,
+		},
+		IsTeam:              false,
+		IsIGSEnabled:        true,
+		IsStripeManaged:     true,
+		Questionnaire:       true,
+		IsUsageBasedBilling: true,
+		Entitlements: map[string]webclient.EntitlementInfo{
+			string(entitlements.AccessLists):            {Enabled: true, Limit: 5},
+			string(entitlements.AccessMonitoring):       {Enabled: true, Limit: 10},
+			string(entitlements.AccessRequests):         {Enabled: false},
+			string(entitlements.App):                    {Enabled: false},
+			string(entitlements.CloudAuditLogRetention): {Enabled: false},
+			string(entitlements.DB):                     {Enabled: false},
+			string(entitlements.Desktop):                {Enabled: false},
+			string(entitlements.DeviceTrust):            {Enabled: false},
+			string(entitlements.ExternalAuditStorage):   {Enabled: false},
+			string(entitlements.FeatureHiding):          {Enabled: false},
+			string(entitlements.HSM):                    {Enabled: false},
+			string(entitlements.Identity):               {Enabled: true},
+			string(entitlements.JoinActiveSessions):     {Enabled: false},
+			string(entitlements.K8s):                    {Enabled: false},
+			string(entitlements.MobileDeviceManagement): {Enabled: false},
+			string(entitlements.OIDC):                   {Enabled: false},
+			string(entitlements.OktaSCIM):               {Enabled: false},
+			string(entitlements.OktaUserSync):           {Enabled: false},
+			string(entitlements.Policy):                 {Enabled: false},
+			string(entitlements.SAML):                   {Enabled: false},
+			string(entitlements.SessionLocks):           {Enabled: false},
+			string(entitlements.UpsellAlert):            {Enabled: false},
+			string(entitlements.UsageReporting):         {Enabled: false},
+			string(entitlements.LicenseAutoUpdate):      {Enabled: false},
+		},
+		PlayableDatabaseProtocols:     player.SupportedDatabaseProtocols,
+		IsPolicyRoleVisualizerEnabled: true,
+	}
+
+	clt := env.proxies[0].newClient(t)
+	require.EventuallyWithT(t, func(t *assert.CollectT) {
+		// Make a request.
+		endpoint := clt.Endpoint("web", "config.js")
+		re, err := clt.Get(ctx, endpoint, nil)
+		if !assert.NoError(t, err) {
+			return
+		}
+		assert.True(t, bytes.HasPrefix(re.Bytes(), []byte("var GRV_CONFIG")))
+
+		// Response is type application/javascript, we need to strip off the variable name
+		// and the semicolon at the end, then we are left with json like object.
+		var cfg webclient.WebConfig
+		res := bytes.ReplaceAll(re.Bytes(), []byte("var GRV_CONFIG = "), []byte{})
+		err = json.Unmarshal(res[:len(res)-1], &cfg)
+		assert.NoError(t, err)
+		diff := cmp.Diff(expectedCfg, cfg)
+		assert.Empty(t, diff)
+	}, time.Second*5, time.Millisecond*50)
 }
 
 func TestCreatePrivilegeToken(t *testing.T) {
@@ -3809,7 +5049,7 @@ func TestAddMFADevice(t *testing.T) {
 		},
 	})
 	require.NoError(t, err)
-	err = env.server.Auth().SetAuthPreference(ctx, ap)
+	_, err = env.server.Auth().UpsertAuthPreference(ctx, ap)
 	require.NoError(t, err)
 
 	// Get a totp code to re-auth.
@@ -3829,7 +5069,7 @@ func TestAddMFADevice(t *testing.T) {
 		name            string
 		deviceName      string
 		getTOTPCode     func() string
-		getWebauthnResp func() *wanlib.CredentialCreationResponse
+		getWebauthnResp func() *wantypes.CredentialCreationResponse
 	}{
 		{
 			name:       "new TOTP device",
@@ -3851,7 +5091,7 @@ func TestAddMFADevice(t *testing.T) {
 		{
 			name:       "new Webauthn device",
 			deviceName: "new-webauthn",
-			getWebauthnResp: func() *wanlib.CredentialCreationResponse {
+			getWebauthnResp: func() *wantypes.CredentialCreationResponse {
 				// Get webauthn register challenge.
 				res, err := env.server.Auth().CreateRegisterChallenge(ctx, &authproto.CreateRegisterChallengeRequest{
 					TokenID:    privilegeToken,
@@ -3862,7 +5102,7 @@ func TestAddMFADevice(t *testing.T) {
 				_, regRes, err := auth.NewTestDeviceFromChallenge(res)
 				require.NoError(t, err)
 
-				return wanlib.CredentialCreationResponseFromProto(regRes.GetWebauthn())
+				return wantypes.CredentialCreationResponseFromProto(regRes.GetWebauthn())
 			},
 		},
 	}
@@ -3872,7 +5112,7 @@ func TestAddMFADevice(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			var totpCode string
-			var webauthnRegResp *wanlib.CredentialCreationResponse
+			var webauthnRegResp *wantypes.CredentialCreationResponse
 
 			if tc.getWebauthnResp != nil {
 				webauthnRegResp = tc.getWebauthnResp()
@@ -3904,7 +5144,7 @@ func TestDeleteMFA(t *testing.T) {
 	jar, err := cookiejar.New(nil)
 	require.NoError(t, err)
 	opts := []roundtrip.ClientParam{roundtrip.BearerAuth(pack.session.Token), roundtrip.CookieJar(jar), roundtrip.HTTPClient(client.NewInsecureWebClient())}
-	rclt, err := roundtrip.NewClient(proxy.webURL.String(), teleport.WebAPIVersion, opts...)
+	rclt, err := roundtrip.NewClient(proxy.webURL.String(), "", opts...)
 	require.NoError(t, err)
 	clt := client.WebClient{Client: rclt}
 	jar.SetCookies(&proxy.webURL, pack.cookies)
@@ -3927,7 +5167,7 @@ func TestDeleteMFA(t *testing.T) {
 		devName := devName
 		t.Run(devName, func(t *testing.T) {
 			t.Parallel()
-			otpSecret := base32.StdEncoding.EncodeToString([]byte(devName))
+			otpSecret := newOTPSharedSecret()
 			dev, err := services.NewTOTPDevice(devName, otpSecret, env.clock.Now())
 			require.NoError(t, err)
 			err = env.server.Auth().UpsertMFADevice(ctx, pack.user, dev)
@@ -3950,7 +5190,7 @@ func TestGetMFADevicesWithAuth(t *testing.T) {
 	re, err := pack.clt.Get(context.Background(), endpoint, url.Values{})
 	require.NoError(t, err)
 
-	var devices []ui.MFADevice
+	var devices []webui.MFADevice
 	err = json.Unmarshal(re.Bytes(), &devices)
 	require.NoError(t, err)
 	require.Len(t, devices, 1)
@@ -3964,7 +5204,7 @@ func TestGetAndDeleteMFADevices_WithRecoveryApprovedToken(t *testing.T) {
 
 	// Create a user with a TOTP device.
 	username := "llama"
-	proxy.createUser(ctx, t, username, "root", "password", "some-otp-secret", nil /* roles */)
+	proxy.createUser(ctx, t, username, "root", "password1234", "some-otp-secret", nil /* roles */)
 
 	// Enable second factor.
 	ap, err := types.NewAuthPreference(types.AuthPreferenceSpecV2{
@@ -3975,14 +5215,14 @@ func TestGetAndDeleteMFADevices_WithRecoveryApprovedToken(t *testing.T) {
 		},
 	})
 	require.NoError(t, err)
-	err = env.server.Auth().SetAuthPreference(ctx, ap)
+	_, err = env.server.Auth().UpsertAuthPreference(ctx, ap)
 	require.NoError(t, err)
 
 	// Acquire an approved token.
 	approvedToken, err := types.NewUserToken("some-token-id")
 	require.NoError(t, err)
 	approvedToken.SetUser(username)
-	approvedToken.SetSubKind(auth.UserTokenTypeRecoveryApproved)
+	approvedToken.SetSubKind(authclient.UserTokenTypeRecoveryApproved)
 	approvedToken.SetExpiry(env.clock.Now().Add(5 * time.Minute))
 	_, err = env.server.Auth().CreateUserToken(ctx, approvedToken)
 	require.NoError(t, err)
@@ -3993,7 +5233,7 @@ func TestGetAndDeleteMFADevices_WithRecoveryApprovedToken(t *testing.T) {
 	res, err := clt.Get(ctx, getDevicesEndpoint, url.Values{})
 	require.NoError(t, err)
 
-	var devices []ui.MFADevice
+	var devices []webui.MFADevice
 	err = json.Unmarshal(res.Bytes(), &devices)
 	require.NoError(t, err)
 	require.Len(t, devices, 1)
@@ -4008,7 +5248,7 @@ func TestGetAndDeleteMFADevices_WithRecoveryApprovedToken(t *testing.T) {
 
 	err = json.Unmarshal(res.Bytes(), &devices)
 	require.NoError(t, err)
-	require.Len(t, devices, 0)
+	require.Empty(t, devices)
 }
 
 func TestCreateAuthenticateChallenge(t *testing.T) {
@@ -4030,7 +5270,7 @@ func TestCreateAuthenticateChallenge(t *testing.T) {
 	startToken, err := types.NewUserToken("some-token-id")
 	require.NoError(t, err)
 	startToken.SetUser(authPack.user)
-	startToken.SetSubKind(auth.UserTokenTypeRecoveryStart)
+	startToken.SetSubKind(authclient.UserTokenTypeRecoveryStart)
 	startToken.SetExpiry(env.clock.Now().Add(5 * time.Minute))
 	_, err = env.server.Auth().CreateUserToken(ctx, startToken)
 	require.NoError(t, err)
@@ -4039,7 +5279,7 @@ func TestCreateAuthenticateChallenge(t *testing.T) {
 		name    string
 		clt     *TestWebClient
 		ep      []string
-		reqBody client.MFAChallengeRequest
+		reqBody any
 	}{
 		{
 			name: "/webapi/mfa/authenticatechallenge/password",
@@ -4062,6 +5302,9 @@ func TestCreateAuthenticateChallenge(t *testing.T) {
 			name: "/webapi/mfa/authenticatechallenge",
 			clt:  authnClt,
 			ep:   []string{"webapi", "mfa", "authenticatechallenge"},
+			reqBody: CreateAuthenticateChallengeRequest{
+				ChallengeScope: int(mfav1.ChallengeScope_CHALLENGE_SCOPE_LOGIN),
+			},
 		},
 		{
 			name: "/webapi/mfa/token/:token/authenticatechallenge",
@@ -4103,37 +5346,38 @@ func TestCreateRegisterChallenge(t *testing.T) {
 		},
 	})
 	require.NoError(t, err)
-	require.NoError(t, env.server.Auth().SetAuthPreference(ctx, ap))
+	_, err = env.server.Auth().UpsertAuthPreference(ctx, ap)
+	require.NoError(t, err)
 
 	// Acquire an accepted token.
 	token, err := types.NewUserToken("some-token-id")
 	require.NoError(t, err)
 	token.SetUser("llama")
-	token.SetSubKind(auth.UserTokenTypePrivilege)
+	token.SetSubKind(authclient.UserTokenTypePrivilege)
 	token.SetExpiry(env.clock.Now().Add(5 * time.Minute))
 	_, err = env.server.Auth().CreateUserToken(ctx, token)
 	require.NoError(t, err)
 
 	tests := []struct {
 		name            string
-		req             *createRegisterChallengeRequest
+		req             *createRegisterChallengeWithTokenRequest
 		assertChallenge func(t *testing.T, c *client.MFARegisterChallenge)
 	}{
 		{
 			name: "totp",
-			req: &createRegisterChallengeRequest{
+			req: &createRegisterChallengeWithTokenRequest{
 				DeviceType: "totp",
 			},
 		},
 		{
 			name: "webauthn",
-			req: &createRegisterChallengeRequest{
+			req: &createRegisterChallengeWithTokenRequest{
 				DeviceType: "webauthn",
 			},
 		},
 		{
 			name: "passwordless",
-			req: &createRegisterChallengeRequest{
+			req: &createRegisterChallengeWithTokenRequest{
 				DeviceType:  "webauthn",
 				DeviceUsage: "passwordless",
 			},
@@ -4193,7 +5437,7 @@ func TestCreateAppSession(t *testing.T) {
 	rawCookie := *pack.cookies[0]
 	cookieBytes, err := hex.DecodeString(rawCookie.Value)
 	require.NoError(t, err)
-	var sessionCookie SessionCookie
+	var sessionCookie websession.Cookie
 	err = json.Unmarshal(cookieBytes, &sessionCookie)
 	require.NoError(t, err)
 
@@ -4207,9 +5451,11 @@ func TestCreateAppSession(t *testing.T) {
 		{
 			name: "Valid request: all fields",
 			inCreateRequest: &CreateAppSessionRequest{
-				FQDNHint:    "panel.example.com",
-				PublicAddr:  "panel.example.com",
-				ClusterName: "localhost",
+				ResolveAppParams: ResolveAppParams{
+					FQDNHint:    "panel.example.com",
+					PublicAddr:  "panel.example.com",
+					ClusterName: "localhost",
+				},
 			},
 			outError:    require.NoError,
 			outFQDN:     "panel.example.com",
@@ -4218,8 +5464,10 @@ func TestCreateAppSession(t *testing.T) {
 		{
 			name: "Valid request: without FQDN",
 			inCreateRequest: &CreateAppSessionRequest{
-				PublicAddr:  "panel.example.com",
-				ClusterName: "localhost",
+				ResolveAppParams: ResolveAppParams{
+					PublicAddr:  "panel.example.com",
+					ClusterName: "localhost",
+				},
 			},
 			outError:    require.NoError,
 			outFQDN:     "panel.example.com",
@@ -4228,7 +5476,9 @@ func TestCreateAppSession(t *testing.T) {
 		{
 			name: "Valid request: only FQDN",
 			inCreateRequest: &CreateAppSessionRequest{
-				FQDNHint: "panel.example.com",
+				ResolveAppParams: ResolveAppParams{
+					FQDNHint: "panel.example.com",
+				},
 			},
 			outError:    require.NoError,
 			outFQDN:     "panel.example.com",
@@ -4237,41 +5487,51 @@ func TestCreateAppSession(t *testing.T) {
 		{
 			name: "Invalid request: only public address",
 			inCreateRequest: &CreateAppSessionRequest{
-				PublicAddr: "panel.example.com",
+				ResolveAppParams: ResolveAppParams{
+					PublicAddr: "panel.example.com",
+				},
 			},
 			outError: require.Error,
 		},
 		{
 			name: "Invalid request: only cluster name",
 			inCreateRequest: &CreateAppSessionRequest{
-				ClusterName: "localhost",
+				ResolveAppParams: ResolveAppParams{
+					ClusterName: "localhost",
+				},
 			},
 			outError: require.Error,
 		},
 		{
 			name: "Invalid application",
 			inCreateRequest: &CreateAppSessionRequest{
-				FQDNHint:    "panel.example.com",
-				PublicAddr:  "invalid.example.com",
-				ClusterName: "localhost",
+				ResolveAppParams: ResolveAppParams{
+					FQDNHint:    "panel.example.com",
+					PublicAddr:  "invalid.example.com",
+					ClusterName: "localhost",
+				},
 			},
 			outError: require.Error,
 		},
 		{
 			name: "Invalid cluster name",
 			inCreateRequest: &CreateAppSessionRequest{
-				FQDNHint:    "panel.example.com",
-				PublicAddr:  "panel.example.com",
-				ClusterName: "example.com",
+				ResolveAppParams: ResolveAppParams{
+					FQDNHint:    "panel.example.com",
+					PublicAddr:  "panel.example.com",
+					ClusterName: "example.com",
+				},
 			},
 			outError: require.Error,
 		},
 		{
 			name: "Malicious request: all fields",
 			inCreateRequest: &CreateAppSessionRequest{
-				FQDNHint:    "panel.example.com@malicious.com",
-				PublicAddr:  "panel.example.com",
-				ClusterName: "localhost",
+				ResolveAppParams: ResolveAppParams{
+					FQDNHint:    "panel.example.com@malicious.com",
+					PublicAddr:  "panel.example.com",
+					ClusterName: "localhost",
+				},
 			},
 			outError:    require.NoError,
 			outFQDN:     "panel.example.com",
@@ -4280,7 +5540,9 @@ func TestCreateAppSession(t *testing.T) {
 		{
 			name: "Malicious request: only FQDN",
 			inCreateRequest: &CreateAppSessionRequest{
-				FQDNHint: "panel.example.com@malicious.com",
+				ResolveAppParams: ResolveAppParams{
+					FQDNHint: "panel.example.com@malicious.com",
+				},
 			},
 			outError: require.Error,
 		},
@@ -4309,7 +5571,209 @@ func TestCreateAppSession(t *testing.T) {
 			})
 			require.NoError(t, err)
 			require.Equal(t, tt.outUsername, sess.GetUser())
+			require.NotEmpty(t, response.CookieValue)
 			require.Equal(t, response.CookieValue, sess.GetName())
+			require.NotEmpty(t, response.SubjectCookieValue, "every session should create a secret token")
+			require.Equal(t, response.SubjectCookieValue, sess.GetBearerToken())
+		})
+	}
+}
+
+func TestCreateAppSessionHealthCheckAppServer(t *testing.T) {
+	t.Parallel()
+
+	validApp, err := types.NewAppV3(types.Metadata{
+		Name: "valid",
+	}, types.AppSpecV3{
+		URI:        "http://127.0.0.1:8080",
+		PublicAddr: "valid.example.com",
+	})
+	require.NoError(t, err)
+
+	invalidApp, err := types.NewAppV3(types.Metadata{
+		Name: "invalid",
+	}, types.AppSpecV3{
+		URI:        "http://127.0.0.1:8080",
+		PublicAddr: "invalid.example.com",
+	})
+	require.NoError(t, err)
+
+	s := newWebSuiteWithConfig(t, webSuiteConfig{
+		HealthCheckAppServer: func(_ context.Context, publicAddr string, _ string) error {
+			// Can only serve "validApp".
+			if publicAddr == validApp.GetPublicAddr() {
+				return nil
+			}
+
+			return trace.ConnectionProblem(nil, "offline AppServer")
+		},
+	})
+
+	for _, app := range []*types.AppV3{validApp, invalidApp} {
+		server, err := types.NewAppServerV3FromApp(app, "host", uuid.New().String())
+		require.NoError(t, err)
+		_, err = s.server.Auth().UpsertApplicationServer(s.ctx, server)
+		require.NoError(t, err)
+	}
+
+	pack := s.authPack(t, "foo@example.com")
+	rawCookie := *pack.cookies[0]
+	cookieBytes, err := hex.DecodeString(rawCookie.Value)
+	require.NoError(t, err)
+	var sessionCookie websession.Cookie
+	err = json.Unmarshal(cookieBytes, &sessionCookie)
+	require.NoError(t, err)
+
+	for _, tc := range []struct {
+		desc       string
+		publicAddr string
+		expectErr  require.ErrorAssertionFunc
+	}{
+		{
+			desc:       "request to application that can be served",
+			publicAddr: validApp.GetPublicAddr(),
+			expectErr:  require.NoError,
+		},
+		{
+			desc:       "request to application that cannot be served",
+			publicAddr: invalidApp.GetPublicAddr(),
+			expectErr:  require.Error,
+		},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			endpoint := pack.clt.Endpoint("webapi", "sessions", "app")
+			_, err := pack.clt.PostJSON(s.ctx, endpoint, &CreateAppSessionRequest{
+				ResolveAppParams: ResolveAppParams{
+					FQDNHint: tc.publicAddr,
+				},
+			})
+			tc.expectErr(t, err)
+		})
+	}
+}
+
+func TestCreateAppSession_RequireSessionMFA(t *testing.T) {
+	ctx := context.Background()
+	t.Parallel()
+	s := newWebSuite(t)
+	pack := s.authPack(t, "foo@example.com")
+
+	// Register an application called "panel".
+	app, err := types.NewAppV3(types.Metadata{
+		Name: "panel",
+	}, types.AppSpecV3{
+		URI:        "http://127.0.0.1:8080",
+		PublicAddr: "panel.example.com",
+	})
+	require.NoError(t, err)
+	server, err := types.NewAppServerV3FromApp(app, "host", uuid.New().String())
+	require.NoError(t, err)
+	_, err = s.server.Auth().UpsertApplicationServer(s.ctx, server)
+	require.NoError(t, err)
+
+	// Enable per session MFA.
+	ap, err := types.NewAuthPreference(types.AuthPreferenceSpecV2{
+		Type:         constants.Local,
+		SecondFactor: constants.SecondFactorWebauthn,
+		Webauthn: &types.Webauthn{
+			RPID: "localhost",
+		},
+		RequireMFAType: types.RequireMFAType_SESSION,
+	})
+	require.NoError(t, err)
+	_, err = s.server.Auth().UpsertAuthPreference(ctx, ap)
+	require.NoError(t, err)
+
+	// register an mfa device for the user.
+	userClient, err := s.server.NewClient(auth.TestUser(pack.user))
+	require.NoError(t, err)
+	webauthnDev, err := auth.RegisterTestDevice(
+		ctx,
+		userClient,
+		"webauthn", authproto.DeviceType_DEVICE_TYPE_WEBAUTHN, pack.device /* authenticator */)
+	require.NoError(t, err)
+
+	// Prepare a valid mfa response for the user.
+	chal, err := userClient.CreateAuthenticateChallenge(ctx, &authproto.CreateAuthenticateChallengeRequest{
+		Request: &authproto.CreateAuthenticateChallengeRequest_ContextUser{},
+		ChallengeExtensions: &mfav1.ChallengeExtensions{
+			Scope: mfav1.ChallengeScope_CHALLENGE_SCOPE_USER_SESSION,
+		},
+	})
+	require.NoError(t, err)
+	mfaResp, err := webauthnDev.SolveAuthn(chal)
+	require.NoError(t, err)
+
+	// Extract the session ID and bearer token for the current session.
+	rawCookie := *pack.cookies[0]
+	cookieBytes, err := hex.DecodeString(rawCookie.Value)
+	require.NoError(t, err)
+	var sessionCookie websession.Cookie
+	err = json.Unmarshal(cookieBytes, &sessionCookie)
+	require.NoError(t, err)
+
+	tests := []struct {
+		name              string
+		inCreateRequest   *CreateAppSessionRequest
+		expectMFAVerified bool
+	}{
+		{
+			name: "NOK MFA not provided",
+			inCreateRequest: &CreateAppSessionRequest{
+				ResolveAppParams: ResolveAppParams{
+					FQDNHint:    "panel.example.com",
+					PublicAddr:  "panel.example.com",
+					ClusterName: "localhost",
+				},
+			},
+			expectMFAVerified: false,
+		},
+		{
+			name: "OK MFA provided",
+			inCreateRequest: &CreateAppSessionRequest{
+				ResolveAppParams: ResolveAppParams{
+					FQDNHint:    "panel.example.com",
+					PublicAddr:  "panel.example.com",
+					ClusterName: "localhost",
+				},
+				MFAResponse: client.MFAChallengeResponse{
+					WebauthnAssertionResponse: wantypes.CredentialAssertionResponseFromProto(mfaResp.GetWebauthn()),
+				},
+			},
+			expectMFAVerified: true,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			// Make a request to create an application session for "panel".
+			endpoint := pack.clt.Endpoint("webapi", "sessions", "app")
+			resp, err := pack.clt.PostJSON(s.ctx, endpoint, tt.inCreateRequest)
+			require.NoError(t, err)
+
+			// Unmarshal the response.
+			var response *CreateAppSessionResponse
+			require.NoError(t, json.Unmarshal(resp.Bytes(), &response))
+
+			// Verify that the application session was created.
+			sess, err := s.server.Auth().GetAppSession(s.ctx, types.GetAppSessionRequest{
+				SessionID: response.CookieValue,
+			})
+			require.NoError(t, err)
+
+			// Verify that the session is MFA verified
+			certificate, err := tlsca.ParseCertificatePEM(sess.GetTLSCert())
+			require.NoError(t, err)
+			identity, err := tlsca.FromSubject(certificate.Subject, certificate.NotAfter)
+			require.NoError(t, err)
+
+			if tt.expectMFAVerified {
+				require.NotEmpty(t, identity.MFAVerified, "expected app session to be MFA verified")
+			} else {
+				require.Empty(t, identity.MFAVerified, "expected app session to not be MFA verified")
+			}
 		})
 	}
 }
@@ -4322,20 +5786,34 @@ func TestNewSessionResponseWithRenewSession(t *testing.T) {
 	duration := time.Duration(5) * time.Minute
 	cfg := types.DefaultClusterNetworkingConfig()
 	cfg.SetWebIdleTimeout(duration)
-	require.NoError(t, env.server.Auth().SetClusterNetworkingConfig(context.Background(), cfg))
+	_, err := env.server.Auth().UpsertClusterNetworkingConfig(context.Background(), cfg)
+	require.NoError(t, err)
 
 	proxy := env.proxies[0]
 	pack := proxy.authPack(t, "foo", nil /* roles */)
 
-	var ns *CreateSessionResponse
-	resp := pack.renewSession(context.Background(), t)
-	require.NoError(t, json.Unmarshal(resp.Bytes(), &ns))
+	assertSession := func(t *testing.T, session *CreateSessionResponse) {
+		t.Helper()
 
-	require.Equal(t, int(duration.Milliseconds()), ns.SessionInactiveTimeoutMS)
-	require.Equal(t, roundtrip.AuthBearer, ns.TokenType)
-	require.NotEmpty(t, ns.SessionExpires)
-	require.NotEmpty(t, ns.Token)
-	require.NotEmpty(t, ns.TokenExpiresIn)
+		assert.Equal(t, roundtrip.AuthBearer, session.TokenType, "token type mismatch")
+		assert.NotEmpty(t, session.Token, "token")
+		assert.NotZero(t, session.TokenExpiresIn, "expires_in")
+		assert.GreaterOrEqual(t, session.SessionExpiresIn, session.TokenExpiresIn, "sessionExpiresIn must be >= expires_in")
+		assert.NotZero(t, session.SessionExpires, "sessionExpires")
+		assert.Equal(t, int(duration.Milliseconds()), session.SessionInactiveTimeoutMS, "sessionInactiveTimeout")
+	}
+
+	t.Run("pack.session", func(t *testing.T) {
+		assertSession(t, pack.session)
+	})
+
+	t.Run("renew", func(t *testing.T) {
+		resp := pack.renewSession(context.Background(), t)
+
+		session := &CreateSessionResponse{}
+		require.NoError(t, json.Unmarshal(resp.Bytes(), &session), "unmarshal renewed session")
+		assertSession(t, session)
+	})
 }
 
 // TestWebSessionsRenewDoesNotBreakExistingTerminalSession validates that the
@@ -4351,13 +5829,22 @@ func TestWebSessionsRenewDoesNotBreakExistingTerminalSession(t *testing.T) {
 	pack1 := proxy1.authPack(t, "foo", nil /* roles */)
 	pack2 := proxy2.authPackFromPack(t, pack1)
 
-	ws, _ := proxy2.makeTerminal(t, pack2, "")
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	term, err := connectToHost(ctx, connectConfig{
+		pack:  pack2,
+		host:  proxy2.node.ID(),
+		proxy: proxy2.webURL.Host,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, term.Close()) })
 
 	// Advance the time before renewing the session.
 	// This will allow the new session to have a more plausible
 	// expiration
 	const delta = 30 * time.Second
-	env.clock.Advance(auth.BearerTokenTTL - delta)
+	env.clock.Advance(defaults.BearerTokenTTL - delta)
 
 	// Renew the session using the 1st proxy
 	resp := pack1.renewSession(context.Background(), t)
@@ -4372,7 +5859,7 @@ func TestWebSessionsRenewDoesNotBreakExistingTerminalSession(t *testing.T) {
 	pack2.validateAPI(context.Background(), t)
 
 	// Check whether the terminal session is still active
-	validateTerminalStream(t, ws)
+	validateTerminal(t, term)
 }
 
 // TestWebSessionsRenewAllowsOldBearerTokenToLinger validates that the
@@ -4391,7 +5878,7 @@ func TestWebSessionsRenewAllowsOldBearerTokenToLinger(t *testing.T) {
 	// Advance the time before renewing the session.
 	// This will allow the new session to have a more plausible
 	// expiration
-	env.clock.Advance(auth.BearerTokenTTL - delta)
+	env.clock.Advance(defaults.BearerTokenTTL - delta)
 
 	// make sure we can use client to make authenticated requests
 	// before we issue this request, we will recover session id and bearer token
@@ -4435,7 +5922,7 @@ func TestWebSessionsRenewAllowsOldBearerTokenToLinger(t *testing.T) {
 	// now delete session
 	_, err = newPack.clt.Delete(
 		context.Background(),
-		pack.clt.Endpoint("webapi", "sessions"))
+		pack.clt.Endpoint("webapi", "sessions", "web"))
 	require.NoError(t, err)
 
 	// subsequent requests to use this session will fail
@@ -4456,7 +5943,7 @@ func TestChangeUserAuthentication_recoveryCodesReturnedForCloud(t *testing.T) {
 		SecondFactor: constants.SecondFactorOTP,
 	})
 	require.NoError(t, err)
-	err = env.server.Auth().SetAuthPreference(ctx, ap)
+	_, err = env.server.Auth().UpsertAuthPreference(ctx, ap)
 	require.NoError(t, err)
 
 	// Enable cloud feature.
@@ -4469,10 +5956,11 @@ func TestChangeUserAuthentication_recoveryCodesReturnedForCloud(t *testing.T) {
 	// Creaet a username that is not a valid email format for recovery.
 	teleUser, err := types.NewUser("invalid-name-for-recovery")
 	require.NoError(t, err)
-	require.NoError(t, env.server.Auth().CreateUser(ctx, teleUser))
+	_, err = env.server.Auth().CreateUser(ctx, teleUser)
+	require.NoError(t, err)
 
 	// Create a reset password token and secrets.
-	resetToken, err := env.server.Auth().CreateResetPasswordToken(ctx, auth.CreateUserTokenRequest{
+	resetToken, err := env.server.Auth().CreateResetPasswordToken(ctx, authclient.CreateUserTokenRequest{
 		Name: "invalid-name-for-recovery",
 	})
 	require.NoError(t, err)
@@ -4488,7 +5976,7 @@ func TestChangeUserAuthentication_recoveryCodesReturnedForCloud(t *testing.T) {
 	clt := env.proxies[0].client
 	re, err := clt.ChangeUserAuthentication(ctx, &authproto.ChangeUserAuthenticationRequest{
 		TokenID:     resetToken.GetName(),
-		NewPassword: []byte("abc123"),
+		NewPassword: []byte("abcdef123456"),
 		NewMFARegisterResponse: &authproto.MFARegisterResponse{Response: &authproto.MFARegisterResponse_TOTP{
 			TOTP: &authproto.TOTPRegisterResponse{Code: totpCode},
 		}},
@@ -4500,10 +5988,11 @@ func TestChangeUserAuthentication_recoveryCodesReturnedForCloud(t *testing.T) {
 	// Create a user that is valid for recovery.
 	teleUser, err = types.NewUser("valid-username@example.com")
 	require.NoError(t, err)
-	require.NoError(t, env.server.Auth().CreateUser(ctx, teleUser))
+	_, err = env.server.Auth().CreateUser(ctx, teleUser)
+	require.NoError(t, err)
 
 	// Create a reset password token and secrets.
-	resetToken, err = env.server.Auth().CreateResetPasswordToken(ctx, auth.CreateUserTokenRequest{
+	resetToken, err = env.server.Auth().CreateResetPasswordToken(ctx, authclient.CreateUserTokenRequest{
 		Name: "valid-username@example.com",
 	})
 	require.NoError(t, err)
@@ -4518,7 +6007,7 @@ func TestChangeUserAuthentication_recoveryCodesReturnedForCloud(t *testing.T) {
 	// Test valid username (email) returns codes.
 	re, err = clt.ChangeUserAuthentication(ctx, &authproto.ChangeUserAuthenticationRequest{
 		TokenID:     resetToken.GetName(),
-		NewPassword: []byte("abc123"),
+		NewPassword: []byte("abcdef123456"),
 		NewMFARegisterResponse: &authproto.MFARegisterResponse{Response: &authproto.MFARegisterResponse_TOTP{
 			TOTP: &authproto.TOTPRegisterResponse{Code: totpCode},
 		}},
@@ -4544,7 +6033,7 @@ func TestChangeUserAuthentication_WithPrivacyPolicyEnabledError(t *testing.T) {
 		RequireMFAType: types.RequireMFAType_HARDWARE_KEY_TOUCH,
 	})
 	require.NoError(t, err)
-	err = env.server.Auth().SetAuthPreference(ctx, ap)
+	_, err = env.server.Auth().UpsertAuthPreference(ctx, ap)
 	require.NoError(t, err)
 
 	// Enable cloud feature.
@@ -4552,18 +6041,19 @@ func TestChangeUserAuthentication_WithPrivacyPolicyEnabledError(t *testing.T) {
 		TestFeatures: modules.Features{
 			RecoveryCodes: true,
 		},
-		MockAttestHardwareKey: func(_ context.Context, _ interface{}, policy keys.PrivateKeyPolicy, _ *keys.AttestationStatement, _ crypto.PublicKey, _ time.Duration) (keys.PrivateKeyPolicy, error) {
-			return "", keys.NewPrivateKeyPolicyError(policy)
+		MockAttestationData: &keys.AttestationData{
+			PrivateKeyPolicy: keys.PrivateKeyPolicyNone,
 		},
 	})
 
 	// Create a user that is valid for recovery.
 	teleUser, err := types.NewUser("valid-username@example.com")
 	require.NoError(t, err)
-	require.NoError(t, env.server.Auth().CreateUser(ctx, teleUser))
+	_, err = env.server.Auth().CreateUser(ctx, teleUser)
+	require.NoError(t, err)
 
 	// Create a reset password token and secrets.
-	resetToken, err := env.server.Auth().CreateResetPasswordToken(ctx, auth.CreateUserTokenRequest{
+	resetToken, err := env.server.Auth().CreateResetPasswordToken(ctx, authclient.CreateUserTokenRequest{
 		Name: "valid-username@example.com",
 	})
 	require.NoError(t, err)
@@ -4579,25 +6069,21 @@ func TestChangeUserAuthentication_WithPrivacyPolicyEnabledError(t *testing.T) {
 	clt := env.proxies[0].newClient(t)
 	req := changeUserAuthenticationRequest{
 		SecondFactorToken: totpCode,
-		Password:          []byte("abc123"),
+		Password:          []byte("abcdef123456"),
 		TokenID:           resetToken.GetName(),
 	}
 	httpReqData, err := json.Marshal(req)
 	require.NoError(t, err)
 
-	// CSRF protected endpoint.
-	csrfToken := "2ebcb768d0090ea4368e42880c970b61865c326172a4a2343b645cf5d7f20992"
 	httpReq, err := http.NewRequest("PUT", clt.Endpoint("webapi", "users", "password", "token"), bytes.NewBuffer(httpReqData))
 	require.NoError(t, err)
-	addCSRFCookieToReq(httpReq, csrfToken)
 	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set(csrf.HeaderName, csrfToken)
 	httpRes, err := httplib.ConvertResponse(clt.RoundTrip(func() (*http.Response, error) {
 		return clt.HTTPClient().Do(httpReq)
 	}))
 	require.NoError(t, err)
 
-	var apiRes ui.ChangedUserAuthn
+	var apiRes webui.ChangedUserAuthn
 	require.NoError(t, json.Unmarshal(httpRes.Bytes(), &apiRes))
 	require.Len(t, apiRes.Recovery.Codes, 3)
 	require.NotEmpty(t, apiRes.Recovery.Created)
@@ -4614,7 +6100,7 @@ func TestChangeUserAuthentication_settingDefaultClusterAuthPreference(t *testing
 		initialConnectorName string
 		resultConnectorName  string
 	}{{
-		name:                 "first cloud sign-in changes connector to `passwordless`",
+		name:                 "first cloud sign-in changes connector to passwordless",
 		cloud:                true,
 		numberOfUsers:        1,
 		authPreferenceType:   constants.Local,
@@ -4645,114 +6131,112 @@ func TestChangeUserAuthentication_settingDefaultClusterAuthPreference(t *testing
 		name:                 "first cloud sign-in with password does not change connector",
 		cloud:                true,
 		numberOfUsers:        1,
-		password:             []byte("abc123"),
+		password:             []byte("abcdef123456"),
 		authPreferenceType:   constants.Local,
 		initialConnectorName: "",
 		resultConnectorName:  "",
 	}}
 
 	for _, tc := range tt {
-		modules.SetTestModules(t, &modules.TestModules{
-			TestFeatures: modules.Features{
-				Cloud: tc.cloud,
-			},
-		})
-
-		const RPID = "localhost"
-
-		s := newWebSuiteWithConfig(t, webSuiteConfig{
-			authPreferenceSpec: &types.AuthPreferenceSpecV2{
-				Type:          tc.authPreferenceType,
-				ConnectorName: tc.initialConnectorName,
-				SecondFactor:  constants.SecondFactorOn,
-				Webauthn: &types.Webauthn{
-					RPID: RPID,
+		t.Run(tc.name, func(t *testing.T) {
+			modules.SetTestModules(t, &modules.TestModules{
+				TestFeatures: modules.Features{
+					Cloud: tc.cloud,
 				},
-			},
-		})
-
-		// user and role
-		users := make([]types.User, tc.numberOfUsers)
-
-		for i := 0; i < tc.numberOfUsers; i++ {
-			user, err := types.NewUser(fmt.Sprintf("test_user_%v", i))
-			require.NoError(t, err)
-
-			user.SetCreatedBy(types.CreatedBy{
-				User: types.UserRef{Name: "other_user"},
 			})
 
-			role := services.RoleForUser(user)
+			const RPID = "localhost"
 
-			err = s.server.Auth().UpsertRole(s.ctx, role)
+			s := newWebSuiteWithConfig(t, webSuiteConfig{
+				authPreferenceSpec: &types.AuthPreferenceSpecV2{
+					Type:          tc.authPreferenceType,
+					ConnectorName: tc.initialConnectorName,
+					SecondFactor:  constants.SecondFactorOn,
+					Webauthn: &types.Webauthn{
+						RPID: RPID,
+					},
+				},
+			})
+
+			// user and role
+			users := make([]types.User, tc.numberOfUsers)
+
+			for i := 0; i < tc.numberOfUsers; i++ {
+				user, err := types.NewUser(fmt.Sprintf("test_user_%v", i))
+				require.NoError(t, err)
+
+				user.SetCreatedBy(types.CreatedBy{
+					User: types.UserRef{Name: "other_user"},
+				})
+
+				role := services.RoleForUser(user)
+
+				role, err = s.server.Auth().UpsertRole(s.ctx, role)
+				require.NoError(t, err)
+
+				user.AddRole(role.GetName())
+
+				user, err = s.server.Auth().CreateUser(s.ctx, user)
+				require.NoError(t, err)
+
+				users[i] = user
+			}
+
+			initialUser := users[0]
+
+			clt := s.client(t)
+
+			// create register challenge
+			token, err := s.server.Auth().CreateResetPasswordToken(s.ctx, authclient.CreateUserTokenRequest{
+				Name: initialUser.GetName(),
+			})
 			require.NoError(t, err)
 
-			user.AddRole(role.GetName())
-
-			err = s.server.Auth().CreateUser(s.ctx, user)
+			res, err := s.server.Auth().CreateRegisterChallenge(s.ctx, &authproto.CreateRegisterChallengeRequest{
+				TokenID:     token.GetName(),
+				DeviceType:  authproto.DeviceType_DEVICE_TYPE_WEBAUTHN,
+				DeviceUsage: authproto.DeviceUsage_DEVICE_USAGE_PASSWORDLESS,
+			})
 			require.NoError(t, err)
 
-			users[i] = user
-		}
+			cc := wantypes.CredentialCreationFromProto(res.GetWebauthn())
 
-		initialUser := users[0]
+			// use passwordless as auth method
+			device, err := mocku2f.Create()
+			require.NoError(t, err)
 
-		clt := s.client(t)
+			device.SetPasswordless()
 
-		// create register challenge
-		token, err := s.server.Auth().CreateResetPasswordToken(s.ctx, auth.CreateUserTokenRequest{
-			Name: initialUser.GetName(),
+			ccr, err := device.SignCredentialCreation("https://"+RPID, cc)
+			require.NoError(t, err)
+
+			// send sign-in response to server
+			body, err := json.Marshal(changeUserAuthenticationRequest{
+				WebauthnCreationResponse: ccr,
+				TokenID:                  token.GetName(),
+				DeviceName:               "passwordless-device",
+				Password:                 tc.password,
+			})
+			require.NoError(t, err)
+
+			req, err := http.NewRequest("PUT", clt.Endpoint("webapi", "users", "password", "token"), bytes.NewBuffer(body))
+			require.NoError(t, err)
+
+			req.Header.Set("Content-Type", "application/json")
+
+			re, err := clt.Client.RoundTrip(func() (*http.Response, error) {
+				return clt.Client.HTTPClient().Do(req)
+			})
+
+			require.NoError(t, err)
+			require.Equal(t, http.StatusOK, re.Code())
+
+			// check if auth preference connectorName is set
+			authPreference, err := s.server.Auth().GetAuthPreference(s.ctx)
+			require.NoError(t, err)
+
+			require.Equal(t, tc.resultConnectorName, authPreference.GetConnectorName(), "Found unexpected auth connector name")
 		})
-		require.NoError(t, err)
-
-		res, err := s.server.Auth().CreateRegisterChallenge(s.ctx, &authproto.CreateRegisterChallengeRequest{
-			TokenID:     token.GetName(),
-			DeviceType:  authproto.DeviceType_DEVICE_TYPE_WEBAUTHN,
-			DeviceUsage: authproto.DeviceUsage_DEVICE_USAGE_PASSWORDLESS,
-		})
-		require.NoError(t, err)
-
-		cc := wanlib.CredentialCreationFromProto(res.GetWebauthn())
-
-		// use passwordless as auth method
-		device, err := mocku2f.Create()
-		require.NoError(t, err)
-
-		device.SetPasswordless()
-
-		ccr, err := device.SignCredentialCreation("https://"+RPID, cc)
-		require.NoError(t, err)
-
-		// send sign-in response to server
-		body, err := json.Marshal(changeUserAuthenticationRequest{
-			WebauthnCreationResponse: ccr,
-			TokenID:                  token.GetName(),
-			DeviceName:               "passwordless-device",
-			Password:                 tc.password,
-		})
-		require.NoError(t, err)
-
-		req, err := http.NewRequest("PUT", clt.Endpoint("webapi", "users", "password", "token"), bytes.NewBuffer(body))
-		require.NoError(t, err)
-
-		csrfToken, err := csrf.GenerateToken()
-		require.NoError(t, err)
-		addCSRFCookieToReq(req, csrfToken)
-		req.Header.Set(csrf.HeaderName, csrfToken)
-		req.Header.Set("Content-Type", "application/json")
-
-		re, err := clt.Client.RoundTrip(func() (*http.Response, error) {
-			return clt.Client.HTTPClient().Do(req)
-		})
-
-		require.NoError(t, err)
-		require.Equal(t, re.Code(), http.StatusOK)
-
-		// check if auth preference connectorName is set
-		authPreference, err := s.server.Auth().GetAuthPreference(s.ctx)
-		require.NoError(t, err)
-
-		require.Equal(t, authPreference.GetConnectorName(), tc.resultConnectorName, "Found unexpected auth connector name")
 	}
 }
 
@@ -4809,7 +6293,11 @@ func TestParseSSORequestParams(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			req, err := http.NewRequest("", tc.url, nil)
 			require.NoError(t, err)
-			addCSRFCookieToReq(req, token)
+
+			req.AddCookie(&http.Cookie{
+				Name:  csrf.CookieName,
+				Value: token,
+			})
 
 			params, err := ParseSSORequestParams(req)
 
@@ -4832,8 +6320,8 @@ func TestClusterDesktopsGet(t *testing.T) {
 	pack := proxy.authPack(t, "test-user@example.com", nil /* roles */)
 
 	type testResponse struct {
-		Items      []ui.Desktop `json:"items"`
-		TotalCount int          `json:"totalCount"`
+		Items      []webui.Desktop `json:"items"`
+		TotalCount int             `json:"totalCount"`
 	}
 
 	// Add a few desktops.
@@ -4864,13 +6352,15 @@ func TestClusterDesktopsGet(t *testing.T) {
 	require.NoError(t, json.Unmarshal(re.Bytes(), &resp))
 	require.Len(t, resp.Items, 2)
 	require.Equal(t, 2, resp.TotalCount)
-	require.ElementsMatch(t, resp.Items, []ui.Desktop{{
+	require.ElementsMatch(t, resp.Items, []webui.Desktop{{
+		Kind:   types.KindWindowsDesktop,
 		OS:     constants.WindowsOS,
 		Name:   "desktop1",
 		Addr:   "addr",
 		Labels: []ui.Label{{Name: "test-field", Value: "test-value"}},
 		HostID: "host",
 	}, {
+		Kind:   types.KindWindowsDesktop,
 		OS:     constants.WindowsOS,
 		Name:   "desktop2",
 		Addr:   "addr",
@@ -4884,7 +6374,7 @@ func TestDesktopActive(t *testing.T) {
 	env := newWebPack(t, 1)
 	ctx := context.Background()
 
-	role, err := types.NewRole("admin", types.RoleSpecV5{
+	role, err := types.NewRole("admin", types.RoleSpecV6{
 		Allow: types.RoleConditions{
 			WindowsDesktopLabels: types.Labels{"environment": []string{"dev"}},
 		},
@@ -4929,12 +6419,13 @@ func TestGetUserOrResetToken(t *testing.T) {
 	teleUser, err := types.NewUser(username)
 	require.NoError(t, err)
 	teleUser.SetLogins([]string{"login1"})
-	require.NoError(t, env.server.Auth().CreateUser(ctx, teleUser))
+	_, err = env.server.Auth().CreateUser(ctx, teleUser)
+	require.NoError(t, err)
 
 	// Create a reset password token and secrets.
-	resetToken, err := env.server.Auth().CreateResetPasswordToken(ctx, auth.CreateUserTokenRequest{
+	resetToken, err := env.server.Auth().CreateResetPasswordToken(ctx, authclient.CreateUserTokenRequest{
 		Name: username,
-		Type: auth.UserTokenTypeResetPasswordInvite,
+		Type: authclient.UserTokenTypeResetPasswordInvite,
 	})
 	require.NoError(t, err)
 
@@ -4946,7 +6437,8 @@ func TestGetUserOrResetToken(t *testing.T) {
 	fooAllowRules := fooRole.GetRules(types.Allow)
 	fooAllowRules = append(fooAllowRules, types.NewRule(types.KindUser, services.RO()))
 	fooRole.SetRules(types.Allow, fooAllowRules)
-	require.NoError(t, env.server.Auth().UpsertRole(ctx, fooRole))
+	_, err = env.server.Auth().UpsertRole(ctx, fooRole)
+	require.NoError(t, err)
 
 	resp, err := pack.clt.Get(ctx, pack.clt.Endpoint("webapi", "users", username), url.Values{})
 	require.NoError(t, err)
@@ -4954,7 +6446,7 @@ func TestGetUserOrResetToken(t *testing.T) {
 
 	resp, err = pack.clt.Get(ctx, pack.clt.Endpoint("webapi", "users", "password", "token", resetToken.GetName()), url.Values{})
 	require.NoError(t, err)
-	require.Equal(t, resp.Code(), http.StatusOK)
+	require.Equal(t, http.StatusOK, resp.Code())
 
 	_, err = pack.clt.Get(ctx, pack.clt.Endpoint("webapi", "users", "password", "notToken", resetToken.GetName()), url.Values{})
 	require.True(t, trace.IsNotFound(err))
@@ -4966,7 +6458,7 @@ func TestListConnectionsDiagnostic(t *testing.T) {
 	ctx := context.Background()
 	username := "someuser"
 	diagName := "diag1"
-	roleROConnectionDiagnostics, err := types.NewRole(services.RoleNameForUser(username), types.RoleSpecV5{
+	roleROConnectionDiagnostics, err := types.NewRole(services.RoleNameForUser(username), types.RoleSpecV6{
 		Allow: types.RoleConditions{
 			Rules: []types.Rule{
 				types.NewRule(types.KindConnectionDiagnostic,
@@ -4997,12 +6489,12 @@ func TestListConnectionsDiagnostic(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, http.StatusOK, resp.Code())
 
-	var receivedConnectionDiagnostic ui.ConnectionDiagnostic
+	var receivedConnectionDiagnostic webui.ConnectionDiagnostic
 	require.NoError(t, json.Unmarshal(resp.Bytes(), &receivedConnectionDiagnostic))
 
 	require.True(t, receivedConnectionDiagnostic.Success)
-	require.Equal(t, receivedConnectionDiagnostic.ID, diagName)
-	require.Equal(t, receivedConnectionDiagnostic.Message, "success for cd0")
+	require.Equal(t, diagName, receivedConnectionDiagnostic.ID)
+	require.Equal(t, "success for cd0", receivedConnectionDiagnostic.Message)
 
 	diag, err := env.server.Auth().GetConnectionDiagnostic(ctx, diagName)
 	require.NoError(t, err)
@@ -5023,11 +6515,11 @@ func TestListConnectionsDiagnostic(t *testing.T) {
 	require.NoError(t, json.Unmarshal(resp.Bytes(), &receivedConnectionDiagnostic))
 
 	require.True(t, receivedConnectionDiagnostic.Success)
-	require.Equal(t, receivedConnectionDiagnostic.ID, diagName)
-	require.Equal(t, receivedConnectionDiagnostic.Message, "after update")
+	require.Equal(t, diagName, receivedConnectionDiagnostic.ID)
+	require.Equal(t, "after update", receivedConnectionDiagnostic.Message)
 	require.Len(t, receivedConnectionDiagnostic.Traces, 1)
 	require.NotNil(t, receivedConnectionDiagnostic.Traces[0])
-	require.Equal(t, receivedConnectionDiagnostic.Traces[0].Details, "some details")
+	require.Equal(t, "some details", receivedConnectionDiagnostic.Traces[0].Details)
 }
 
 func TestDiagnoseSSHConnection(t *testing.T) {
@@ -5040,7 +6532,7 @@ func TestDiagnoseSSHConnection(t *testing.T) {
 	require.NotEmpty(t, osUsername)
 
 	roleWithFullAccess := func(username string, login string) []types.Role {
-		ret, err := types.NewRole(services.RoleNameForUser(username), types.RoleSpecV5{
+		ret, err := types.NewRole(services.RoleNameForUser(username), types.RoleSpecV6{
 			Allow: types.RoleConditions{
 				Namespaces: []string{apidefaults.Namespace},
 				NodeLabels: types.Labels{types.Wildcard: []string{types.Wildcard}},
@@ -5056,7 +6548,7 @@ func TestDiagnoseSSHConnection(t *testing.T) {
 	require.NotNil(t, roleWithFullAccess)
 
 	rolesWithoutAccessToNode := func(username string, login string) []types.Role {
-		ret, err := types.NewRole(services.RoleNameForUser(username), types.RoleSpecV5{
+		ret, err := types.NewRole(services.RoleNameForUser(username), types.RoleSpecV6{
 			Allow: types.RoleConditions{
 				Namespaces: []string{apidefaults.Namespace},
 				NodeLabels: types.Labels{"forbidden": []string{"yes"}},
@@ -5072,7 +6564,7 @@ func TestDiagnoseSSHConnection(t *testing.T) {
 	require.NotNil(t, rolesWithoutAccessToNode)
 
 	roleWithPrincipal := func(username string, principal string) []types.Role {
-		ret, err := types.NewRole(services.RoleNameForUser(username), types.RoleSpecV5{
+		ret, err := types.NewRole(services.RoleNameForUser(username), types.RoleSpecV6{
 			Allow: types.RoleConditions{
 				Namespaces: []string{apidefaults.Namespace},
 				NodeLabels: types.Labels{types.Wildcard: []string{types.Wildcard}},
@@ -5090,12 +6582,24 @@ func TestDiagnoseSSHConnection(t *testing.T) {
 	env := newWebPack(t, 1)
 	nodeName := env.node.GetInfo().GetHostname()
 
+	// Wait for node to show up
+	require.Eventually(t, func() bool {
+		_, err := env.server.Auth().GetNode(ctx, apidefaults.Namespace, nodeName)
+		if trace.IsNotFound(err) {
+			return false
+		}
+		assert.NoError(t, err, "GetNode returned an unexpected error")
+		return true
+	}, 5*time.Second, 250*time.Millisecond)
+
 	for _, tt := range []struct {
 		name            string
 		teleportUser    string
 		roles           []types.Role
 		resourceName    string
 		nodeUser        string
+		nodeOS          string
+		setupMethod     string
 		stopNode        bool
 		expectedSuccess bool
 		expectedMessage string
@@ -5133,11 +6637,12 @@ func TestDiagnoseSSHConnection(t *testing.T) {
 			},
 		},
 		{
-			name:            "node not found",
-			roles:           roleWithFullAccess("nodenotfound", osUsername),
-			teleportUser:    "nodenotfound",
+			name:            "Linux node not found",
+			roles:           roleWithFullAccess("nodenotfound-linux", osUsername),
+			teleportUser:    "nodenotfound-linux",
 			resourceName:    "notanode",
 			nodeUser:        osUsername,
+			nodeOS:          constants.LinuxOS,
 			expectedSuccess: false,
 			expectedMessage: "failed",
 			expectedTraces: []types.ConnectionDiagnosticTrace{
@@ -5145,7 +6650,44 @@ func TestDiagnoseSSHConnection(t *testing.T) {
 					Type:    types.ConnectionDiagnosticTrace_CONNECTIVITY,
 					Status:  types.ConnectionDiagnosticTrace_FAILED,
 					Details: `Failed to connect to the Node. Ensure teleport service is running using "systemctl status teleport".`,
-					Error:   "Teleport proxy failed to connect to",
+					Error:   "direct dialing to nodes not found in inventory is not supported",
+				},
+			},
+		},
+		{
+			name:            "Darwin node not found",
+			roles:           roleWithFullAccess("nodenotfound-darwin", osUsername),
+			teleportUser:    "nodenotfound-darwin",
+			resourceName:    "notanode",
+			nodeUser:        osUsername,
+			nodeOS:          constants.DarwinOS,
+			expectedSuccess: false,
+			expectedMessage: "failed",
+			expectedTraces: []types.ConnectionDiagnosticTrace{
+				{
+					Type:    types.ConnectionDiagnosticTrace_CONNECTIVITY,
+					Status:  types.ConnectionDiagnosticTrace_FAILED,
+					Details: `Failed to connect to the Node. Ensure teleport service is running using "launchctl print 'system/Teleport Service'".`,
+					Error:   "direct dialing to nodes not found in inventory is not supported",
+				},
+			},
+		},
+		{
+			name:            "Connect My Computer node not found",
+			roles:           roleWithFullAccess("nodenotfound-connect-my-computer", osUsername),
+			teleportUser:    "nodenotfound-connect-my-computer",
+			resourceName:    "notanode",
+			nodeUser:        osUsername,
+			nodeOS:          constants.DarwinOS,
+			setupMethod:     conntest.SSHNodeSetupMethodConnectMyComputer,
+			expectedSuccess: false,
+			expectedMessage: "failed",
+			expectedTraces: []types.ConnectionDiagnosticTrace{
+				{
+					Type:    types.ConnectionDiagnosticTrace_CONNECTIVITY,
+					Status:  types.ConnectionDiagnosticTrace_FAILED,
+					Details: `Open the Connect My Computer tab in Teleport Connect and make sure that the agent is running.`,
+					Error:   "direct dialing to nodes not found in inventory is not supported",
 				},
 			},
 		},
@@ -5202,7 +6744,7 @@ func TestDiagnoseSSHConnection(t *testing.T) {
 			},
 		},
 		{
-			name:            "principal doesnt exist in target host",
+			name:            "principal does not exist in target host",
 			teleportUser:    "principaldoesnotexist",
 			roles:           roleWithPrincipal("principaldoesnotexist", "nonvalidlinuxuser"),
 			resourceName:    nodeName,
@@ -5213,8 +6755,26 @@ func TestDiagnoseSSHConnection(t *testing.T) {
 				{
 					Type:    types.ConnectionDiagnosticTrace_NODE_PRINCIPAL,
 					Status:  types.ConnectionDiagnosticTrace_FAILED,
-					Details: `Invalid user. Please ensure the principal "nonvalidlinuxuser" is a valid Linux login in the target node. Output from Node: Failed to launch: user: unknown user nonvalidlinuxuser.`,
+					Details: `Invalid user. Please ensure the principal "nonvalidlinuxuser" is a valid login in the target node. Output from Node: Failed to launch: user:`,
 					Error:   "Process exited with status 255",
+				},
+			},
+		},
+		{
+			name:            "principal does not exist in target Connect My Computer host",
+			teleportUser:    "principaldoesnotexist-connect-my-computer",
+			roles:           roleWithPrincipal("principaldoesnotexist-connect-my-computer", "nonvaliduser"),
+			resourceName:    nodeName,
+			nodeUser:        "nonvaliduser",
+			setupMethod:     conntest.SSHNodeSetupMethodConnectMyComputer,
+			expectedSuccess: false,
+			expectedMessage: "failed",
+			expectedTraces: []types.ConnectionDiagnosticTrace{
+				{
+					Type:    types.ConnectionDiagnosticTrace_NODE_PRINCIPAL,
+					Status:  types.ConnectionDiagnosticTrace_FAILED,
+					Details: `Invalid user`,
+					Error:   `The role "connect-my-computer-principaldoesnotexist-connect-my-computer" includes only the login "nonvaliduser" and "nonvaliduser" is not a valid principal for this node`,
 				},
 			},
 		},
@@ -5233,16 +6793,16 @@ func TestDiagnoseSSHConnection(t *testing.T) {
 			createConnectionEndpoint := pack.clt.Endpoint("webapi", "sites", clusterName, "diagnostics", "connections")
 
 			resp, err := pack.clt.PostJSON(ctx, createConnectionEndpoint, conntest.TestConnectionRequest{
-				ResourceKind: types.KindNode,
-				ResourceName: tt.resourceName,
-				SSHPrincipal: tt.nodeUser,
-				// Default is 30 seconds but since tests run locally, we can reduce this value to also improve test responsiveness
-				DialTimeout: time.Second,
+				ResourceKind:       types.KindNode,
+				ResourceName:       tt.resourceName,
+				SSHPrincipal:       tt.nodeUser,
+				SSHNodeOS:          tt.nodeOS,
+				SSHNodeSetupMethod: tt.setupMethod,
 			})
 			require.NoError(t, err)
 			require.Equal(t, http.StatusOK, resp.Code())
 
-			var connectionDiagnostic ui.ConnectionDiagnostic
+			var connectionDiagnostic webui.ConnectionDiagnostic
 			require.NoError(t, json.Unmarshal(resp.Bytes(), &connectionDiagnostic))
 
 			gotFailedTraces := 0
@@ -5274,7 +6834,7 @@ func TestDiagnoseSSHConnection(t *testing.T) {
 
 					foundTrace = true
 					require.Equal(t, returnedTrace.Status, expectedTrace.Status.String())
-					require.Equal(t, returnedTrace.Details, expectedTrace.Details)
+					require.Contains(t, returnedTrace.Details, expectedTrace.Details)
 					require.Contains(t, returnedTrace.Error, expectedTrace.Error)
 				}
 
@@ -5283,10 +6843,41 @@ func TestDiagnoseSSHConnection(t *testing.T) {
 			require.Equal(t, expectedFailedTraces, gotFailedTraces)
 		})
 	}
+
+	// Test success with per-session MFA.
+
+	ap, err := types.NewAuthPreference(types.AuthPreferenceSpecV2{
+		Type:           constants.Local,
+		SecondFactor:   constants.SecondFactorOTP,
+		RequireMFAType: types.RequireMFAType_SESSION,
+	})
+	require.NoError(t, err)
+	_, err = env.server.Auth().UpsertAuthPreference(ctx, ap)
+	require.NoError(t, err)
+
+	// Get a totp code to re-auth.
+	pack := env.proxies[0].authPack(t, "llama", roleWithFullAccess("success", osUsername))
+	totpCode, err := totp.GenerateCode(pack.otpSecret, env.clock.Now().Add(30*time.Second))
+	require.NoError(t, err)
+
+	clusterName := env.server.ClusterName()
+	createConnectionEndpoint := pack.clt.Endpoint("webapi", "sites", clusterName, "diagnostics", "connections")
+
+	resp, err := pack.clt.PostJSON(ctx, createConnectionEndpoint, conntest.TestConnectionRequest{
+		ResourceKind: types.KindNode,
+		ResourceName: nodeName,
+		SSHPrincipal: osUsername,
+		MFAResponse:  client.MFAChallengeResponse{TOTPCode: totpCode},
+	})
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.Code())
+
+	var connectionDiagnostic webui.ConnectionDiagnostic
+	require.NoError(t, json.Unmarshal(resp.Bytes(), &connectionDiagnostic))
+	require.True(t, connectionDiagnostic.Success)
 }
 
 func TestDiagnoseKubeConnection(t *testing.T) {
-
 	var (
 		validKubeUsers              = []string{}
 		multiKubeUsers              = []string{"user1", "user2"}
@@ -5298,7 +6889,7 @@ func TestDiagnoseKubeConnection(t *testing.T) {
 	)
 
 	roleWithFullAccess := func(username string, kubeUsers, kubeGroups []string) []types.Role {
-		ret, err := types.NewRole(services.RoleNameForUser(username), types.RoleSpecV5{
+		ret, err := types.NewRole(services.RoleNameForUser(username), types.RoleSpecV6{
 			Allow: types.RoleConditions{
 				Namespaces:       []string{apidefaults.Namespace},
 				KubernetesLabels: types.Labels{types.Wildcard: []string{types.Wildcard}},
@@ -5307,6 +6898,14 @@ func TestDiagnoseKubeConnection(t *testing.T) {
 				},
 				KubeGroups: kubeGroups,
 				KubeUsers:  kubeUsers,
+				KubernetesResources: []types.KubernetesResource{
+					{
+						Kind:      types.KindKubePod,
+						Namespace: types.Wildcard,
+						Name:      types.Wildcard,
+						Verbs:     []string{types.Wildcard},
+					},
+				},
 			},
 		})
 		require.NoError(t, err)
@@ -5315,7 +6914,7 @@ func TestDiagnoseKubeConnection(t *testing.T) {
 	require.NotNil(t, roleWithFullAccess)
 
 	rolesWithoutAccessToKubeCluster := func(username string, kubeUsers, kubeGroups []string) []types.Role {
-		ret, err := types.NewRole(services.RoleNameForUser(username), types.RoleSpecV5{
+		ret, err := types.NewRole(services.RoleNameForUser(username), types.RoleSpecV6{
 			Allow: types.RoleConditions{
 				Namespaces:       []string{apidefaults.Namespace},
 				KubernetesLabels: types.Labels{"forbidden": []string{"yes"}},
@@ -5324,6 +6923,14 @@ func TestDiagnoseKubeConnection(t *testing.T) {
 				},
 				KubeGroups: kubeGroups,
 				KubeUsers:  kubeUsers,
+				KubernetesResources: []types.KubernetesResource{
+					{
+						Kind:      types.KindKubePod,
+						Namespace: types.Wildcard,
+						Name:      types.Wildcard,
+						Verbs:     []string{types.Wildcard},
+					},
+				},
 			},
 		})
 		require.NoError(t, err)
@@ -5342,6 +6949,7 @@ func TestDiagnoseKubeConnection(t *testing.T) {
 		marshalValidPodList(t, w)
 	})
 	testKube := httptest.NewTLSServer(rt)
+
 	t.Cleanup(func() {
 		testKube.Close()
 	})
@@ -5462,7 +7070,8 @@ func TestDiagnoseKubeConnection(t *testing.T) {
 					Type:    types.ConnectionDiagnosticTrace_RBAC_PRINCIPAL,
 					Status:  types.ConnectionDiagnosticTrace_FAILED,
 					Details: "User-associated roles do not configure \"kubernetes_groups\" or \"kubernetes_users\". Make sure that at least one is configured for the user.",
-					Error:   "this user cannot request kubernetes access, has no assigned groups or users",
+					Error: "Your user's Teleport role does not allow Kubernetes access." +
+						" Please ask cluster administrator to ensure your role has appropriate kubernetes_groups and kubernetes_users set.",
 				},
 			},
 		},
@@ -5682,7 +7291,7 @@ func TestDiagnoseKubeConnection(t *testing.T) {
 			require.NoError(t, err)
 			require.Equal(t, http.StatusOK, resp.Code())
 
-			var connectionDiagnostic ui.ConnectionDiagnostic
+			var connectionDiagnostic webui.ConnectionDiagnostic
 			require.NoError(t, json.Unmarshal(resp.Bytes(), &connectionDiagnostic))
 			gotFailedTraces := 0
 			expectedFailedTraces := 0
@@ -5712,9 +7321,9 @@ func TestDiagnoseKubeConnection(t *testing.T) {
 					}
 
 					foundTrace = true
-					require.Equal(t, returnedTrace.Status, expectedTrace.Status.String())
-					require.Equal(t, returnedTrace.Details, expectedTrace.Details)
-					require.Contains(t, returnedTrace.Error, expectedTrace.Error)
+					require.Equal(t, expectedTrace.Status.String(), returnedTrace.Status)
+					require.Equal(t, expectedTrace.Details, returnedTrace.Details)
+					require.Contains(t, expectedTrace.Error, returnedTrace.Error)
 				}
 
 				require.True(t, foundTrace, expectedTrace)
@@ -5723,6 +7332,41 @@ func TestDiagnoseKubeConnection(t *testing.T) {
 			require.Equal(t, expectedFailedTraces, gotFailedTraces)
 		})
 	}
+
+	// Test success with per-session MFA.
+
+	ap, err := types.NewAuthPreference(types.AuthPreferenceSpecV2{
+		Type:           constants.Local,
+		SecondFactor:   constants.SecondFactorOTP,
+		RequireMFAType: types.RequireMFAType_SESSION,
+	})
+	require.NoError(t, err)
+	_, err = env.server.Auth().UpsertAuthPreference(ctx, ap)
+	require.NoError(t, err)
+
+	// Get a totp code to re-auth.
+	pack := env.proxies[0].authPack(t, "llama", roleWithFullAccess("llama", validKubeUsers, validKubeGroups))
+	totpCode, err := totp.GenerateCode(pack.otpSecret, env.clock.Now().Add(30*time.Second))
+	require.NoError(t, err)
+
+	clusterName := env.server.ClusterName()
+	createConnectionEndpoint := pack.clt.Endpoint("webapi", "sites", clusterName, "diagnostics", "connections")
+
+	resp, err := pack.clt.PostJSON(ctx, createConnectionEndpoint, conntest.TestConnectionRequest{
+		ResourceKind: types.KindKubernetesCluster,
+		ResourceName: kubeClusterName,
+		// Default is 30 seconds but since tests run locally, we can reduce this value to also improve test responsiveness
+		DialTimeout:             time.Second,
+		KubernetesImpersonation: conntest.KubernetesImpersonation{},
+		MFAResponse:             client.MFAChallengeResponse{TOTPCode: totpCode},
+	})
+
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.Code())
+
+	var connectionDiagnostic webui.ConnectionDiagnostic
+	require.NoError(t, json.Unmarshal(resp.Bytes(), &connectionDiagnostic))
+	require.True(t, connectionDiagnostic.Success)
 }
 
 func TestCreateDatabase(t *testing.T) {
@@ -5730,8 +7374,10 @@ func TestCreateDatabase(t *testing.T) {
 
 	ctx := context.Background()
 	username := "someuser"
-	roleCreateDatabase, err := types.NewRole(services.RoleNameForUser(username), types.RoleSpecV5{
+	roleCreateDatabase, err := types.NewRole(services.RoleNameForUser(username), types.RoleSpecV6{
 		Allow: types.RoleConditions{
+			DatabaseNames: []string{"name1"},
+			DatabaseUsers: []string{"user1"},
 			Rules: []types.Rule{
 				types.NewRule(types.KindDatabase,
 					[]string{types.VerbCreate}),
@@ -5749,25 +7395,39 @@ func TestCreateDatabase(t *testing.T) {
 
 	createDatabaseEndpoint := pack.clt.Endpoint("webapi", "sites", clusterName, "databases")
 
+	// Create an initial database to table test a duplicate creation
+	_, err = pack.clt.PostJSON(ctx, createDatabaseEndpoint, createOrOverwriteDatabaseRequest{
+		Name:     "duplicatedb",
+		Protocol: "mysql",
+		URI:      "someuri:3306",
+	})
+	require.NoError(t, err)
+
 	for _, tt := range []struct {
 		name           string
-		req            createDatabaseRequest
+		req            createOrOverwriteDatabaseRequest
 		expectedStatus int
 		errAssert      require.ErrorAssertionFunc
 	}{
 		{
 			name: "valid",
-			req: createDatabaseRequest{
+			req: createOrOverwriteDatabaseRequest{
 				Name:     "mydatabase",
 				Protocol: "mysql",
 				URI:      "someuri:3306",
+				Labels: []ui.Label{
+					{
+						Name:  "teleport.dev/origin",
+						Value: "dynamic",
+					},
+				},
 			},
 			expectedStatus: http.StatusOK,
 			errAssert:      require.NoError,
 		},
 		{
 			name: "valid with labels",
-			req: createDatabaseRequest{
+			req: createOrOverwriteDatabaseRequest{
 				Name:     "dbwithlabels",
 				Protocol: "mysql",
 				URI:      "someuri:3306",
@@ -5776,6 +7436,10 @@ func TestCreateDatabase(t *testing.T) {
 						Name:  "env",
 						Value: "prod",
 					},
+					{
+						Name:  "teleport.dev/origin",
+						Value: "dynamic",
+					},
 				},
 			},
 			expectedStatus: http.StatusOK,
@@ -5783,50 +7447,63 @@ func TestCreateDatabase(t *testing.T) {
 		},
 		{
 			name: "empty name",
-			req: createDatabaseRequest{
+			req: createOrOverwriteDatabaseRequest{
 				Name:     "",
 				Protocol: "mysql",
 				URI:      "someuri:3306",
 			},
 			expectedStatus: http.StatusBadRequest,
 			errAssert: func(tt require.TestingT, err error, i ...interface{}) {
-				require.ErrorContains(t, err, "missing database name")
+				require.ErrorContains(tt, err, "missing database name")
 			},
 		},
 		{
 			name: "empty protocol",
-			req: createDatabaseRequest{
+			req: createOrOverwriteDatabaseRequest{
 				Name:     "emptyprotocol",
 				Protocol: "",
 				URI:      "someuri:3306",
 			},
 			expectedStatus: http.StatusBadRequest,
 			errAssert: func(tt require.TestingT, err error, i ...interface{}) {
-				require.ErrorContains(t, err, "missing protocol")
+				require.ErrorContains(tt, err, "missing protocol")
 			},
 		},
 		{
 			name: "empty uri",
-			req: createDatabaseRequest{
+			req: createOrOverwriteDatabaseRequest{
 				Name:     "emptyuri",
 				Protocol: "mysql",
 				URI:      "",
 			},
 			expectedStatus: http.StatusBadRequest,
 			errAssert: func(tt require.TestingT, err error, i ...interface{}) {
-				require.ErrorContains(t, err, "missing uri")
+				require.ErrorContains(tt, err, "missing uri")
 			},
 		},
 		{
 			name: "missing port",
-			req: createDatabaseRequest{
+			req: createOrOverwriteDatabaseRequest{
 				Name:     "missingport",
 				Protocol: "mysql",
 				URI:      "someuri",
 			},
 			expectedStatus: http.StatusBadRequest,
 			errAssert: func(tt require.TestingT, err error, i ...interface{}) {
-				require.ErrorContains(t, err, "missing port in address")
+				require.ErrorContains(tt, err, "missing port in address")
+			},
+		},
+		{
+			name: "duplicatedb",
+			req: createOrOverwriteDatabaseRequest{
+				Name:     "duplicatedb",
+				Protocol: "mysql",
+				URI:      "someuri:3306",
+			},
+			expectedStatus: http.StatusConflict,
+			errAssert: func(tt require.TestingT, err error, i ...interface{}) {
+				require.True(t, trace.IsAlreadyExists(err), "expected already exists error, got %v", err)
+				require.Contains(t, err.Error(), `failed to create database ("duplicatedb" already exists), please use another name`)
 			},
 		},
 	} {
@@ -5834,7 +7511,7 @@ func TestCreateDatabase(t *testing.T) {
 		resp, err := pack.clt.PostJSON(ctx, createDatabaseEndpoint, tt.req)
 		tt.errAssert(t, err)
 
-		require.Equal(t, resp.Code(), tt.expectedStatus, "invalid status code received")
+		require.Equal(t, tt.expectedStatus, resp.Code(), "invalid status code received")
 
 		if err != nil {
 			continue
@@ -5844,9 +7521,9 @@ func TestCreateDatabase(t *testing.T) {
 		database, err := env.proxies[0].client.GetDatabase(ctx, tt.req.Name)
 		require.NoError(t, err)
 
-		require.Equal(t, database.GetName(), tt.req.Name)
-		require.Equal(t, database.GetProtocol(), tt.req.Protocol)
-		require.Equal(t, database.GetURI(), tt.req.URI)
+		require.Equal(t, tt.req.Name, database.GetName())
+		require.Equal(t, tt.req.Protocol, database.GetProtocol())
+		require.Equal(t, tt.req.URI, database.GetURI())
 
 		// At least the provided labels exist in the database resource
 		databaseLabels := database.GetAllLabels()
@@ -5854,16 +7531,109 @@ func TestCreateDatabase(t *testing.T) {
 			require.Contains(t, databaseLabels, label.Name, "label not found")
 			require.Equal(t, label.Value, databaseLabels[label.Name], "label exists but has unexpected value")
 		}
+
+		// Check response value:
+		if tt.expectedStatus == http.StatusOK {
+			result := webui.Database{}
+			require.NoError(t, json.Unmarshal(resp.Bytes(), &result))
+			expected := webui.Database{
+				Kind:          types.KindDatabase,
+				Name:          tt.req.Name,
+				Protocol:      tt.req.Protocol,
+				Type:          types.DatabaseTypeSelfHosted,
+				Labels:        tt.req.Labels,
+				Hostname:      "someuri",
+				DatabaseUsers: []string{"user1"},
+				DatabaseNames: []string{"name1"},
+				URI:           "someuri:3306",
+			}
+			require.Equal(t, expected, result)
+		}
 	}
 }
 
-func TestUpdateDatabase(t *testing.T) {
+func TestOverwriteDatabase(t *testing.T) {
+	t.Parallel()
+
+	env := newWebPack(t, 1)
+	proxy := env.proxies[0]
+	pack := proxy.authPack(t, "user", nil /* roles */)
+	accessChecker := services.NewAccessCheckerWithRoleSet(&services.AccessInfo{}, env.server.ClusterName(), nil)
+
+	initDb, err := types.NewDatabaseV3(types.Metadata{
+		Name: "postgres",
+	}, types.DatabaseSpecV3{
+		Protocol: "postgres",
+		URI:      "localhost:5432",
+		AWS: types.AWS{
+			AccountID: "123456789012",
+		},
+	})
+	require.NoError(t, err)
+
+	err = env.server.Auth().CreateDatabase(context.Background(), initDb)
+	require.NoError(t, err)
+
+	tests := []struct {
+		name           string
+		req            createOrOverwriteDatabaseRequest
+		verifyResponse func(*testing.T, *roundtrip.Response, createOrOverwriteDatabaseRequest, error)
+	}{
+		{
+			name: "overwrite",
+			req: createOrOverwriteDatabaseRequest{
+				Name:      initDb.GetName(),
+				Overwrite: true,
+				URI:       "some-other-uri:3306",
+				Protocol:  "postgres",
+			},
+			verifyResponse: func(t *testing.T, resp *roundtrip.Response, req createOrOverwriteDatabaseRequest, err error) {
+				require.NoError(t, err)
+
+				var gotDb webui.Database
+				require.NoError(t, json.Unmarshal(resp.Bytes(), &gotDb))
+				require.Equal(t, req.URI, gotDb.URI)
+				require.Equal(t, req.Protocol, gotDb.Protocol)
+				require.Empty(t, req.AWSRDS)
+				require.Equal(t, initDb.GetName(), gotDb.Name)
+
+				backendDb, err := env.server.Auth().GetDatabase(context.Background(), req.Name)
+				require.NoError(t, err)
+
+				require.Equal(t, webui.MakeDatabase(backendDb, accessChecker, proxy.handler.handler.cfg.DatabaseREPLRegistry, false), gotDb)
+			},
+		},
+		{
+			name: "overwrite error: database does not exist",
+			req: createOrOverwriteDatabaseRequest{
+				Name:      "this-db-does-not-exist",
+				URI:       "some-uri",
+				Protocol:  "mysql",
+				Overwrite: true,
+			},
+			verifyResponse: func(t *testing.T, resp *roundtrip.Response, req createOrOverwriteDatabaseRequest, err error) {
+				require.True(t, trace.IsNotFound(err))
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			endpoint := pack.clt.Endpoint("webapi", "sites", env.server.ClusterName(), "databases")
+			resp, err := pack.clt.PostJSON(context.Background(), endpoint, test.req)
+
+			test.verifyResponse(t, resp, test.req, err)
+		})
+	}
+}
+
+func TestUpdateDatabase_Errors(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
 	databaseName := "somedb"
 	username := "someuser"
-	roleCreateUpdateDatabase, err := types.NewRole(services.RoleNameForUser(username), types.RoleSpecV5{
+	roleCreateUpdateDatabase, err := types.NewRole(services.RoleNameForUser(username), types.RoleSpecV6{
 		Allow: types.RoleConditions{
 			Rules: []types.Rule{
 				types.NewRule(types.KindDatabase,
@@ -5882,7 +7652,7 @@ func TestUpdateDatabase(t *testing.T) {
 
 	// Create database
 	createDatabaseEndpoint := pack.clt.Endpoint("webapi", "sites", clusterName, "databases")
-	_, err = pack.clt.PostJSON(ctx, createDatabaseEndpoint, createDatabaseRequest{
+	_, err = pack.clt.PostJSON(ctx, createDatabaseEndpoint, createOrOverwriteDatabaseRequest{
 		Name:     databaseName,
 		Protocol: "mysql",
 		URI:      "someuri:3306",
@@ -5896,50 +7666,258 @@ func TestUpdateDatabase(t *testing.T) {
 		errAssert      require.ErrorAssertionFunc
 	}{
 		{
-			name: "valid",
-			req: updateDatabaseRequest{
-				CACert: fakeValidTLSCert,
-			},
-			expectedStatus: http.StatusOK,
-			errAssert:      require.NoError,
-		},
-		{
 			name: "empty ca_cert",
 			req: updateDatabaseRequest{
-				CACert: "",
+				CACert: strPtr(""),
 			},
 			expectedStatus: http.StatusBadRequest,
 			errAssert: func(tt require.TestingT, err error, i ...interface{}) {
-				require.ErrorContains(t, err, "missing CA certificate data")
+				require.ErrorContains(tt, err, "missing CA certificate data")
 			},
 		},
 		{
 			name: "invalid certificate",
 			req: updateDatabaseRequest{
-				CACert: "Not a certificate",
+				CACert: strPtr("Not a certificate"),
 			},
 			expectedStatus: http.StatusBadRequest,
 			errAssert: func(tt require.TestingT, err error, i ...interface{}) {
-				require.ErrorContains(t, err, "could not parse provided CA as X.509 PEM certificate")
+				require.ErrorContains(tt, err, "could not parse provided CA as X.509 PEM certificate")
+			},
+		},
+
+		{
+			name: "invalid awsRDS missing resourceID field",
+			req: updateDatabaseRequest{
+				AWSRDS: &awsRDS{
+					AccountID: "123123123123",
+				},
+			},
+			expectedStatus: http.StatusBadRequest,
+			errAssert: func(tt require.TestingT, err error, i ...interface{}) {
+				require.ErrorContains(tt, err, "missing aws rds field resource id")
+			},
+		},
+		{
+			name: "invalid awsRDS missing accountID field",
+			req: updateDatabaseRequest{
+				AWSRDS: &awsRDS{
+					ResourceID: "123123123123",
+				},
+			},
+			expectedStatus: http.StatusBadRequest,
+			errAssert: func(tt require.TestingT, err error, i ...interface{}) {
+				require.ErrorContains(tt, err, "missing aws rds field account id")
+			},
+		},
+		{
+			name:           "no fields defined",
+			req:            updateDatabaseRequest{},
+			expectedStatus: http.StatusBadRequest,
+			errAssert: func(tt require.TestingT, err error, i ...interface{}) {
+				require.ErrorContains(tt, err, "missing fields to update the database")
 			},
 		},
 	} {
-		// Update database's CA Cert
-		updateDatabaseEndpoint := pack.clt.Endpoint("webapi", "sites", clusterName, "databases", databaseName)
-		resp, err := pack.clt.PutJSON(ctx, updateDatabaseEndpoint, tt.req)
-		tt.errAssert(t, err)
+		t.Run(tt.name, func(t *testing.T) {
+			// Update database's CA Cert
+			updateDatabaseEndpoint := pack.clt.Endpoint("webapi", "sites", clusterName, "databases", databaseName)
+			resp, err := pack.clt.PutJSON(ctx, updateDatabaseEndpoint, tt.req)
+			tt.errAssert(t, err)
 
-		require.Equal(t, resp.Code(), tt.expectedStatus, "invalid status code received")
+			require.Equal(t, tt.expectedStatus, resp.Code(), "invalid status code received")
+		})
+	}
+}
 
-		if err != nil {
-			continue
-		}
+func TestUpdateDatabase_NonErrors(t *testing.T) {
+	t.Parallel()
 
-		// Ensure database was updated
-		database, err := env.proxies[0].client.GetDatabase(ctx, databaseName)
-		require.NoError(t, err)
+	ctx := context.Background()
+	databaseName := "somedb"
+	username := "someuser"
+	roleCreateUpdateDatabase, err := types.NewRole(services.RoleNameForUser(username), types.RoleSpecV6{
+		Allow: types.RoleConditions{
+			Rules: []types.Rule{
+				types.NewRule(types.KindDatabase,
+					[]string{types.VerbCreate, types.VerbUpdate, types.VerbRead}),
+			},
+			DatabaseLabels: types.Labels{
+				types.Wildcard: {types.Wildcard},
+			},
+		},
+	})
+	require.NoError(t, err)
 
-		require.Equal(t, database.GetCA(), fakeValidTLSCert)
+	env := newWebPack(t, 1)
+	clusterName := env.server.ClusterName()
+	pack := env.proxies[0].authPack(t, username, []types.Role{roleCreateUpdateDatabase})
+
+	// Create a database.
+	dbProtocol := "mysql"
+	database, err := getNewDatabaseResource(createOrOverwriteDatabaseRequest{
+		Name:     databaseName,
+		Protocol: dbProtocol,
+		URI:      "someuri:3306",
+	})
+	require.NoError(t, err)
+	require.NoError(t, env.server.Auth().CreateDatabase(ctx, database))
+
+	requiredOriginLabel := ui.Label{Name: types.OriginLabel, Value: types.OriginDynamic}
+
+	// Each test case builds on top of each other.
+	for _, tt := range []struct {
+		name           string
+		req            updateDatabaseRequest
+		expectedFields webui.Database
+		expectedAWSRDS awsRDS
+	}{
+		{
+			name: "update caCert",
+			req: updateDatabaseRequest{
+				CACert: &fakeValidTLSCert,
+			},
+			expectedFields: webui.Database{
+				Kind:     types.KindDatabase,
+				Name:     databaseName,
+				Protocol: dbProtocol,
+				Type:     "self-hosted",
+				Hostname: "someuri",
+				Labels:   []ui.Label{requiredOriginLabel},
+				URI:      "someuri:3306",
+			},
+		},
+		{
+			name: "update URI",
+			req: updateDatabaseRequest{
+				URI: "something-else:3306",
+			},
+			expectedFields: webui.Database{
+				Kind:     types.KindDatabase,
+				Name:     databaseName,
+				Protocol: dbProtocol,
+				Type:     "self-hosted",
+				Hostname: "something-else",
+				Labels:   []ui.Label{requiredOriginLabel},
+				URI:      "something-else:3306",
+			},
+		},
+		{
+			name: "update aws rds fields",
+			req: updateDatabaseRequest{
+				URI: "llama.cgi8.us-west-2.rds.amazonaws.com:3306",
+				AWSRDS: &awsRDS{
+					AccountID:  "123123123123",
+					ResourceID: "db-1234",
+				},
+			},
+			expectedAWSRDS: awsRDS{
+				AccountID:  "123123123123",
+				ResourceID: "db-1234",
+			},
+			expectedFields: webui.Database{
+				Kind:     types.KindDatabase,
+				Name:     databaseName,
+				Protocol: dbProtocol,
+				Type:     "rds",
+				Hostname: "llama.cgi8.us-west-2.rds.amazonaws.com",
+				Labels:   []ui.Label{requiredOriginLabel},
+				URI:      "llama.cgi8.us-west-2.rds.amazonaws.com:3306",
+				AWS: &webui.AWS{
+					AWS: types.AWS{
+						Region:    "us-west-2",
+						AccountID: "123123123123",
+						RDS: types.RDS{
+							ResourceID: "db-1234",
+							InstanceID: "llama",
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "update labels",
+			req: updateDatabaseRequest{
+				Labels: []ui.Label{{Name: "env", Value: "prod"}},
+			},
+			expectedAWSRDS: awsRDS{
+				AccountID:  "123123123123",
+				ResourceID: "db-1234",
+			},
+			expectedFields: webui.Database{
+				Kind:     types.KindDatabase,
+				Name:     databaseName,
+				Protocol: dbProtocol,
+				Type:     "rds",
+				Hostname: "llama.cgi8.us-west-2.rds.amazonaws.com",
+				Labels:   []ui.Label{{Name: "env", Value: "prod"}, requiredOriginLabel},
+				URI:      "llama.cgi8.us-west-2.rds.amazonaws.com:3306",
+				AWS: &webui.AWS{
+					AWS: types.AWS{
+						Region:    "us-west-2",
+						AccountID: "123123123123",
+						RDS: types.RDS{
+							ResourceID: "db-1234",
+							InstanceID: "llama",
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "update multiple fields",
+			req: updateDatabaseRequest{
+				URI: "alpaca.cgi8.us-east-1.rds.amazonaws.com:3306",
+				AWSRDS: &awsRDS{
+					AccountID:  "000000000000",
+					ResourceID: "db-0000",
+				},
+			},
+			expectedAWSRDS: awsRDS{
+				AccountID:  "000000000000",
+				ResourceID: "db-0000",
+			},
+			expectedFields: webui.Database{
+				Kind:     types.KindDatabase,
+				Name:     databaseName,
+				Protocol: dbProtocol,
+				Type:     "rds",
+				Hostname: "alpaca.cgi8.us-east-1.rds.amazonaws.com",
+				Labels:   []ui.Label{{Name: "env", Value: "prod"}, requiredOriginLabel},
+				URI:      "alpaca.cgi8.us-east-1.rds.amazonaws.com:3306",
+				AWS: &webui.AWS{
+					AWS: types.AWS{
+						Region:    "us-east-1",
+						AccountID: "000000000000",
+						RDS: types.RDS{
+							ResourceID: "db-0000",
+							InstanceID: "alpaca",
+						},
+					},
+				},
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			updateDatabaseEndpoint := pack.clt.Endpoint("webapi", "sites", clusterName, "databases", databaseName)
+			resp, err := pack.clt.PutJSON(ctx, updateDatabaseEndpoint, tt.req)
+			require.NoError(t, err)
+			var dbResp webui.Database
+			require.NoError(t, json.Unmarshal(resp.Bytes(), &dbResp))
+			require.Equal(t, tt.expectedFields, dbResp)
+
+			// Ensure database was updated
+			database, err := env.proxies[0].client.GetDatabase(ctx, databaseName)
+			require.NoError(t, err)
+
+			require.Equal(t, database.GetCA(), fakeValidTLSCert) // should not have changed
+			require.Equal(t, database.GetType(), tt.expectedFields.Type)
+			require.Equal(t, database.GetProtocol(), tt.expectedFields.Protocol)
+			require.Equal(t, database.GetURI(), fmt.Sprintf("%s:3306", tt.expectedFields.Hostname))
+
+			require.Equal(t, database.GetAWS().AccountID, tt.expectedAWSRDS.AccountID)
+			require.Equal(t, database.GetAWS().RDS.ResourceID, tt.expectedAWSRDS.ResourceID)
+		})
 	}
 }
 
@@ -5947,12 +7925,12 @@ type authProviderMock struct {
 	server types.ServerV2
 }
 
-func (mock authProviderMock) GetNodes(ctx context.Context, n string) ([]types.Server, error) {
-	return []types.Server{&mock.server}, nil
+func (mock authProviderMock) ListUnifiedResources(ctx context.Context, req *authproto.ListUnifiedResourcesRequest) (*authproto.ListUnifiedResourcesResponse, error) {
+	return nil, nil
 }
 
-func (mock authProviderMock) GetSessionEvents(n string, s session.ID, c int, p bool) ([]events.EventFields, error) {
-	return []events.EventFields{}, nil
+func (mock authProviderMock) GetNode(ctx context.Context, namespace, name string) (types.Server, error) {
+	return &mock.server, nil
 }
 
 func (mock authProviderMock) GetSessionTracker(ctx context.Context, sessionID string) (types.SessionTracker, error) {
@@ -5963,98 +7941,35 @@ func (mock authProviderMock) IsMFARequired(ctx context.Context, req *authproto.I
 	return nil, nil
 }
 
-func (mock authProviderMock) GenerateUserSingleUseCerts(ctx context.Context) (authproto.AuthService_GenerateUserSingleUseCertsClient, error) {
+func (mock authProviderMock) CreateAuthenticateChallenge(ctx context.Context, req *authproto.CreateAuthenticateChallengeRequest) (*authproto.MFAAuthenticateChallenge, error) {
 	return nil, nil
 }
 
-type terminalOpt func(t *TerminalRequest)
-
-func withSessionID(sid session.ID) terminalOpt {
-	return func(t *TerminalRequest) { t.SessionID = sid }
+func (mock authProviderMock) GenerateUserCerts(ctx context.Context, req authproto.UserCertsRequest) (*authproto.Certs, error) {
+	return nil, nil
 }
 
-func withServer(target string) terminalOpt {
-	return func(t *TerminalRequest) { t.Server = target }
+func (mock authProviderMock) GenerateOpenSSHCert(ctx context.Context, req *authproto.OpenSSHCertRequest) (*authproto.OpenSSHCert, error) {
+	return nil, nil
 }
 
-func withKeepaliveInterval(d time.Duration) terminalOpt {
-	return func(t *TerminalRequest) { t.KeepAliveInterval = d }
+func (mock authProviderMock) MaintainSessionPresence(ctx context.Context) (authproto.AuthService_MaintainSessionPresenceClient, error) {
+	return nil, nil
 }
 
-func (s *WebSuite) makeTerminal(t *testing.T, pack *authPack, opts ...terminalOpt) (*websocket.Conn, *session.Session, error) {
-	req := TerminalRequest{
-		Server: s.srvID,
-		Login:  pack.login,
-		Term: session.TerminalParams{
-			W: 100,
-			H: 100,
-		},
-	}
-	for _, opt := range opts {
-		opt(&req)
-	}
-
-	u := url.URL{
-		Host:   s.url().Host,
-		Scheme: client.WSS,
-		Path:   fmt.Sprintf("/v1/webapi/sites/%v/connect", currentSiteShortcut),
-	}
-	data, err := json.Marshal(req)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	q := u.Query()
-	q.Set("params", string(data))
-	q.Set(roundtrip.AccessTokenQueryParam, pack.session.Token)
-	u.RawQuery = q.Encode()
-
-	dialer := websocket.Dialer{}
-	dialer.TLSClientConfig = &tls.Config{
-		InsecureSkipVerify: true,
-	}
-
-	header := http.Header{}
-	header.Add("Origin", "http://localhost")
-	for _, cookie := range pack.cookies {
-		header.Add("Cookie", cookie.String())
-	}
-
-	ws, resp, err := dialer.Dial(u.String(), header)
-	if err != nil {
-		return nil, nil, trace.Wrap(err)
-	}
-
-	ty, raw, err := ws.ReadMessage()
-	if err != nil {
-		return nil, nil, trace.Wrap(err)
-	}
-	require.Equal(t, websocket.BinaryMessage, ty)
-	var env Envelope
-
-	err = proto.Unmarshal(raw, &env)
-	if err != nil {
-		return nil, nil, trace.Wrap(err)
-	}
-
-	var sessResp siteSessionGenerateResponse
-
-	err = json.Unmarshal([]byte(env.Payload), &sessResp)
-	if err != nil {
-		return nil, nil, trace.Wrap(err)
-	}
-
-	err = resp.Body.Close()
-	if err != nil {
-		return nil, nil, trace.Wrap(err)
-	}
-
-	return ws, &sessResp.Session, nil
+func (mock authProviderMock) GetUser(_ context.Context, _ string, _ bool) (types.User, error) {
+	return nil, nil
 }
 
-func waitForOutput(stream *terminalStream, substr string) error {
-	timeoutCh := time.After(10 * time.Second)
+func (mock authProviderMock) GetRole(_ context.Context, _ string) (types.Role, error) {
+	return nil, nil
+}
 
+func waitForOutputWithDuration(r ReaderWithDeadline, substr string, timeout time.Duration) error {
+	timeoutCh := time.After(timeout)
+
+	var prev string
+	out := make([]byte, int64(len(substr)*3))
 	for {
 		select {
 		case <-timeoutCh:
@@ -6062,15 +7977,43 @@ func waitForOutput(stream *terminalStream, substr string) error {
 		default:
 		}
 
-		out := make([]byte, 100)
-		_, err := stream.Read(out)
+		if err := r.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+			return trace.Wrap(err)
+		}
+		n, err := r.Read(out)
+		outStr := removeSpace(string(out[:n]))
+
+		// Check for [substr] before checking the error,
+		// as it's valid for n > 0 even when there is an error.
+		// The [substr] is checked against the current and previous
+		// output to account for scenarios where the [substr] is split
+		// across two reads. While we try to prevent this by reading
+		// twice the length of [substr] there are no guarantees the
+		// whole thing will arrive in a single read.
+		if n > 0 && strings.Contains(prev+outStr, substr) {
+			return nil
+		}
 		if err != nil {
 			return trace.Wrap(err)
 		}
-		if strings.Contains(removeSpace(string(out)), substr) {
-			return nil
-		}
+		prev = outStr
 	}
+}
+
+type ReaderWithDeadline interface {
+	io.Reader
+	SetReadDeadline(time.Time) error
+}
+
+type ReadWriterWithDeadline interface {
+	io.Reader
+	io.Writer
+	SetReadDeadline(time.Time) error
+	SetWriteDeadline(time.Time) error
+}
+
+func waitForOutput(r ReaderWithDeadline, substr string) error {
+	return waitForOutputWithDuration(r, substr, 10*time.Second)
 }
 
 func (s *WebSuite) client(t *testing.T, opts ...roundtrip.ClientParam) *TestWebClient {
@@ -6099,23 +8042,6 @@ func (c *TestWebClient) RoundTrip(fn roundtrip.RoundTripFn) (*roundtrip.Response
 	return resp, err
 }
 
-func (s *WebSuite) login(clt *TestWebClient, cookieToken string, reqToken string, reqData interface{}) (*roundtrip.Response, error) {
-	return httplib.ConvertResponse(clt.RoundTrip(func() (*http.Response, error) {
-		data, err := json.Marshal(reqData)
-		if err != nil {
-			return nil, err
-		}
-		req, err := http.NewRequest("POST", clt.Endpoint("webapi", "sessions"), bytes.NewBuffer(data))
-		if err != nil {
-			return nil, err
-		}
-		addCSRFCookieToReq(req, cookieToken)
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set(csrf.HeaderName, reqToken)
-		return clt.HTTPClient().Do(req)
-	}))
-}
-
 func (s *WebSuite) url() *url.URL {
 	u, err := url.Parse("https://" + s.webServer.Listener.Addr().String())
 	if err != nil {
@@ -6124,29 +8050,11 @@ func (s *WebSuite) url() *url.URL {
 	return u
 }
 
-func addCSRFCookieToReq(req *http.Request, token string) {
-	cookie := &http.Cookie{
-		Name:  csrf.CookieName,
-		Value: token,
-	}
-
-	req.AddCookie(cookie)
-}
-
 func removeSpace(in string) string {
 	for _, c := range []string{"\n", "\r", "\t"} {
 		in = strings.Replace(in, c, " ", -1)
 	}
 	return strings.TrimSpace(in)
-}
-
-func newTerminalHandler() TerminalHandler {
-	return TerminalHandler{
-		log:     logrus.WithFields(logrus.Fields{}),
-		encoder: unicode.UTF8.NewEncoder(),
-		decoder: unicode.UTF8.NewDecoder(),
-		wsLock:  &sync.Mutex{},
-	}
 }
 
 func decodeSessionCookie(t *testing.T, value string) (sessionID string) {
@@ -6160,11 +8068,7 @@ func decodeSessionCookie(t *testing.T, value string) (sessionID string) {
 	return cookie.SessionID
 }
 
-func (r CreateSessionResponse) response() (*CreateSessionResponse, error) {
-	return &CreateSessionResponse{TokenType: r.TokenType, Token: r.Token, TokenExpiresIn: r.TokenExpiresIn, SessionInactiveTimeoutMS: r.SessionInactiveTimeoutMS}, nil
-}
-
-func newWebPack(t *testing.T, numProxies int) *webPack {
+func newWebPack(t *testing.T, numProxies int, opts ...proxyOption) *webPack {
 	ctx := context.Background()
 	clock := clockwork.NewFakeClockAt(time.Now())
 
@@ -6173,14 +8077,22 @@ func newWebPack(t *testing.T, numProxies int) *webPack {
 			ClusterName: "localhost",
 			Dir:         t.TempDir(),
 			Clock:       clock,
+			AuditLog:    events.NewDiscardAuditLog(),
 		},
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, server.Shutdown(ctx)) })
 
+	// use a sync recording mode because the disk-based uploader
+	// that runs in the background introduces races with test cleanup
+	recConfig := types.DefaultSessionRecordingConfig()
+	recConfig.SetMode(types.RecordAtNodeSync)
+	_, err = server.AuthServer.AuthServer.UpsertSessionRecordingConfig(context.Background(), recConfig)
+	require.NoError(t, err)
+
 	// Register the auth server, since test auth server doesn't start its own
 	// heartbeat.
-	err = server.Auth().UpsertAuthServer(&types.ServerV2{
+	err = server.Auth().UpsertAuthServer(ctx, &types.ServerV2{
 		Kind:    types.KindAuthServer,
 		Version: types.V2,
 		Metadata: types.Metadata{
@@ -6218,7 +8130,7 @@ func newWebPack(t *testing.T, numProxies int) *webPack {
 	hostSigners := []ssh.Signer{signer}
 
 	nodeClient, err := server.TLS.NewClient(auth.TestIdentity{
-		I: auth.BuiltinRole{
+		I: authz.BuiltinRole{
 			Role:     types.RoleNode,
 			Username: nodeID,
 		},
@@ -6251,7 +8163,7 @@ func newWebPack(t *testing.T, numProxies int) *webPack {
 		ctx,
 		utils.NetAddr{AddrNetwork: "tcp", Addr: "127.0.0.1:0"},
 		nodeID,
-		hostSigners,
+		sshutils.StaticHostSigners(hostSigners...),
 		nodeClient,
 		nodeDataDir,
 		"",
@@ -6259,11 +8171,9 @@ func newWebPack(t *testing.T, numProxies int) *webPack {
 		nodeClient,
 		regular.SetUUID(nodeID),
 		regular.SetNamespace(apidefaults.Namespace),
-		regular.SetShell("/bin/sh"),
 		regular.SetEmitter(nodeClient),
-		regular.SetPAMConfig(&pam.Config{Enabled: false}),
+		regular.SetPAMConfig(&servicecfg.PAMConfig{Enabled: false}),
 		regular.SetBPF(&bpf.NOP{}),
-		regular.SetRestrictedSessionManager(&restricted.NOP{}),
 		regular.SetClock(clock),
 		regular.SetLockWatcher(nodeLockWatcher),
 		regular.SetSessionController(nodeSessionController),
@@ -6271,12 +8181,15 @@ func newWebPack(t *testing.T, numProxies int) *webPack {
 	require.NoError(t, err)
 
 	require.NoError(t, node.Start())
-	t.Cleanup(func() { require.NoError(t, node.Close()) })
+	t.Cleanup(func() {
+		require.NoError(t, node.Close())
+		node.Wait()
+	})
 
 	var proxies []*testProxy
 	for p := 0; p < numProxies; p++ {
 		proxyID := fmt.Sprintf("proxy%v", p)
-		proxies = append(proxies, createProxy(ctx, t, proxyID, node, server.TLS, hostSigners, clock))
+		proxies = append(proxies, createProxy(ctx, t, proxyID, node, server.TLS, hostSigners, clock, opts...))
 	}
 
 	// Wait for proxies to fully register before starting the test.
@@ -6299,18 +8212,58 @@ func newWebPack(t *testing.T, numProxies int) *webPack {
 	}
 }
 
+// wrappedAuthClient is used when tests need to mock or replace parts of the
+// underlying auth.Client used by the Proxy.
+type wrappedAuthClient struct {
+	*authclient.Client
+	devicesClient devicepb.DeviceTrustServiceClient
+}
+
+func (w *wrappedAuthClient) DevicesClient() devicepb.DeviceTrustServiceClient {
+	return w.devicesClient
+}
+
+type proxyConfig struct {
+	minimalHandler        bool
+	devicesClientOverride devicepb.DeviceTrustServiceClient
+}
+
+type proxyOption func(cfg *proxyConfig)
+
+func withDevicesClientOverride(c devicepb.DeviceTrustServiceClient) proxyOption {
+	return func(cfg *proxyConfig) {
+		cfg.devicesClientOverride = c
+	}
+}
+
 func createProxy(ctx context.Context, t *testing.T, proxyID string, node *regular.Server, authServer *auth.TestTLSServer,
-	hostSigners []ssh.Signer, clock clockwork.FakeClock,
+	hostSigners []ssh.Signer, clock *clockwork.FakeClock, opts ...proxyOption,
 ) *testProxy {
+	cfg := proxyConfig{}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
 	// create reverse tunnel service:
-	client, err := authServer.NewClient(auth.TestIdentity{
-		I: auth.BuiltinRole{
+	authClient, err := authServer.NewClient(auth.TestIdentity{
+		I: authz.BuiltinRole{
 			Role:     types.RoleProxy,
 			Username: proxyID,
 		},
 	})
 	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, client.Close()) })
+	t.Cleanup(func() { require.NoError(t, authClient.Close()) })
+
+	// Replace underlying devicesClient, if the option was supplied.
+	var client authclient.ClientI
+	if cfg.devicesClientOverride != nil {
+		client = &wrappedAuthClient{
+			Client:        authClient,
+			devicesClient: cfg.devicesClientOverride,
+		}
+	} else {
+		client = authClient
+	}
+	// Favor client instead of authClient from here on.
 
 	revTunListener, err := net.Listen("tcp", fmt.Sprintf("%v:0", authServer.ClusterName()))
 	require.NoError(t, err)
@@ -6340,16 +8293,29 @@ func createProxy(ctx context.Context, t *testing.T, proxyID string, node *regula
 			Component: teleport.ComponentProxy,
 			Client:    client,
 		},
+		NodesGetter: client,
 	})
 	require.NoError(t, err)
 	t.Cleanup(proxyNodeWatcher.Close)
 
+	proxyGitServerWatcher, err := services.NewGitServerWatcher(ctx, services.GitServerWatcherConfig{
+		ResourceWatcherConfig: services.ResourceWatcherConfig{
+			Component: teleport.ComponentProxy,
+			Client:    client,
+		},
+		GitServerGetter: client.GitServerReadOnlyClient(),
+	})
+	require.NoError(t, err)
+	t.Cleanup(proxyGitServerWatcher.Close)
+
 	revTunServer, err := reversetunnel.NewServer(reversetunnel.Config{
-		ID:                    node.ID(),
-		Listener:              revTunListener,
-		ClientTLS:             client.TLSConfig(),
+		ID:       node.ID(),
+		Listener: revTunListener,
+		GetClientTLSCertificate: func() (*tls.Certificate, error) {
+			return &authClient.TLSConfig().Certificates[0], nil
+		},
 		ClusterName:           authServer.ClusterName(),
-		HostSigners:           hostSigners,
+		GetHostSigners:        sshutils.StaticHostSigners(hostSigners...),
 		LocalAuthClient:       client,
 		LocalAccessPoint:      client,
 		Emitter:               client,
@@ -6357,6 +8323,7 @@ func createProxy(ctx context.Context, t *testing.T, proxyID string, node *regula
 		DataDir:               t.TempDir(),
 		LockWatcher:           proxyLockWatcher,
 		NodeWatcher:           proxyNodeWatcher,
+		GitServerWatcher:      proxyGitServerWatcher,
 		CertAuthorityWatcher:  proxyCAWatcher,
 		CircuitBreakerConfig:  breaker.NoopBreakerConfig(),
 		LocalAuthAddresses:    []string{authServer.Listener.Addr().String()},
@@ -6364,12 +8331,12 @@ func createProxy(ctx context.Context, t *testing.T, proxyID string, node *regula
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, revTunServer.Close()) })
 
+	clustername := authServer.ClusterName()
 	router, err := proxy.NewRouter(proxy.RouterConfig{
-		ClusterName:         authServer.ClusterName(),
-		Log:                 utils.NewLoggerForTests().WithField(trace.Component, "test"),
-		RemoteClusterGetter: client,
-		SiteGetter:          revTunServer,
-		TracerProvider:      tracing.NoopProvider(),
+		ClusterName:      clustername,
+		LocalAccessPoint: client,
+		SiteGetter:       revTunServer,
+		TracerProvider:   tracing.NoopProvider(),
 	})
 	require.NoError(t, err)
 
@@ -6383,11 +8350,106 @@ func createProxy(ctx context.Context, t *testing.T, proxyID string, node *regula
 	})
 	require.NoError(t, err)
 
+	proxyListener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	mux, err := multiplexer.New(multiplexer.Config{
+		Listener:          proxyListener,
+		PROXYProtocolMode: multiplexer.PROXYProtocolOff,
+		ID:                teleport.Component(teleport.ComponentProxy, "ssh"),
+		CertAuthorityGetter: func(ctx context.Context, id types.CertAuthID, loadKeys bool) (types.CertAuthority, error) {
+			return client.GetCertAuthority(ctx, id, loadKeys)
+		},
+		LocalClusterName: clustername,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, mux.Close()) })
+
+	go func() {
+		if err := mux.Serve(); err != nil && !utils.IsOKNetworkError(err) {
+			slog.ErrorContext(context.Background(), "Mux encountered error serving", "error", err)
+		}
+	}()
+
+	authorizer, err := authz.NewAuthorizer(authz.AuthorizerOpts{
+		ClusterName: clustername,
+		AccessPoint: authServer.Auth(),
+		LockWatcher: proxyLockWatcher,
+	})
+	require.NoError(t, err)
+
+	tlscfg, err := authServer.Identity.TLSConfig(utils.DefaultCipherSuites())
+	require.NoError(t, err)
+	tlscfg.ClientAuth = tls.RequireAndVerifyClientCert
+	if lib.IsInsecureDevMode() {
+		tlscfg.InsecureSkipVerify = true
+		tlscfg.ClientAuth = tls.RequireAnyClientCert
+	}
+	tlscfg.GetConfigForClient = func(info *tls.ClientHelloInfo) (*tls.Config, error) {
+		tlsClone := tlscfg.Clone()
+
+		// Build the client CA pool containing the cluster's user CA in
+		// order to be able to validate certificates provided by users.
+		var err error
+		tlsClone.ClientCAs, _, _, err = authclient.DefaultClientCertPool(info.Context(), authServer.Auth(), clustername)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+
+		return tlsClone, nil
+	}
+
+	creds, err := auth.NewTransportCredentials(auth.TransportCredentialsConfig{
+		TransportCredentials: credentials.NewTLS(tlscfg),
+		UserGetter: &auth.Middleware{
+			ClusterName: authServer.ClusterName(),
+		},
+		Authorizer: authorizer,
+	})
+	require.NoError(t, err)
+
+	sshGRPCServer := grpc.NewServer(
+		grpc.ChainUnaryInterceptor(interceptors.GRPCServerUnaryErrorInterceptor),
+		grpc.ChainStreamInterceptor(interceptors.GRPCServerStreamErrorInterceptor),
+		grpc.Creds(creds),
+	)
+	t.Cleanup(sshGRPCServer.Stop)
+
+	connMonitor, err := srv.NewConnectionMonitor(srv.ConnectionMonitorConfig{
+		AccessPoint:    client,
+		LockWatcher:    proxyLockWatcher,
+		Clock:          clock,
+		ServerID:       proxyID,
+		Emitter:        client,
+		EmitterContext: ctx,
+		Logger:         utils.NewSlogLoggerForTests(),
+	})
+	require.NoError(t, err)
+
+	transportService, err := transportv1.NewService(transportv1.ServerConfig{
+		FIPS:   false,
+		Logger: utils.NewSlogLoggerForTests(),
+		Dialer: router,
+		SignerFn: func(authzCtx *authz.Context, clusterName string) agentless.SignerCreator {
+			return agentless.SignerFromAuthzContext(authzCtx, client, clusterName)
+		},
+		ConnectionMonitor: connMonitor,
+		LocalAddr:         proxyListener.Addr(),
+	})
+	require.NoError(t, err)
+	transportpb.RegisterTransportServiceServer(sshGRPCServer, transportService)
+
+	go func() {
+		if err := sshGRPCServer.Serve(mux.TLS()); err != nil && !utils.IsOKNetworkError(err) {
+			slog.ErrorContext(context.Background(), "gRPC proxy server terminated unexpectedly", "error", err)
+		}
+	}()
+
 	proxyServer, err := regular.New(
 		ctx,
-		utils.NetAddr{AddrNetwork: "tcp", Addr: "127.0.0.1:0"},
+		utils.NetAddr{AddrNetwork: proxyListener.Addr().Network(), Addr: mux.SSH().Addr().String()},
 		authServer.ClusterName(),
-		hostSigners,
+		sshutils.StaticHostSigners(hostSigners...),
 		client,
 		t.TempDir(),
 		"",
@@ -6398,21 +8460,29 @@ func createProxy(ctx context.Context, t *testing.T, proxyID string, node *regula
 		regular.SetEmitter(client),
 		regular.SetNamespace(apidefaults.Namespace),
 		regular.SetBPF(&bpf.NOP{}),
-		regular.SetRestrictedSessionManager(&restricted.NOP{}),
 		regular.SetClock(clock),
 		regular.SetLockWatcher(proxyLockWatcher),
-		regular.SetNodeWatcher(proxyNodeWatcher),
 		regular.SetSessionController(sessionController),
+		regular.SetPublicAddrs([]utils.NetAddr{{AddrNetwork: "tcp", Addr: "127.0.0.1:0"}}),
 	)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, proxyServer.Close()) })
 
-	fs, err := NewDebugFileSystem("../../webassets/teleport")
+	fs, err := NewDebugFileSystem(false)
+	require.NoError(t, err)
+
+	authID := state.IdentityID{
+		Role:     types.RoleProxy,
+		HostUUID: proxyID,
+	}
+	dns := []string{"localhost", "127.0.0.1"}
+	proxyIdentity, err := auth.LocalRegister(authID, authServer.Auth(), nil, dns, "", nil)
+	require.NoError(t, err)
+	proxyClientCert, err := keys.X509KeyPair(proxyIdentity.TLSCertBytes, proxyIdentity.KeyBytes)
 	require.NoError(t, err)
 	handler, err := NewHandler(Config{
 		Proxy:            revTunServer,
 		AuthServers:      utils.FromAddr(authServer.Addr()),
-		DomainName:       authServer.ClusterName(),
 		ProxyClient:      client,
 		ProxyPublicAddrs: utils.MustParseAddrList("proxy-1.example.com", "proxy-2.example.com"),
 		CipherSuites:     utils.DefaultCipherSuites(),
@@ -6421,20 +8491,39 @@ func createProxy(ctx context.Context, t *testing.T, proxyID string, node *regula
 		HostUUID:         proxyID,
 		Emitter:          client,
 		StaticFS:         fs,
-		ProxySettings:    &mockProxySettings{},
-		SessionControl:   sessionController,
-		Router:           router,
-	}, SetSessionStreamPollPeriod(200*time.Millisecond), SetClock(clock))
+		ProxySettings: &ProxySettings{
+			ServiceConfig: servicecfg.MakeDefaultConfig(),
+			ProxySSHAddr:  "127.0.0.1",
+			AccessPoint:   client,
+		},
+		SessionControl: SessionControllerFunc(func(ctx context.Context, sctx *SessionContext, login, localAddr, remoteAddr string) (context.Context, error) {
+			controller := srv.WebSessionController(sessionController)
+			ctx, err := controller(ctx, sctx, login, localAddr, remoteAddr)
+			return ctx, trace.Wrap(err)
+		}),
+		Router:                         router,
+		HealthCheckAppServer:           func(context.Context, string, string) error { return nil },
+		MinimalReverseTunnelRoutesOnly: cfg.minimalHandler,
+		GetProxyClientCertificate: func() (*tls.Certificate, error) {
+			return &proxyClientCert, nil
+		},
+		IntegrationAppHandler: &mockIntegrationAppHandler{},
+		DatabaseREPLRegistry:  &mockDatabaseREPLRegistry{repl: map[string]dbrepl.REPLNewFunc{}},
+	}, SetClock(clock))
 	require.NoError(t, err)
 
 	webServer := httptest.NewTLSServer(handler)
 	t.Cleanup(webServer.Close)
-	require.NoError(t, proxyServer.Start())
+	go func() {
+		if err := proxyServer.Serve(mux.SSH()); err != nil && !utils.IsOKNetworkError(err) {
+			slog.ErrorContext(context.Background(), "SSH proxy server terminated unexpectedly", "error", err)
+		}
+	}()
 
-	proxyAddr := utils.MustParseAddr(proxyServer.Addr())
+	proxyAddr := mux.Listener.Addr()
 	addr := utils.MustParseAddr(webServer.Listener.Addr().String())
 	handler.handler.cfg.ProxyWebAddr = *addr
-	handler.handler.cfg.ProxySSHAddr = *proxyAddr
+	handler.handler.cfg.ProxySSHAddr = utils.NetAddr{AddrNetwork: proxyAddr.Network(), Addr: proxyAddr.String()}
 
 	_, sshPort, err := net.SplitHostPort(proxyAddr.String())
 	require.NoError(t, err)
@@ -6450,6 +8539,7 @@ func createProxy(ctx context.Context, t *testing.T, proxyID string, node *regula
 		},
 	)
 	handler.handler.cfg.ProxyKubeAddr = utils.FromAddr(kubeProxyAddr)
+	handler.handler.cfg.PublicProxyAddr = webServer.Listener.Addr().String()
 	url, err := url.Parse("https://" + webServer.Listener.Addr().String())
 	require.NoError(t, err)
 
@@ -6466,6 +8556,10 @@ func createProxy(ctx context.Context, t *testing.T, proxyID string, node *regula
 	}
 }
 
+type mockIntegrationAppHandler struct{}
+
+func (m *mockIntegrationAppHandler) HandleConnection(_ net.Conn) {}
+
 // webPack represents the state of a single web test.
 // It replicates most of the WebSuite and serves to gradually
 // transition the test suite to use the testing package
@@ -6474,14 +8568,14 @@ type webPack struct {
 	proxies []*testProxy
 	server  *auth.TestServer
 	node    *regular.Server
-	clock   clockwork.FakeClock
+	clock   *clockwork.FakeClock
 }
 
 type testProxy struct {
-	clock   clockwork.FakeClock
-	client  *auth.Client
+	clock   *clockwork.FakeClock
+	client  authclient.ClientI
 	auth    *auth.TestTLSServer
-	revTun  reversetunnel.Server
+	revTun  reversetunnelclient.Server
 	node    *regular.Server
 	proxy   *regular.Server
 	handler *APIHandler
@@ -6494,7 +8588,7 @@ type testProxy struct {
 func (r *testProxy) authPack(t *testing.T, teleportUser string, roles []types.Role) *authPack {
 	ctx := context.Background()
 	const (
-		pass      = "abc123"
+		pass      = "abcdef123456"
 		rawSecret = "def456"
 	)
 
@@ -6502,7 +8596,7 @@ func (r *testProxy) authPack(t *testing.T, teleportUser string, roles []types.Ro
 	require.NoError(t, err)
 	loginUser := u.Username
 
-	otpSecret := base32.StdEncoding.EncodeToString([]byte(rawSecret))
+	otpSecret := newOTPSharedSecret()
 
 	ap, err := types.NewAuthPreference(types.AuthPreferenceSpecV2{
 		Type:         constants.Local,
@@ -6510,45 +8604,36 @@ func (r *testProxy) authPack(t *testing.T, teleportUser string, roles []types.Ro
 	})
 	require.NoError(t, err)
 
-	err = r.auth.Auth().SetAuthPreference(ctx, ap)
+	_, err = r.auth.Auth().UpsertAuthPreference(ctx, ap)
 	require.NoError(t, err)
 
 	r.createUser(context.Background(), t, teleportUser, loginUser, pass, otpSecret, roles)
 
-	// create a valid otp token
-	validToken, err := totp.GenerateCode(otpSecret, r.clock.Now())
-	require.NoError(t, err)
-
-	clt := r.newClient(t)
-	req := CreateSessionReq{
-		User:              teleportUser,
-		Pass:              pass,
-		SecondFactorToken: validToken,
-	}
-
-	csrfToken := "2ebcb768d0090ea4368e42880c970b61865c326172a4a2343b645cf5d7f20992"
-	resp := login(t, clt, csrfToken, csrfToken, req)
-
-	var rawSession *CreateSessionResponse
-	require.NoError(t, json.Unmarshal(resp.Bytes(), &rawSession))
-
-	session, err := rawSession.response()
-	require.NoError(t, err)
+	sessionResp, httpResp := loginWebOTP(t, ctx, loginWebOTPParams{
+		webClient: r.newClient(t),
+		clock:     r.clock,
+		user:      teleportUser,
+		password:  pass,
+		otpSecret: otpSecret,
+	})
 
 	jar, err := cookiejar.New(nil)
 	require.NoError(t, err)
 
-	clt = r.newClient(t, roundtrip.BearerAuth(session.Token), roundtrip.CookieJar(jar))
-	jar.SetCookies(&r.webURL, resp.Cookies())
+	clt := r.newClient(t, roundtrip.BearerAuth(sessionResp.Token), roundtrip.CookieJar(jar))
+	jar.SetCookies(&r.webURL, httpResp.Cookies())
 
 	return &authPack{
 		otpSecret: otpSecret,
 		user:      teleportUser,
 		login:     loginUser,
-		session:   session,
+		session:   sessionResp,
 		clt:       clt,
-		cookies:   resp.Cookies(),
+		cookies:   httpResp.Cookies(),
 		password:  pass,
+		device: &auth.TestDevice{
+			TOTPSecret: otpSecret,
+		},
 	}
 }
 
@@ -6567,6 +8652,9 @@ func (r *testProxy) authPackFromPack(t *testing.T, pack *authPack) *authPack {
 func (r *testProxy) authPackFromResponse(t *testing.T, httpResp *roundtrip.Response) *authPack {
 	var resp *CreateSessionResponse
 	require.NoError(t, json.Unmarshal(httpResp.Bytes(), &resp))
+	if resp.TokenExpiresIn < 0 {
+		t.Errorf("Expected expiry time to be in the future but got %v", resp.TokenExpiresIn)
+	}
 
 	jar, err := cookiejar.New(nil)
 	require.NoError(t, err)
@@ -6574,13 +8662,8 @@ func (r *testProxy) authPackFromResponse(t *testing.T, httpResp *roundtrip.Respo
 	clt := r.newClient(t, roundtrip.BearerAuth(resp.Token), roundtrip.CookieJar(jar))
 	jar.SetCookies(&r.webURL, httpResp.Cookies())
 
-	session, err := resp.response()
-	require.NoError(t, err)
-	if session.TokenExpiresIn < 0 {
-		t.Errorf("Expected expiry time to be in the future but got %v", session.TokenExpiresIn)
-	}
 	return &authPack{
-		session: session,
+		session: resp,
 		clt:     clt,
 		cookies: httpResp.Cookies(),
 	}
@@ -6605,7 +8688,7 @@ func (r *testProxy) createUser(ctx context.Context, t *testing.T, user, login, p
 	}
 
 	for _, role := range roles {
-		err = r.auth.Auth().UpsertRole(ctx, role)
+		role, err = r.auth.Auth().UpsertRole(ctx, role)
 		require.NoError(t, err)
 
 		teleUser.AddRole(role.GetName())
@@ -6615,7 +8698,7 @@ func (r *testProxy) createUser(ctx context.Context, t *testing.T, user, login, p
 		User: types.UserRef{Name: "some-auth-user"},
 	})
 
-	err = r.auth.Auth().CreateUser(ctx, teleUser)
+	_, err = r.auth.Auth().CreateUser(ctx, teleUser)
 	require.NoError(t, err)
 
 	err = r.auth.Auth().UpsertPassword(user, []byte(pass))
@@ -6636,76 +8719,38 @@ func (r *testProxy) newClient(t *testing.T, opts ...roundtrip.ClientParam) *Test
 	return &TestWebClient{clt, t}
 }
 
-func (r *testProxy) makeTerminal(t *testing.T, pack *authPack, sessionID session.ID) (*websocket.Conn, session.Session) {
-	u := url.URL{
-		Host:   r.webURL.Host,
-		Scheme: client.WSS,
-		Path:   fmt.Sprintf("/v1/webapi/sites/%v/connect", currentSiteShortcut),
+func makeAuthReqOverWS(ws *websocket.Conn, token string) error {
+	authReq, err := json.Marshal(struct {
+		Token string `json:"token"`
+	}{Token: token})
+	if err != nil {
+		return trace.Wrap(err)
 	}
 
-	requestData := TerminalRequest{
-		Server: r.node.ID(),
-		Login:  pack.login,
-		Term: session.TerminalParams{
-			W: 100,
-			H: 100,
-		},
+	if err := ws.WriteMessage(websocket.TextMessage, authReq); err != nil {
+		return trace.Wrap(err)
 	}
-
-	if sessionID != "" {
-		requestData.SessionID = sessionID
+	_, authRes, err := ws.ReadMessage()
+	if err != nil {
+		return trace.Wrap(err)
 	}
-
-	data, err := json.Marshal(requestData)
-	require.NoError(t, err)
-
-	q := u.Query()
-	q.Set("params", string(data))
-	q.Set(roundtrip.AccessTokenQueryParam, pack.session.Token)
-	u.RawQuery = q.Encode()
-
-	dialer := websocket.Dialer{}
-	dialer.TLSClientConfig = &tls.Config{
-		InsecureSkipVerify: true,
+	if !strings.Contains(string(authRes), `"status":"ok"`) {
+		return trace.AccessDenied("unexpected response")
 	}
-
-	header := http.Header{}
-	header.Add("Origin", "http://localhost")
-	for _, cookie := range pack.cookies {
-		header.Add("Cookie", cookie.String())
-	}
-
-	ws, resp, err := dialer.Dial(u.String(), header)
-	require.NoError(t, err)
-	t.Cleanup(func() {
-		require.NoError(t, ws.Close())
-		require.NoError(t, resp.Body.Close())
-	})
-
-	ty, raw, err := ws.ReadMessage()
-	require.NoError(t, err)
-	require.Equal(t, websocket.BinaryMessage, ty)
-	var env Envelope
-	require.NoError(t, proto.Unmarshal(raw, &env))
-
-	var sessResp siteSessionGenerateResponse
-	require.NoError(t, json.Unmarshal([]byte(env.Payload), &sessResp))
-
-	return ws, sessResp.Session
+	return nil
 }
 
-func (r *testProxy) makeDesktopSession(t *testing.T, pack *authPack, sessionID session.ID, addr net.Addr) *websocket.Conn {
+func (r *testProxy) makeDesktopSession(t *testing.T, pack *authPack) *websocket.Conn {
 	u := url.URL{
 		Host:   r.webURL.Host,
 		Scheme: client.WSS,
-		Path:   fmt.Sprintf("/webapi/sites/%s/desktops/%s/connect", currentSiteShortcut, "desktop1"),
+		Path:   fmt.Sprintf("/webapi/sites/%s/desktops/%s/connect/ws", currentSiteShortcut, "desktop1"),
 	}
 
 	q := u.Query()
 	q.Set("username", "marek")
 	q.Set("width", "100")
 	q.Set("height", "100")
-	q.Set(roundtrip.AccessTokenQueryParam, pack.session.Token)
 	u.RawQuery = q.Encode()
 
 	dialer := websocket.Dialer{}
@@ -6720,6 +8765,10 @@ func (r *testProxy) makeDesktopSession(t *testing.T, pack *authPack, sessionID s
 
 	ws, resp, err := dialer.Dial(u.String(), header)
 	require.NoError(t, err)
+
+	err = makeAuthReqOverWS(ws, pack.session.Token)
+	require.NoError(t, err)
+
 	t.Cleanup(func() {
 		require.NoError(t, ws.Close())
 		require.NoError(t, resp.Body.Close())
@@ -6727,41 +8776,14 @@ func (r *testProxy) makeDesktopSession(t *testing.T, pack *authPack, sessionID s
 	return ws
 }
 
-func login(t *testing.T, clt *TestWebClient, cookieToken, reqToken string, reqData interface{}) *roundtrip.Response {
-	resp, err := httplib.ConvertResponse(clt.RoundTrip(func() (*http.Response, error) {
-		data, err := json.Marshal(reqData)
-		if err != nil {
-			return nil, err
-		}
-		req, err := http.NewRequest("POST", clt.Endpoint("webapi", "sessions"), bytes.NewBuffer(data))
-		if err != nil {
-			return nil, err
-		}
-		addCSRFCookieToReq(req, cookieToken)
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set(csrf.HeaderName, reqToken)
-		return clt.HTTPClient().Do(req)
-	}))
-	require.NoError(t, err)
-	return resp
-}
-
-func validateTerminalStream(t *testing.T, conn *websocket.Conn) {
+func validateTerminal(t *testing.T, term ReadWriterWithDeadline) {
 	t.Helper()
-	termHandler := newTerminalHandler()
-	stream := termHandler.asTerminalStream(conn)
 
 	// here we intentionally run a command where the output we're looking
 	// for is not present in the command itself
-	_, err := io.WriteString(stream, "echo txlxport | sed 's/x/e/g'\r\n")
+	_, err := io.WriteString(term, "echo txlxport | sed 's/x/e/g'\r\n")
 	require.NoError(t, err)
-	require.NoError(t, waitForOutput(stream, "teleport"))
-}
-
-type mockProxySettings struct{}
-
-func (mock *mockProxySettings) GetProxySettings(ctx context.Context) (*webclient.ProxySettings, error) {
-	return &webclient.ProxySettings{}, nil
+	require.NoError(t, waitForOutput(term, "teleport"))
 }
 
 // TestUserContextWithAccessRequest checks that the userContext includes the ID of the
@@ -6778,7 +8800,7 @@ func TestUserContextWithAccessRequest(t *testing.T) {
 	requestableRolename := "requestable-role"
 
 	// Create user's base role with the ability to request the requestable role.
-	baseRole, err := types.NewRole(baseRoleName, types.RoleSpecV5{
+	baseRole, err := types.NewRole(baseRoleName, types.RoleSpecV6{
 		Allow: types.RoleConditions{
 			Request: &types.AccessRequestConditions{
 				Roles: []string{requestableRolename},
@@ -6791,9 +8813,9 @@ func TestUserContextWithAccessRequest(t *testing.T) {
 	pack := proxy.authPack(t, username, []types.Role{baseRole})
 
 	// Create the requestable role.
-	requestableRole, err := types.NewRole(requestableRolename, types.RoleSpecV5{})
+	requestableRole, err := types.NewRole(requestableRolename, types.RoleSpecV6{})
 	require.NoError(t, err)
-	err = env.server.Auth().UpsertRole(ctx, requestableRole)
+	_, err = env.server.Auth().UpsertRole(ctx, requestableRole)
 	require.NoError(t, err)
 
 	identity := tlsca.Identity{
@@ -6804,14 +8826,14 @@ func TestUserContextWithAccessRequest(t *testing.T) {
 	accessReq, err := services.NewAccessRequest(username, requestableRolename)
 	require.NoError(t, err)
 	accessReq.SetState(types.RequestState_APPROVED)
-	err = env.server.Auth().CreateAccessRequest(ctx, accessReq, identity)
+	accessReq, err = env.server.Auth().CreateAccessRequestV2(ctx, accessReq, identity)
 	require.NoError(t, err)
 
 	// Get the ID of the created and approved access request.
 	accessRequestID := accessReq.GetMetadata().Name
 
 	// Make a request to renew the session with the ID of the access request.
-	_, err = pack.clt.PostJSON(ctx, pack.clt.Endpoint("webapi", "sessions", "renew"), renewSessionRequest{
+	_, err = pack.clt.PostJSON(ctx, pack.clt.Endpoint("webapi", "sessions", "web", "renew"), renewSessionRequest{
 		AccessRequestID: accessRequestID,
 	})
 	require.NoError(t, err)
@@ -6822,12 +8844,236 @@ func TestUserContextWithAccessRequest(t *testing.T) {
 	require.NoError(t, err)
 
 	// Process the JSON response of the request.
-	var userContext ui.UserContext
+	var userContext webui.UserContext
 	err = json.Unmarshal(response.Bytes(), &userContext)
 	require.NoError(t, err)
 
 	// Verify that the userContext returned contains the correct Access Request ID.
 	require.Equal(t, accessRequestID, userContext.ConsumedAccessRequestID)
+}
+
+// TestIsMFARequired_AcceptedRequests mostly tests that requests
+// are formatted correctly.
+func TestIsMFARequired_AcceptedRequests(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	env := newWebPack(t, 1)
+	proxy := env.proxies[0]
+	pack := proxy.authPack(t, "llama", nil /* roles */)
+
+	cfg, err := types.NewAuthPreference(types.AuthPreferenceSpecV2{
+		Type:           constants.Local,
+		SecondFactor:   constants.SecondFactorWebauthn,
+		RequireMFAType: types.RequireMFAType_SESSION,
+		Webauthn: &types.Webauthn{
+			RPID: env.server.ClusterName(),
+		},
+	})
+	require.NoError(t, err)
+	_, err = env.server.Auth().UpsertAuthPreference(ctx, cfg)
+	require.NoError(t, err)
+
+	// Register an application called "panel".
+	app, err := types.NewAppV3(types.Metadata{
+		Name: "panel",
+	}, types.AppSpecV3{
+		URI:        "http://127.0.0.1:8080",
+		PublicAddr: "panel.example.com",
+	})
+	require.NoError(t, err)
+	server, err := types.NewAppServerV3FromApp(app, "host", uuid.New().String())
+	require.NoError(t, err)
+	_, err = env.server.Auth().UpsertApplicationServer(ctx, server)
+	require.NoError(t, err)
+
+	for _, test := range []struct {
+		name       string
+		errMsg     string
+		getRequest func() IsMFARequiredRequest
+	}{
+		{
+			name: "valid db req",
+			getRequest: func() IsMFARequiredRequest {
+				return IsMFARequiredRequest{
+					Database: &isMFARequiredDatabase{
+						ServiceName: "name",
+						Protocol:    "protocol",
+					},
+				}
+			},
+		},
+		{
+			name:   "invalid db req",
+			errMsg: "missing service_name",
+			getRequest: func() IsMFARequiredRequest {
+				return IsMFARequiredRequest{Database: &isMFARequiredDatabase{}}
+			},
+		},
+		{
+			name: "valid node req",
+			getRequest: func() IsMFARequiredRequest {
+				return IsMFARequiredRequest{
+					Node: &isMFARequiredNode{
+						NodeName: "name",
+						Login:    "login",
+					},
+				}
+			},
+		},
+		{
+			name:   "invalid node req",
+			errMsg: "missing login",
+			getRequest: func() IsMFARequiredRequest {
+				return IsMFARequiredRequest{Node: &isMFARequiredNode{}}
+			},
+		},
+		{
+			name: "valid kube req",
+			getRequest: func() IsMFARequiredRequest {
+				return IsMFARequiredRequest{
+					Kube: &isMFARequiredKube{
+						ClusterName: "name",
+					},
+				}
+			},
+		},
+		{
+			name:   "invalid kube req",
+			errMsg: "missing cluster_name",
+			getRequest: func() IsMFARequiredRequest {
+				return IsMFARequiredRequest{Kube: &isMFARequiredKube{}}
+			},
+		},
+		{
+			name: "valid windows desktop req",
+			getRequest: func() IsMFARequiredRequest {
+				return IsMFARequiredRequest{
+					WindowsDesktop: &isMFARequiredWindowsDesktop{
+						DesktopName: "name",
+						Login:       "login",
+					},
+				}
+			},
+		},
+		{
+			name:   "invalid windows desktop req",
+			errMsg: "missing desktop_name",
+			getRequest: func() IsMFARequiredRequest {
+				return IsMFARequiredRequest{WindowsDesktop: &isMFARequiredWindowsDesktop{}}
+			},
+		},
+		{
+			name: "valid app req - resolve addr",
+			getRequest: func() IsMFARequiredRequest {
+				return IsMFARequiredRequest{
+					App: &IsMFARequiredApp{
+						ResolveAppParams: ResolveAppParams{
+							PublicAddr:  app.GetPublicAddr(),
+							ClusterName: env.server.ClusterName(),
+						},
+					},
+				}
+			},
+		},
+		{
+			name: "valid app req - resolve fqdn",
+			getRequest: func() IsMFARequiredRequest {
+				return IsMFARequiredRequest{
+					App: &IsMFARequiredApp{
+						ResolveAppParams: ResolveAppParams{
+							FQDNHint: fmt.Sprintf("%v.%v", app.GetName(), "proxy-1.example.com"),
+						},
+					},
+				}
+			},
+		},
+		{
+			name:   "invalid app req",
+			errMsg: "no inputs to resolve application",
+			getRequest: func() IsMFARequiredRequest {
+				return IsMFARequiredRequest{App: &IsMFARequiredApp{}}
+			},
+		},
+		{
+			name: "valid admin action req",
+			getRequest: func() IsMFARequiredRequest {
+				return IsMFARequiredRequest{
+					AdminAction: &isMFARequiredAdminAction{},
+				}
+			},
+		},
+		{
+			name:   "invalid empty req",
+			errMsg: "missing target",
+			getRequest: func() IsMFARequiredRequest {
+				return IsMFARequiredRequest{}
+			},
+		},
+		{
+			name:   "invalid multi field",
+			errMsg: "only one target is allowed",
+			getRequest: func() IsMFARequiredRequest {
+				return IsMFARequiredRequest{
+					Kube: &isMFARequiredKube{
+						ClusterName: "name",
+					},
+					Node: &isMFARequiredNode{
+						NodeName: "name",
+						Login:    "login",
+					},
+				}
+			},
+		},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			endpoint := pack.clt.Endpoint("webapi", "sites", env.server.ClusterName(), "mfa", "required")
+			re, err := pack.clt.PostJSON(ctx, endpoint, test.getRequest())
+
+			if test.errMsg != "" {
+				require.True(t, trace.IsBadParameter(err), "isMFARequired returned err = %v (%T), wanted trace.BadParameter", err, err)
+				require.ErrorContains(t, err, test.errMsg)
+				return
+			}
+
+			require.NoError(t, err)
+			resp := isMfaRequiredResponse{}
+			require.NoError(t, json.Unmarshal(re.Bytes(), &resp))
+			require.True(t, resp.Required, "isMFARequired returned response with unexpected value for Required field")
+		})
+	}
+}
+
+func TestWithLimiterHandlerFunc(t *testing.T) {
+	const burst = 20
+	limiter, err := limiter.NewRateLimiter(limiter.Config{
+		Rates: []limiter.Rate{
+			{
+				Period:  time.Minute,
+				Average: 10,
+				Burst:   burst,
+			},
+		},
+		Clock: clockwork.NewFakeClock(),
+	})
+	require.NoError(t, err)
+	h := &Handler{limiter: limiter}
+	hf := h.WithLimiterHandlerFunc(func(http.ResponseWriter, *http.Request, httprouter.Params) (interface{}, error) {
+		return nil, nil
+	})
+
+	// Verify that a valid burst is allowed.
+	r := &http.Request{}
+	for i := 0; i < burst; i++ {
+		r.RemoteAddr = fmt.Sprintf("127.0.0.1:%v", i)
+		_, err = hf(nil, r, nil)
+		require.NoError(t, err, "WithLimiterHandlerFunc failed unexpectedly")
+	}
+
+	// Verify that exceeding the limit causes errors.
+	r.RemoteAddr = fmt.Sprintf("127.0.0.1:%v", burst)
+	_, err = hf(nil, r, nil)
+	require.True(t, trace.IsLimitExceeded(err), "WithLimiterHandlerFunc returned err = %T, want trace.LimitExceededError", err)
 }
 
 // kubeClusterConfig defines the cluster to be created
@@ -6861,7 +9107,7 @@ func newKubeConfigFile(ctx context.Context, t *testing.T, clusters ...kubeCluste
 type startKubeOptions struct {
 	clusters    []kubeClusterConfig
 	authServer  *auth.TestTLSServer
-	revTunnel   reversetunnel.Server
+	revTunnel   reversetunnelclient.Server
 	serviceType kubeproxy.KubeServiceType
 }
 
@@ -6906,20 +9152,20 @@ func startKubeWithoutCleanup(ctx context.Context, t *testing.T, cfg startKubeOpt
 		},
 	})
 	require.NoError(t, err)
-	proxyAuthorizer, err := auth.NewAuthorizer(
-		cfg.authServer.ClusterName(),
-		proxyAuthClient,
-		proxyLockWatcher,
-	)
+	proxyAuthorizer, err := authz.NewAuthorizer(authz.AuthorizerOpts{
+		ClusterName: cfg.authServer.ClusterName(),
+		AccessPoint: proxyAuthClient,
+		LockWatcher: proxyLockWatcher,
+	})
 	require.NoError(t, err)
 
 	// TLS config for kube proxy and Kube service.
-	authID := auth.IdentityID{
+	authID := state.IdentityID{
 		Role:     role,
 		HostUUID: hostID,
 		NodeName: "kube_server",
 	}
-	dns := []string{"localhost", "127.0.0.1", "kube." + constants.APIDomain, "*" + constants.APIDomain}
+	dns := []string{"localhost", "127.0.0.1", constants.KubeTeleportProxyALPNPrefix + constants.APIDomain, "*" + constants.APIDomain}
 	identity, err := auth.LocalRegister(authID, cfg.authServer.Auth(), nil, dns, "", nil)
 	require.NoError(t, err)
 
@@ -6931,6 +9177,29 @@ func startKubeWithoutCleanup(ctx context.Context, t *testing.T, cfg startKubeOpt
 		component = teleport.ComponentKube
 	}
 
+	proxySigner := &mockPROXYSigner{}
+	if cfg.serviceType == kubeproxy.KubeService {
+		proxySigner = nil
+	}
+	clock := clockwork.NewRealClock()
+	watcher, err := services.NewKubeServerWatcher(ctx, services.KubeServerWatcherConfig{
+		ResourceWatcherConfig: services.ResourceWatcherConfig{
+			Component: component,
+			Client:    client,
+			Clock:     clock,
+		},
+		KubernetesServerGetter: client,
+	})
+	require.NoError(t, err)
+
+	inventoryHandle := inventory.NewDownstreamHandle(client.InventoryControlStream, clientproto.UpstreamInventoryHello{
+		ServerID: hostID,
+		Version:  teleport.Version,
+		Services: []types.SystemRole{role},
+		Hostname: "test",
+	})
+	t.Cleanup(func() { require.NoError(t, inventoryHandle.Close()) })
+
 	kubeServer, err := kubeproxy.NewTLSServer(kubeproxy.TLSServerConfig{
 		ForwarderConfig: kubeproxy.ForwarderConfig{
 			Namespace:         apidefaults.Namespace,
@@ -6938,7 +9207,7 @@ func startKubeWithoutCleanup(ctx context.Context, t *testing.T, cfg startKubeOpt
 			ClusterName:       cfg.authServer.ClusterName(),
 			Authz:             proxyAuthorizer,
 			AuthClient:        client,
-			StreamEmitter:     client,
+			Emitter:           client,
 			DataDir:           t.TempDir(),
 			CachingAuthClient: client,
 			HostID:            hostID,
@@ -6948,18 +9217,33 @@ func startKubeWithoutCleanup(ctx context.Context, t *testing.T, cfg startKubeOpt
 			Component:         component,
 			LockWatcher:       proxyLockWatcher,
 			ReverseTunnelSrv:  cfg.revTunnel,
+			PROXYSigner:       proxySigner,
 			// skip Impersonation validation
 			CheckImpersonationPermissions: func(ctx context.Context, clusterName string, sarClient authztypes.SelfSubjectAccessReviewInterface) error {
 				return nil
 			},
+
+			GetConnTLSCertificate: func() (*tls.Certificate, error) {
+				return &tlsConfig.Certificates[0], nil
+			},
+			GetConnTLSRoots: func() (*x509.CertPool, error) {
+				return tlsConfig.RootCAs, nil
+			},
+
 			Clock: clockwork.NewRealClock(),
+			ClusterFeatures: func() authproto.Features {
+				return authproto.Features{
+					Entitlements: map[string]*authproto.EntitlementInfo{
+						string(entitlements.K8s): {Enabled: true},
+					},
+				}
+			},
 		},
-		TLS:           tlsConfig,
+		TLS:           tlsConfig.Clone(),
 		AccessPoint:   client,
 		DynamicLabels: nil,
 		LimiterConfig: limiter.Config{
-			MaxConnections:   1000,
-			MaxNumberOfUsers: 1000,
+			MaxConnections: 1000,
 		},
 		// each time heartbeat is called we insert data into the channel.
 		// this is used to make sure that heartbeat started and the clusters
@@ -6970,9 +9254,11 @@ func startKubeWithoutCleanup(ctx context.Context, t *testing.T, cfg startKubeOpt
 			default:
 			}
 		},
-		GetRotation:      func(role types.SystemRole) (*types.Rotation, error) { return &types.Rotation{}, nil },
-		ResourceMatchers: nil,
-		OnReconcile:      func(kc types.KubeClusters) {},
+		GetRotation:              func(role types.SystemRole) (*types.Rotation, error) { return &types.Rotation{}, nil },
+		ResourceMatchers:         nil,
+		OnReconcile:              func(kc types.KubeClusters) {},
+		KubernetesServersWatcher: watcher,
+		InventoryHandle:          inventoryHandle,
 	})
 	require.NoError(t, err)
 
@@ -6988,6 +9274,8 @@ func startKubeWithoutCleanup(ctx context.Context, t *testing.T, cfg startKubeOpt
 		}
 		errChan <- err
 	}()
+	// wait for the watcher to init or it may race with test cleanup.
+	require.NoError(t, watcher.WaitInitialization())
 
 	// Waits for len(clusters) heartbeats to start
 	heartbeatsToExpect := len(cfg.clusters)
@@ -7019,8 +9307,8 @@ func marshalRBACError(t *testing.T, w http.ResponseWriter) {
 func marshalValidPodList(t *testing.T, w http.ResponseWriter) {
 	result := &corev1.PodList{
 		TypeMeta: metav1.TypeMeta{
-			Kind:       "",
-			APIVersion: "",
+			Kind:       "PodList",
+			APIVersion: "v1",
 		},
 		ListMeta: metav1.ListMeta{
 			SelfLink:           "",
@@ -7120,7 +9408,7 @@ func TestForwardingTraces(t *testing.T) {
 	cases := []struct {
 		name      string
 		req       func(t *testing.T) *http.Request
-		assertion func(t *testing.T, spans []*otlp.ResourceSpans, err error, code int)
+		assertion func(t *testing.T, spans []*tracepb.ResourceSpans, err error, code int)
 	}{
 		{
 			name: "no data",
@@ -7196,7 +9484,7 @@ func TestForwardingTraces(t *testing.T) {
 
 				return r
 			},
-			assertion: func(t *testing.T, spans []*otlp.ResourceSpans, err error, code int) {
+			assertion: func(t *testing.T, spans []*tracepb.ResourceSpans, err error, code int) {
 				require.NoError(t, err)
 				require.Equal(t, http.StatusOK, code)
 				require.Len(t, spans, 1)
@@ -7206,7 +9494,7 @@ func TestForwardingTraces(t *testing.T) {
 
 				// compare the spans, but ignore the ids since we know that the rawSpan
 				// has hex encoded ids and protojson.Unmarshal will give us an invalid value
-				require.Empty(t, cmp.Diff(data.ResourceSpans[0], spans[0], protocmp.Transform(), protocmp.IgnoreFields(&otlp.Span{}, "span_id", "trace_id")))
+				require.Empty(t, cmp.Diff(data.ResourceSpans[0], spans[0], protocmp.Transform(), protocmp.IgnoreFields(&tracepb.Span{}, "span_id", "trace_id")))
 
 				// compare the ids separately
 				sid1 := spans[0].ScopeSpans[0].Spans[0].SpanId
@@ -7233,7 +9521,7 @@ func TestForwardingTraces(t *testing.T) {
 			recorder := httptest.NewRecorder()
 
 			// use the handler directly because there is no easy way to pipe in our tracing
-			// data using the pack client in a format that would match the ui.
+			// data using the pack client in a format that would match the webui.
 			_, err := p.handler.handler.traces(recorder, tt.req(t), nil, nil)
 
 			// if traces weren't uploaded perform the assertion
@@ -7257,10 +9545,16 @@ func TestForwardingTraces(t *testing.T) {
 	}
 }
 
+type mockPROXYSigner struct{}
+
+func (m *mockPROXYSigner) SignPROXYHeader(source, destination net.Addr) ([]byte, error) {
+	return nil, nil
+}
+
 type mockTraceClient struct {
 	uploadError    error
 	uploadReceived chan struct{}
-	spans          []*otlp.ResourceSpans
+	spans          []*tracepb.ResourceSpans
 }
 
 func (m *mockTraceClient) Start(ctx context.Context) error {
@@ -7271,8 +9565,1814 @@ func (m *mockTraceClient) Stop(ctx context.Context) error {
 	return nil
 }
 
-func (m *mockTraceClient) UploadTraces(ctx context.Context, protoSpans []*otlp.ResourceSpans) error {
+func (m *mockTraceClient) UploadTraces(ctx context.Context, protoSpans []*tracepb.ResourceSpans) error {
 	m.spans = append(m.spans, protoSpans...)
 	m.uploadReceived <- struct{}{}
 	return m.uploadError
+}
+
+func TestLogout(t *testing.T) {
+	ctx := context.Background()
+	t.Parallel()
+	env := newWebPack(t, 2)
+
+	// create a logged in user for proxy 1
+	pack := env.proxies[0].authPack(t, "llama", nil /* roles */)
+
+	// ensure the client is authenticated
+	re, err := pack.clt.Get(ctx, pack.clt.Endpoint("webapi", "sites"), url.Values{})
+	require.NoError(t, err)
+	var clusters []webui.Cluster
+	require.NoError(t, json.Unmarshal(re.Bytes(), &clusters))
+	require.Len(t, clusters, 1)
+
+	// create a client for proxy 2 with the token and cookies from proxy 1
+	jar, err := cookiejar.New(nil)
+	require.NoError(t, err)
+	jar.SetCookies(&env.proxies[1].webURL, pack.cookies)
+	clt2 := env.proxies[1].newClient(t, roundtrip.BearerAuth(pack.session.Token), roundtrip.CookieJar(jar))
+
+	// ensure the second client is authenticated
+	re, err = clt2.Get(ctx, clt2.Endpoint("webapi", "sites"), url.Values{})
+	require.NoError(t, err)
+	require.NoError(t, json.Unmarshal(re.Bytes(), &clusters))
+	require.Len(t, clusters, 1)
+
+	// logout from proxy 1
+	_, err = pack.clt.Delete(ctx, pack.clt.Endpoint("webapi", "sessions", "web"))
+	require.NoError(t, err)
+
+	// ensure proxy 1 invalidated the session
+	_, err = pack.clt.Get(ctx, pack.clt.Endpoint("webapi", "sites"), url.Values{})
+	require.Error(t, err)
+	require.ErrorIs(t, err, trace.AccessDenied("missing session cookie"))
+
+	// should still be authenticated to proxy 2 until the expiration loop kicks in
+	re, err = clt2.Get(ctx, clt2.Endpoint("webapi", "sites"), url.Values{})
+	require.NoError(t, err)
+	require.NoError(t, json.Unmarshal(re.Bytes(), &clusters))
+	require.Len(t, clusters, 1)
+
+	// advance the clock to fire the expiration ticker
+	env.clock.Advance(time.Second)
+
+	// wait for the expiration loop to purge the session
+	require.Eventually(t, func() bool {
+		return env.proxies[1].handler.handler.auth.ActiveSessions() == 0
+	}, 5*time.Second, 100*time.Millisecond)
+
+	// ensure proxy 2 invalidated the session
+	_, err = clt2.Get(ctx, clt2.Endpoint("webapi", "sites"), url.Values{})
+	require.True(t, trace.IsAccessDenied(err))
+	require.ErrorIs(t, err, trace.AccessDenied("need auth"))
+}
+
+// initGRPCServer creates a gRPC server serving on the provided listener.
+func initGRPCServer(t *testing.T, env *webPack, listener net.Listener) {
+	clusterName := env.server.ClusterName()
+	// Auth client, lock watcher and authorizer for Kube proxy.
+	proxyAuthClient, err := env.server.TLS.NewClient(auth.TestBuiltin(types.RoleProxy))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, proxyAuthClient.Close()) })
+
+	serverIdentity, err := auth.NewServerIdentity(env.server.Auth(), uuid.NewString(), types.RoleProxy)
+	require.NoError(t, err)
+	tlsConfig, err := serverIdentity.TLSConfig(nil)
+	require.NoError(t, err)
+	limiter, err := limiter.NewLimiter(limiter.Config{MaxConnections: 100})
+	require.NoError(t, err)
+	// authMiddleware authenticates request assuming TLS client authentication
+	// adds authentication information to the context
+	// and passes it to the API server
+	authMiddleware := &auth.Middleware{
+		ClusterName:   clusterName,
+		Limiter:       limiter,
+		AcceptedUsage: []string{teleport.UsageKubeOnly},
+	}
+
+	tlsConf := copyAndConfigureTLS(tlsConfig, proxyAuthClient, clusterName)
+	creds, err := auth.NewTransportCredentials(auth.TransportCredentialsConfig{
+		TransportCredentials: credentials.NewTLS(tlsConf),
+		UserGetter:           authMiddleware,
+	})
+	require.NoError(t, err)
+
+	grpcServer := grpc.NewServer(
+		grpc.ChainUnaryInterceptor(authMiddleware.UnaryInterceptors()...),
+		grpc.ChainStreamInterceptor(authMiddleware.StreamInterceptors()...),
+		grpc.Creds(creds),
+	)
+
+	kubeproto.RegisterKubeServiceServer(grpcServer, &fakeKubeService{})
+	errC := make(chan error, 1)
+	t.Cleanup(func() {
+		grpcServer.GracefulStop()
+		require.NoError(t, <-errC)
+	})
+	go func() {
+		err := grpcServer.Serve(listener)
+		errC <- trace.Wrap(err)
+	}()
+}
+
+// copyAndConfigureTLS can be used to copy and modify an existing *tls.Config
+// for Teleport application proxy servers.
+func copyAndConfigureTLS(config *tls.Config, accessPoint authclient.AccessCache, clusterName string) *tls.Config {
+	tlsConfig := config.Clone()
+
+	// Require clients to present a certificate
+	tlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
+
+	// Configure function that will be used to fetch the CA that signed the
+	// client's certificate to verify the chain presented. If the client does not
+	// pass in the cluster name, this functions pulls back all CA to try and
+	// match the certificate presented against any CA.
+	tlsConfig.GetConfigForClient = authclient.WithClusterCAs(tlsConfig.Clone(), accessPoint, clusterName, slog.Default())
+
+	return tlsConfig
+}
+
+type fakeKubeService struct {
+	kubeproto.UnimplementedKubeServiceServer
+}
+
+func (s *fakeKubeService) ListKubernetesResources(ctx context.Context, req *kubeproto.ListKubernetesResourcesRequest) (*kubeproto.ListKubernetesResourcesResponse, error) {
+	switch req.GetResourceType() {
+	case types.KindKubePod:
+		{
+			return &kubeproto.ListKubernetesResourcesResponse{
+				Resources: []*types.KubernetesResourceV1{
+					{
+						Kind: types.KindKubePod,
+						Metadata: types.Metadata{
+							Name: "test-pod",
+							Labels: map[string]string{
+								"app": "test",
+							},
+						},
+						Spec: types.KubernetesResourceSpecV1{
+							Namespace: "default",
+						},
+					},
+					{
+						Kind: types.KindKubePod,
+						Metadata: types.Metadata{
+							Name: "test-pod2",
+							Labels: map[string]string{
+								"app": "test2",
+							},
+						},
+						Spec: types.KubernetesResourceSpecV1{
+							Namespace: "default",
+						},
+					},
+				},
+				TotalCount: 2,
+			}, nil
+		}
+	case types.KindKubeNamespace:
+		{
+			return &kubeproto.ListKubernetesResourcesResponse{
+				Resources: []*types.KubernetesResourceV1{
+					{
+						Kind: types.KindNamespace,
+						Metadata: types.Metadata{
+							Name: "default",
+							Labels: map[string]string{
+								"app": "test",
+							},
+						},
+					},
+				},
+				TotalCount: 1,
+			}, nil
+		}
+	default:
+		return nil, trace.BadParameter("kubernetes resource kind %q is not mocked", req.GetResourceType())
+	}
+}
+
+func TestWebSocketAuthenticateRequest(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	env := newWebPack(t, 1)
+	proxy := env.proxies[0]
+	pack := proxy.authPack(t, "test-user@example.com", nil)
+	for _, tc := range []struct {
+		name              string
+		serverExpectError string
+		expectResponse    wsStatus
+		token             string
+		writeTimeout      func()
+		readTimeout       func()
+	}{
+		{
+			name: "valid token",
+			expectResponse: wsStatus{
+				Type:   "create_session_response",
+				Status: "ok",
+			},
+			token: pack.session.Token,
+		},
+		{
+			name:              "invalid token",
+			serverExpectError: "not found",
+			expectResponse: wsStatus{
+				Type:    "create_session_response",
+				Status:  "error",
+				Message: "invalid token",
+			},
+			token: "honk",
+		},
+		{
+			name:              "server read timeout",
+			serverExpectError: "i/o timeout",
+			token:             pack.session.Token,
+			readTimeout: func() {
+				<-time.After(wsIODeadline * 3)
+			},
+		},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				sctx, ws, err := proxy.handler.handler.AuthenticateRequestWS(w, r)
+				if err != nil {
+					if tc.serverExpectError == "" {
+						t.Errorf("unexpected error: %v", err)
+					}
+					if !strings.Contains(err.Error(), tc.serverExpectError) {
+						t.Errorf("unexpected error: %v", err)
+						return
+					}
+					return
+				}
+				t.Cleanup(func() { ws.Close() })
+				if tc.serverExpectError != "" {
+					t.Errorf("expected error, got nil")
+					return
+				}
+
+				clt, err := sctx.GetClient()
+				if err != nil {
+					t.Errorf("unexpected error: %v", err)
+					return
+				}
+				_, err = clt.GetDomainName(ctx)
+				if err != nil {
+					t.Errorf("unexpected error: %v", err)
+					return
+				}
+			}))
+
+			header := http.Header{}
+			for _, cookie := range pack.cookies {
+				header.Add("Cookie", cookie.String())
+			}
+
+			u := strings.Replace(server.URL, "http:", "ws:", 1)
+			conn, resp, err := websocket.DefaultDialer.Dial(u, header)
+			require.NoError(t, err)
+			t.Cleanup(func() { conn.Close() })
+			t.Cleanup(func() { resp.Body.Close() })
+
+			if tc.readTimeout != nil {
+				tc.readTimeout()
+			}
+			err = conn.WriteJSON(wsBearerToken{
+				Token: tc.token,
+			})
+			require.NoError(t, err)
+			if tc.readTimeout != nil {
+				return // Reading will fail as the server will have closed the connection
+			}
+
+			var status wsStatus
+			err = conn.ReadJSON(&status)
+			require.NoError(t, err)
+			require.Equal(t, tc.expectResponse, status)
+		})
+	}
+}
+
+func TestGetKubeExecClusterData(t *testing.T) {
+	testCases := []struct {
+		name          string
+		listenerMode  types.ProxyListenerMode
+		proxyKubeAddr string
+		proxyWebAddr  string
+
+		expectedServerAddr string
+		expectedTLSName    string
+
+		errCheck require.ErrorAssertionFunc
+	}{
+		{
+			name:               "separate, regular addr",
+			listenerMode:       types.ProxyListenerMode_Separate,
+			proxyKubeAddr:      "kube.example.com:555",
+			expectedServerAddr: "https://kube.example.com:555",
+		},
+		{
+			name:               "separate, specified ip addr",
+			listenerMode:       types.ProxyListenerMode_Separate,
+			proxyKubeAddr:      "1.2.3.4:444",
+			expectedServerAddr: "https://1.2.3.4:444",
+		},
+		{
+			name:               "separate, unspecified ip addr",
+			listenerMode:       types.ProxyListenerMode_Separate,
+			proxyKubeAddr:      "0.0.0.0:444",
+			expectedServerAddr: "https://localhost:444",
+		},
+		{
+			name:               "multiplex, regular proxy web addr",
+			listenerMode:       types.ProxyListenerMode_Multiplex,
+			proxyWebAddr:       "web.example.com:777",
+			expectedServerAddr: "https://web.example.com:777",
+			expectedTLSName:    "kube-teleport-proxy-alpn.web.example.com",
+		},
+		{
+			name:               "multiplex, proxy web addr unspecified ip",
+			listenerMode:       types.ProxyListenerMode_Multiplex,
+			proxyWebAddr:       "0.0.0.0:888",
+			expectedServerAddr: "https://localhost:888",
+			expectedTLSName:    "kube-teleport-proxy-alpn.teleport.cluster.local",
+		},
+	}
+
+	for _, tt := range testCases {
+		t.Run(tt.name, func(t *testing.T) {
+			h := Handler{}
+			if tt.proxyWebAddr != "" {
+				h.cfg.ProxyWebAddr = *utils.MustParseAddr(tt.proxyWebAddr)
+			}
+			if tt.proxyKubeAddr != "" {
+				h.cfg.ProxyKubeAddr = *utils.MustParseAddr(tt.proxyKubeAddr)
+			}
+
+			netConfig := types.ClusterNetworkingConfigV2{Spec: types.ClusterNetworkingConfigSpecV2{
+				ProxyListenerMode: tt.listenerMode,
+			}}
+
+			serverAddr, tlsServerName, err := h.getKubeExecClusterData(&netConfig)
+			if tt.errCheck != nil {
+				tt.errCheck(t, err)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tt.expectedServerAddr, serverAddr)
+			require.Equal(t, tt.expectedTLSName, tlsServerName)
+		})
+	}
+}
+
+// TestSimultaneousAuthenticateRequest ensures that multiple authenticated
+// requests do not race to create a SessionContext. This would happen when
+// Proxies were deployed behind a round-robin load balancer. Only the Proxy
+// that handled the login will have initially created a SessionContext for
+// the particular user+session. All subsequent requests to the other Proxies
+// in the load balancer pool attempt to create a SessionContext in
+// [Handler.AuthenticateRequest] if one didn't already exist. If the web UI
+// makes enough requests fast enough it can result in the Proxy trying to
+// create multiple SessionContext for a user+session. Since only one SessionContext
+// is stored in the sessionCache all previous SessionContext and their underlying
+// auth client get closed, which results in an ugly and unfriendly
+// `grpc: the client connection is closing` error banner on the web webui.
+func TestSimultaneousAuthenticateRequest(t *testing.T) {
+	ctx := context.Background()
+	env := newWebPack(t, 1)
+
+	proxy := env.proxies[0]
+
+	// Authenticate to get a session token and cookies.
+	pack := proxy.authPack(t, "test-user@example.com", nil)
+
+	// Reset the sessions so that all future requests will race to create
+	// a new SessionContext for the user + session pair to simulate multiple
+	// proxies behind a load balancer.
+	proxy.handler.handler.auth.sessions = map[string]*SessionContext{}
+
+	// Create a request with the auth header and cookies for the session.
+	endpoint := pack.clt.Endpoint("webapi", "sites")
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	require.NoError(t, err)
+
+	req.Header.Set("Authorization", "Bearer "+pack.session.Token)
+	for _, cookie := range pack.cookies {
+		req.AddCookie(cookie)
+	}
+
+	// Spawn several requests in parallel and attempt to use the auth client.
+	type res struct {
+		domain string
+		err    error
+	}
+	const requests = 10
+	respC := make(chan res, requests)
+	for i := 0; i < requests; i++ {
+		go func() {
+			sctx, err := proxy.handler.handler.AuthenticateRequest(httptest.NewRecorder(), req.Clone(ctx), false)
+			if err != nil {
+				respC <- res{err: err}
+				return
+			}
+
+			clt, err := sctx.GetClient()
+			if err != nil {
+				respC <- res{err: err}
+				return
+			}
+
+			domain, err := clt.GetDomainName(ctx)
+			respC <- res{domain: domain, err: err}
+		}()
+	}
+
+	// Assert that all requests were successful and each one was able to
+	// get the domain name without its auth client being closed.
+	for i := 0; i < requests; i++ {
+		select {
+		case res := <-respC:
+			require.NoError(t, res.err)
+			require.Equal(t, "localhost", res.domain)
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for responses")
+		}
+	}
+}
+
+// mockedPingTestProxy is a test proxy with a mocked Ping method
+type mockedPingTestProxy struct {
+	authclient.ClientI
+	mockedPing func(ctx context.Context) (authproto.PingResponse, error)
+}
+
+func (m mockedPingTestProxy) Ping(ctx context.Context) (authproto.PingResponse, error) {
+	return m.mockedPing(ctx)
+}
+
+// TestModeratedSession validates that peers are able to start Moderated
+// Sessions and remain in the waiting room until the required number of
+// moderators are present. Only when the moderator is present the peer
+// is allowed to access the host and start entering input and receiving
+// output until the moderator terminates the session.
+func TestModeratedSession(t *testing.T) {
+	modules.SetTestModules(t, &modules.TestModules{TestBuildType: modules.BuildEnterprise})
+
+	s := newWebSuiteWithConfig(t, webSuiteConfig{disableDiskBasedRecording: true})
+
+	peerRole, err := types.NewRole("moderated", types.RoleSpecV6{
+		Allow: types.RoleConditions{
+			RequireSessionJoin: []*types.SessionRequirePolicy{
+				{
+					Name:   "moderated",
+					Filter: "contains(user.roles, \"moderator\")",
+					Kinds:  []string{string(types.SSHSessionKind)},
+					Count:  1,
+					Modes:  []string{string(types.SessionModeratorMode)},
+				},
+			},
+		},
+	})
+	require.NoError(t, err)
+	peerRole, err = s.server.Auth().UpsertRole(s.ctx, peerRole)
+	require.NoError(t, err)
+
+	moderatorRole, err := types.NewRole("moderator", types.RoleSpecV6{
+		Allow: types.RoleConditions{
+			JoinSessions: []*types.SessionJoinPolicy{
+				{
+					Name:  "moderated",
+					Roles: []string{peerRole.GetName()},
+					Kinds: []string{string(types.SSHSessionKind)},
+					Modes: []string{string(types.SessionModeratorMode), string(types.SessionObserverMode)},
+				},
+			},
+		},
+	})
+	require.NoError(t, err)
+	moderatorRole, err = s.server.Auth().UpsertRole(s.ctx, moderatorRole)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(s.ctx)
+	t.Cleanup(cancel)
+
+	peerTerm, err := connectToHost(ctx, connectConfig{
+		pack:  s.authPack(t, "foo", peerRole.GetName()),
+		host:  s.node.ID(),
+		proxy: s.webServer.Listener.Addr().String(),
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, peerTerm.Close()) })
+
+	require.NoError(t, waitForOutput(peerTerm, "Teleport > Waiting for required participants..."), "waiting for peer to enter session")
+
+	moderatorTerm, err := connectToHost(ctx, connectConfig{
+		pack:            s.authPack(t, "bar", moderatorRole.GetName()),
+		host:            s.node.ID(),
+		proxy:           s.webServer.Listener.Addr().String(),
+		sessionID:       peerTerm.GetSession().ID,
+		participantMode: types.SessionModeratorMode,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, moderatorTerm.Close()) })
+
+	require.NoError(t, waitForOutput(peerTerm, "Teleport > Connecting to node over SSH"), "waiting for peer connection to node after moderator joins")
+
+	// here we intentionally run a command where the output we're looking
+	// for is not present in the command itself
+	_, err = io.WriteString(peerTerm, "echo llxmx | sed 's/x/a/g'\r\n")
+	require.NoError(t, err)
+	require.NoError(t, waitForOutput(peerTerm, "llama"), "waiting for output on peer terminal")
+	require.NoError(t, waitForOutput(moderatorTerm, "llama"), "waiting for output on moderator terminal")
+
+	// the moderator terminates the session
+	_, err = io.WriteString(moderatorTerm, "t")
+	require.NoError(t, err)
+
+	require.NoError(t, waitForOutput(moderatorTerm, "Stopping session..."), "waiting for moderator to terminate session")
+	require.NoError(t, waitForOutput(peerTerm, "Process exited with status 255"), "waiting for peer session to be terminated")
+}
+
+// TestModeratedSessionWithMFA validates the same behavior as TestModeratedSession while
+// also ensuring that MFA is performed prior to accessing the host and that periodic
+// presence checks are performed by the moderator. When presence checks are not performed
+// the session is aborted.
+func TestModeratedSessionWithMFA(t *testing.T) {
+	modules.SetTestModules(t, &modules.TestModules{TestBuildType: modules.BuildEnterprise})
+
+	const RPID = "localhost"
+
+	presenceClock := clockwork.NewFakeClock()
+	s := newWebSuiteWithConfig(t, webSuiteConfig{
+		clock:                     clockwork.NewFakeClockAt(presenceClock.Now()),
+		disableDiskBasedRecording: true,
+		authPreferenceSpec: &types.AuthPreferenceSpecV2{
+			Type:           constants.Local,
+			ConnectorName:  constants.PasswordlessConnector,
+			SecondFactor:   constants.SecondFactorOn,
+			RequireMFAType: types.RequireMFAType_SESSION,
+			Webauthn: &types.Webauthn{
+				RPID: RPID,
+			},
+		},
+		presenceChecker: func(ctx context.Context, term io.Writer, maintainer client.PresenceMaintainer, sessionID string, mfaCeremony *mfa.Ceremony, opts ...client.PresenceOption) error {
+			return trace.Wrap(client.RunPresenceTask(ctx, term, maintainer, sessionID, mfaCeremony, client.WithPresenceClock(presenceClock)))
+		},
+	})
+
+	peerRole, err := types.NewRole("moderated", types.RoleSpecV6{
+		Allow: types.RoleConditions{
+			RequireSessionJoin: []*types.SessionRequirePolicy{
+				{
+					Name:   "moderated",
+					Filter: "contains(user.roles, \"moderator\")",
+					Kinds:  []string{string(types.SSHSessionKind)},
+					Count:  1,
+					Modes:  []string{string(types.SessionModeratorMode)},
+				},
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	moderatorRole, err := types.NewRole("moderator", types.RoleSpecV6{
+		Allow: types.RoleConditions{
+			JoinSessions: []*types.SessionJoinPolicy{
+				{
+					Name:  "moderated",
+					Roles: []string{peerRole.GetName()},
+					Kinds: []string{string(types.SSHSessionKind)},
+					Modes: []string{string(types.SessionModeratorMode), string(types.SessionObserverMode)},
+				},
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	peer := s.authPackWithMFA(t, "foo", peerRole)
+	moderator := s.authPackWithMFA(t, "bar", moderatorRole)
+
+	ctx, cancel := context.WithCancel(s.ctx)
+	t.Cleanup(cancel)
+
+	peerTerm, err := connectToHost(ctx, connectConfig{
+		pack:  peer,
+		host:  s.node.ID(),
+		proxy: s.webServer.Listener.Addr().String(),
+		mfaCeremony: func(challenge client.MFAAuthenticateChallenge) []byte {
+			res, err := peer.device.SolveAuthn(&authproto.MFAAuthenticateChallenge{
+				WebauthnChallenge: wantypes.CredentialAssertionToProto(challenge.WebauthnChallenge),
+			})
+			require.NoError(t, err)
+
+			webauthnResBytes, err := json.Marshal(wantypes.CredentialAssertionResponseFromProto(res.GetWebauthn()))
+			require.NoError(t, err)
+
+			envelope := &terminal.Envelope{
+				Version: defaults.WebsocketVersion,
+				Type:    defaults.WebsocketMFAChallenge,
+				Payload: string(webauthnResBytes),
+			}
+			envelopeBytes, err := proto.Marshal(envelope)
+			require.NoError(t, err)
+
+			return envelopeBytes
+		},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, peerTerm.Close()) })
+
+	require.NoError(t, waitForOutput(peerTerm, "Teleport > Waiting for required participants..."), "waiting for peer to start session")
+
+	moderatorTerm, err := connectToHost(ctx, connectConfig{
+		pack:            moderator,
+		host:            s.node.ID(),
+		proxy:           s.webServer.Listener.Addr().String(),
+		sessionID:       peerTerm.GetSession().ID,
+		participantMode: types.SessionModeratorMode,
+		mfaCeremony: func(challenge client.MFAAuthenticateChallenge) []byte {
+			res, err := moderator.device.SolveAuthn(&authproto.MFAAuthenticateChallenge{
+				WebauthnChallenge: wantypes.CredentialAssertionToProto(challenge.WebauthnChallenge),
+			})
+			require.NoError(t, err)
+
+			webauthnResBytes, err := json.Marshal(wantypes.CredentialAssertionResponseFromProto(res.GetWebauthn()))
+			require.NoError(t, err)
+
+			envelope := &terminal.Envelope{
+				Version: defaults.WebsocketVersion,
+				Type:    defaults.WebsocketMFAChallenge,
+				Payload: string(webauthnResBytes),
+			}
+			envelopeBytes, err := proto.Marshal(envelope)
+			require.NoError(t, err)
+
+			return envelopeBytes
+		},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, moderatorTerm.Close()) })
+
+	require.NoError(t, waitForOutput(peerTerm, "Teleport > Connecting to node over SSH"), "waiting for peer to connect after moderator joins")
+
+	// here we intentionally run a command where the output we're looking
+	// for is not present in the command itself
+	_, err = io.WriteString(peerTerm, "echo llxmx | sed 's/x/a/g'\r\n")
+	require.NoError(t, err)
+	require.NoError(t, waitForOutput(peerTerm, "llama"), "waiting for output in peer terminal")
+	require.NoError(t, waitForOutput(moderatorTerm, "llama"), "waiting for output in moderator terminal")
+
+	// run the presence check a few times
+	for i := 0; i < 3; i++ {
+		presenceClock.BlockUntil(1)
+		presenceClock.Advance(30 * time.Second)
+		require.NoError(t, waitForOutput(moderatorTerm, "Teleport > Please tap your MFA key"), "waiting for moderator mfa prompt")
+
+		challenge, err := moderatorTerm.stream.ReadChallenge(protobufMFACodec{})
+		require.NoError(t, err)
+
+		res, err := moderator.device.SolveAuthn(challenge)
+		require.NoError(t, err)
+
+		webauthnResBytes, err := json.Marshal(wantypes.CredentialAssertionResponseFromProto(res.GetWebauthn()))
+		require.NoError(t, err)
+
+		envelope := &terminal.Envelope{
+			Version: defaults.WebsocketVersion,
+			Type:    defaults.WebsocketMFAChallenge,
+			Payload: string(webauthnResBytes),
+		}
+		envelopeBytes, err := proto.Marshal(envelope)
+		require.NoError(t, err)
+
+		require.NoError(t, moderatorTerm.ws.WriteMessage(websocket.BinaryMessage, envelopeBytes))
+	}
+
+	// Advance the clock far enough in the future to make the moderator stale
+	// which will terminate the session - because the clock is used by ALL server
+	// components, it's not practical to use BlockUntil here, so we use EventuallyWithT instead.
+	require.EventuallyWithT(t, func(t *assert.CollectT) {
+		s.clock.Advance(3 * time.Minute)
+		assert.NoError(t, waitForOutputWithDuration(moderatorTerm, "wait: remote command exited without exit status or exit signal", 3*time.Second))
+		assert.NoError(t, waitForOutputWithDuration(peerTerm, "Process exited with status 255", 3*time.Second))
+	}, 15*time.Second, 500*time.Millisecond)
+}
+
+type proxyClientMock struct {
+	authclient.ClientI
+	tokens map[string]types.ProvisionToken
+}
+
+// GetToken returns provisioning token
+func (pc *proxyClientMock) GetToken(_ context.Context, token string) (types.ProvisionToken, error) {
+	tok, ok := pc.tokens[token]
+	if ok {
+		return tok, nil
+	}
+
+	return nil, trace.NotFound("%s", token)
+}
+
+func (pc *proxyClientMock) DeleteToken(_ context.Context, token string) error {
+	_, ok := pc.tokens[token]
+	if ok {
+		delete(pc.tokens, token)
+		return nil
+	}
+	return trace.NotFound("%s", token)
+}
+
+func Test_consumeTokenForAPICall(t *testing.T) {
+	pc := &proxyClientMock{tokens: map[string]types.ProvisionToken{}}
+
+	tests := []struct {
+		name     string
+		getToken func() (string, types.ProvisionToken)
+		wantErr  require.ErrorAssertionFunc
+	}{
+		{
+			name: "missing token is rejected",
+			getToken: func() (string, types.ProvisionToken) {
+				return "fake", nil
+			},
+			wantErr: func(t require.TestingT, err error, i ...interface{}) {
+				require.True(t, trace.IsNotFound(err))
+			},
+		},
+		{
+			name: "valid token is accepted",
+			getToken: func() (string, types.ProvisionToken) {
+				tok, err := types.NewProvisionToken(uuid.New().String(), []types.SystemRole{types.RoleDatabase}, time.Now().Add(time.Hour))
+				require.NoError(t, err)
+				pc.tokens[tok.GetName()] = tok
+				return tok.GetName(), tok
+			},
+		},
+		{
+			name: "token with no expiry is accepted",
+			getToken: func() (string, types.ProvisionToken) {
+				tok, err := types.NewProvisionToken(uuid.New().String(), []types.SystemRole{types.RoleDatabase}, time.Time{})
+				require.NoError(t, err)
+				pc.tokens[tok.GetName()] = tok
+				return tok.GetName(), tok
+			},
+		},
+		{
+			name: "expired token is rejected",
+			getToken: func() (string, types.ProvisionToken) {
+				tok, err := types.NewProvisionToken(uuid.New().String(), []types.SystemRole{types.RoleDatabase}, time.Now().Add(-time.Hour))
+				require.NoError(t, err)
+				pc.tokens[tok.GetName()] = tok
+				return tok.GetName(), tok
+			},
+			wantErr: func(t require.TestingT, err error, i ...interface{}) {
+				require.ErrorContains(t, err, "expired token")
+			},
+		},
+		{
+			name: "token with invalid join type is rejected",
+			getToken: func() (string, types.ProvisionToken) {
+				tok, err := types.NewProvisionTokenFromSpec("ec2-token", time.Now().Add(time.Hour), types.ProvisionTokenSpecV2{
+					Roles:      []types.SystemRole{types.RoleDatabase},
+					Allow:      []*types.TokenRule{{AWSAccount: "1234"}},
+					JoinMethod: types.JoinMethodEC2,
+				})
+
+				require.NoError(t, err)
+				pc.tokens[tok.GetName()] = tok
+				return tok.GetName(), tok
+			},
+			wantErr: func(t require.TestingT, err error, i ...interface{}) {
+				require.ErrorContains(t, err, "unexpected join method \"ec2\" for token \"ec2-token\"")
+			},
+		},
+	}
+
+	tokenExists := func(tokenName string) bool {
+		tok, _ := pc.GetToken(context.Background(), tokenName)
+		return tok != nil
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tokName, tok := tt.getToken()
+			tokenInitiallyPresent := tokenExists(tokName)
+			result, err := consumeTokenForAPICall(context.Background(), pc, tokName)
+			if tt.wantErr != nil {
+				tt.wantErr(t, err)
+				// verify that if token was present, then it has not been deleted.
+				require.Equal(t, tokenInitiallyPresent, tokenExists(tokName))
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, tok, result)
+				// verify that token does not exist now, even if it did.
+				require.False(t, tokenExists(tokName))
+			}
+		})
+	}
+}
+
+// TestGithubAuthCompat asserts that the proxy can handle github login flows
+// from tsh clients that send split keys in the new format, or only a single key
+// in the old format.
+func TestGithubAuthCompat(t *testing.T) {
+	ctx := context.Background()
+	env := newWebPack(t, 1)
+
+	env.server.Auth().GithubUserAndTeamsOverride = func() (*auth.GithubUserResponse, []auth.GithubTeamResponse, error) {
+		return &auth.GithubUserResponse{
+				Login: "alice",
+			}, []auth.GithubTeamResponse{{
+				Name: "devs",
+				Slug: "devs",
+				Org:  auth.GithubOrgResponse{Login: "octocats"},
+			}}, nil
+	}
+
+	connector, err := types.NewGithubConnector("github", types.GithubConnectorSpecV3{
+		ClientID:     "12345",
+		ClientSecret: "678910",
+		RedirectURL:  "https://proxy.example.com/v1/webapi/github/callback",
+		Display:      "Github",
+		TeamsToRoles: []types.TeamRolesMapping{
+			{
+				Organization: "octocats",
+				Team:         "devs",
+				Roles:        []string{"access"},
+			},
+		},
+	})
+	require.NoError(t, err)
+	_, err = env.server.Auth().UpsertGithubConnector(ctx, connector)
+	require.NoError(t, err)
+
+	access, err := types.NewRole("access", types.RoleSpecV6{})
+	require.NoError(t, err)
+	_, err = env.server.Auth().CreateRole(ctx, access)
+	require.NoError(t, err)
+
+	clt := env.proxies[0].newClient(t)
+
+	// The response in the callback will be encrypted with this key.
+	secretKey, err := secret.NewKey()
+	require.NoError(t, err)
+
+	sshKey, err := cryptosuites.GenerateKeyWithAlgorithm(cryptosuites.Ed25519)
+	require.NoError(t, err)
+	sshPub, err := ssh.NewPublicKey(sshKey.Public())
+	require.NoError(t, err)
+	sshPubBytes := ssh.MarshalAuthorizedKey(sshPub)
+
+	tlsKey, err := cryptosuites.GenerateKeyWithAlgorithm(cryptosuites.ECDSAP256)
+	require.NoError(t, err)
+	tlsPubBytes, err := keys.MarshalPublicKey(tlsKey.Public())
+	require.NoError(t, err)
+
+	for _, tc := range []struct {
+		desc                         string
+		pubKey, sshPubKey, tlsPubKey []byte
+		expectLoginError             string
+		expectSSHSubjectKey          ssh.PublicKey
+		expectTLSSubjectKey          crypto.PublicKey
+	}{
+		{
+			desc:             "no keys",
+			expectLoginError: "Failed to login",
+		},
+		{
+			desc:                "single key",
+			pubKey:              sshPubBytes,
+			expectSSHSubjectKey: sshPub,
+			expectTLSSubjectKey: sshKey.Public(),
+		},
+		{
+			desc:                "split keys",
+			sshPubKey:           sshPubBytes,
+			tlsPubKey:           tlsPubBytes,
+			expectSSHSubjectKey: sshPub,
+			expectTLSSubjectKey: tlsKey.Public(),
+		},
+		{
+			desc:                "only ssh",
+			sshPubKey:           sshPubBytes,
+			expectSSHSubjectKey: sshPub,
+		},
+		{
+			desc:                "only tls",
+			tlsPubKey:           tlsPubBytes,
+			expectTLSSubjectKey: tlsKey.Public(),
+		},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			// Initiate the github SSO login.
+			loginResponse, err := clt.PostJSON(ctx, clt.Endpoint("webapi", "github", "login", "console"), client.SSOLoginConsoleReq{
+				RedirectURL: (&url.URL{
+					Scheme:   "http",
+					Host:     "localhost",
+					Path:     "callback",
+					RawQuery: url.Values{"secret_key": []string{secretKey.String()}}.Encode(),
+				}).String(),
+				ConnectorID: "github",
+				SSOUserPublicKeys: client.SSOUserPublicKeys{
+					PublicKey: tc.pubKey,
+					SSHPubKey: tc.sshPubKey,
+					TLSPubKey: tc.tlsPubKey,
+				},
+				CertTTL: time.Hour,
+			})
+			if tc.expectLoginError != "" {
+				require.Error(t, err)
+				require.ErrorContains(t, err, tc.expectLoginError)
+				return
+			}
+			require.NoError(t, err)
+
+			// Retrieve the state token from the redirect URL in the response.
+			stateToken := stateTokenFromConsoleLoginResponse(t, loginResponse.Bytes())
+
+			// Send the callback to the proxy to complete the login.
+			callbackResponse, err := clt.Get(ctx, clt.Endpoint("webapi", "github", "callback"), url.Values{
+				"state": []string{stateToken},
+				"code":  []string{"success"},
+			})
+			require.NoError(t, err)
+
+			// Retrieve the login response from the callback response HTML.
+			sshLoginResponse := sshLoginResponseFromCallbackResponse(t, callbackResponse.Reader(), secretKey)
+
+			// Make sure the subject key in the issued SSH cert matches the
+			// expected key and didn't get accidentally switched.
+			if tc.expectSSHSubjectKey != nil {
+				sshCert, err := apisshutils.ParseCertificate(sshLoginResponse.Cert)
+				require.NoError(t, err)
+				require.Equal(t, tc.expectSSHSubjectKey, sshCert.Key)
+			} else {
+				// No SSH cert should be issued if we didn't ask for one.
+				require.Empty(t, sshLoginResponse.Cert)
+			}
+
+			// Make sure the subject key in the issued TLS cert matches the
+			// expected key and didn't get accidentally switched.
+			if tc.expectTLSSubjectKey != nil {
+				tlsCert, err := tlsca.ParseCertificatePEM(sshLoginResponse.TLSCert)
+				require.NoError(t, err)
+				require.Equal(t, tc.expectTLSSubjectKey, tlsCert.PublicKey)
+			} else {
+				// No TLS cert should be issued if we didn't ask for one.
+				require.Empty(t, sshLoginResponse.TLSCert)
+			}
+		})
+	}
+}
+
+func stateTokenFromConsoleLoginResponse(t *testing.T, responseBody []byte) string {
+	var loginResp client.SSOLoginConsoleResponse
+	require.NoError(t, json.Unmarshal(responseBody, &loginResp))
+	u, err := url.Parse(loginResp.RedirectURL)
+	require.NoError(t, err, "parsing login redirect URL")
+	q, err := url.ParseQuery(u.RawQuery)
+	require.NoError(t, err, "parsing login redirect URL query params")
+	require.Contains(t, q, "state", "redirect query did not contain state token")
+	return q["state"][0]
+}
+
+// The login response we're after with the certs in it is:
+// - JSON
+// - encrypted with [secretKey]
+// - in a query param
+// - in a redirect URL
+// - in an HTML document
+func sshLoginResponseFromCallbackResponse(t *testing.T, responseBody io.Reader, secretKey secret.Key) *authclient.SSHLoginResponse {
+	// First pull the URL from the HTML meta redirect.
+	redirectURL, err := app.GetURLFromMetaRedirect(responseBody)
+	require.NoError(t, err)
+
+	// Then get the encrypted JSON out of the query param.
+	u, err := url.Parse(redirectURL)
+	require.NoError(t, err)
+	require.Contains(t, u.Query(), "response", "redirect query did not contain response")
+	ciphertext := u.Query().Get("response")
+
+	// Then unencrypt.
+	callbackPlaintext, err := secretKey.Open([]byte(ciphertext))
+	require.NoError(t, err, "unencrypting github callback response")
+
+	// Then unmarshal the JSON.
+	var sshLoginResponse authclient.SSHLoginResponse
+	require.NoError(t, json.Unmarshal(callbackPlaintext, &sshLoginResponse))
+	return &sshLoginResponse
+}
+
+func TestGithubConnector(t *testing.T) {
+	ctx := context.Background()
+	env := newWebPack(t, 1)
+
+	proxy := env.proxies[0]
+
+	// Authenticate to get a session token and cookies.
+	pack := proxy.authPack(t, "test-user@example.com", nil)
+
+	expected, err := types.NewGithubConnector("github", types.GithubConnectorSpecV3{
+		ClientID:     "12345",
+		ClientSecret: "678910",
+		RedirectURL:  "https://proxy.example.com/v1/webapi/github/callback",
+		Display:      "Github",
+		TeamsToRoles: []types.TeamRolesMapping{
+			{
+				Organization: "acme",
+				Team:         "users",
+				Roles:        []string{"access", "editor", "auditor"},
+			},
+		},
+	})
+	require.NoError(t, err, "creating initial connector resource")
+
+	createPayload := func(connector types.GithubConnector) webui.ResourceItem {
+		raw, err := services.MarshalGithubConnector(connector, services.PreserveRevision())
+		require.NoError(t, err, "marshaling connector")
+
+		return webui.ResourceItem{
+			Kind:    types.KindGithubConnector,
+			Name:    connector.GetName(),
+			Content: string(raw),
+		}
+	}
+
+	unmarshalResponse := func(resp []byte) types.GithubConnector {
+		var item webui.ResourceItem
+		require.NoError(t, json.Unmarshal(resp, &item), "response from server contained an invalid resource item")
+
+		var conn types.GithubConnectorV3
+		require.NoError(t, yaml.Unmarshal([]byte(item.Content), &conn), "resource item content was not a github connector")
+		return &conn
+	}
+
+	// Create the initial connector.
+	resp, err := pack.clt.PostJSON(ctx, pack.clt.Endpoint("webapi", "github"), createPayload(expected))
+	require.NoError(t, err, "expected creating the initial connector to succeed")
+	require.Equal(t, http.StatusOK, resp.Code(), "unexpected status code creating connector")
+
+	created := unmarshalResponse(resp.Bytes())
+
+	// Validate that creating the connector again fails.
+	resp, err = pack.clt.PostJSON(ctx, pack.clt.Endpoint("webapi", "github"), createPayload(expected))
+	assert.Error(t, err, "expected an error creating a duplicate connector")
+	assert.True(t, trace.IsAlreadyExists(err), "expected an already exists error got %T", err)
+	assert.Equal(t, http.StatusConflict, resp.Code(), "unexpected status code creating duplicate connector")
+
+	// Update the connector.
+	created.SetDisplay("test")
+	resp, err = pack.clt.PutJSON(ctx, pack.clt.Endpoint("webapi", "github", expected.GetName()), createPayload(created))
+	require.NoError(t, err, "unexpected error updating the connector")
+	require.Equal(t, http.StatusOK, resp.Code(), "unexpected status code updating the connector")
+
+	updated := unmarshalResponse(resp.Bytes())
+
+	require.Empty(t, cmp.Diff(created, updated, cmpopts.IgnoreFields(types.Metadata{}, "Revision", "Namespace"),
+		cmpopts.IgnoreFields(types.GithubConnectorSpecV3{}, "Display", "ClientSecret"),
+	))
+	require.NotEqual(t, expected.GetDisplay(), updated.GetDisplay(), "expected update to modify the display name")
+	require.Equal(t, "test", updated.GetDisplay(), "display name should have been updated to test. got %s", updated.GetDisplay())
+
+	// Validate that a stale revision prevents updates.
+	resp, err = pack.clt.PutJSON(ctx, pack.clt.Endpoint("webapi", "github", expected.GetName()), createPayload(expected))
+	assert.Error(t, err, "expected an error updating a connector with a stale revision")
+	assert.True(t, trace.IsCompareFailed(err), "expected a compare failed error got %T", err)
+	assert.Equal(t, http.StatusPreconditionFailed, resp.Code(), "unexpected status code updating the connector")
+
+	// Validate that renaming the connector prevents updates.
+	updated.SetName(uuid.NewString())
+	resp, err = pack.clt.PutJSON(ctx, pack.clt.Endpoint("webapi", "github", expected.GetName()), createPayload(updated))
+	assert.Error(t, err, "expected and error when renaming a connector")
+	assert.True(t, trace.IsBadParameter(err), "expected a bad parameter error got %T", err)
+	assert.Equal(t, http.StatusBadRequest, resp.Code(), "unexpected status code updating the connector")
+
+	// Validate that updating a nonexistent connector fails.
+	updated.SetName(uuid.NewString())
+	resp, err = pack.clt.PutJSON(ctx, pack.clt.Endpoint("webapi", "github", updated.GetName()), createPayload(updated))
+	assert.Error(t, err, "expected updating a nonexistent connector to fail")
+	assert.True(t, trace.IsCompareFailed(err), "expected a compare failed error got %T", err)
+	assert.Equal(t, http.StatusPreconditionFailed, resp.Code(), "unexpected status code updating the connector")
+
+	// Validate that the connector can be deleted
+	_, err = pack.clt.Delete(ctx, pack.clt.Endpoint("webapi", "github", expected.GetName()))
+	require.NoError(t, err, "unexpected error deleting connector")
+
+	resp, err = pack.clt.Get(ctx, pack.clt.Endpoint("webapi", "github"), nil)
+	assert.NoError(t, err, "unexpected error listing github connectors")
+
+	authConnectorsResp := webui.ListAuthConnectorsResponse{}
+	require.NoError(t, json.Unmarshal(resp.Bytes(), &authConnectorsResp), "invalid response received")
+
+	assert.Empty(t, authConnectorsResp.Connectors)
+	assert.Equal(t, http.StatusOK, resp.Code(), "unexpected status code getting connectors")
+}
+
+func TestCalculateSSHLogins(t *testing.T) {
+	cases := []struct {
+		name              string
+		allowedLogins     []string
+		grantedPrincipals []string
+		expectedLogins    []string
+	}{
+		{
+			name:              "no matching logins",
+			allowedLogins:     []string{"llama"},
+			grantedPrincipals: []string{"fish"},
+		},
+		{
+			name:              "identical logins",
+			allowedLogins:     []string{"llama", "shark", "goose"},
+			grantedPrincipals: []string{"shark", "goose", "llama"},
+			expectedLogins:    []string{"goose", "shark", "llama"},
+		},
+		{
+			name:              "subset of logins",
+			allowedLogins:     []string{"llama"},
+			grantedPrincipals: []string{"shark", "goose", "llama"},
+			expectedLogins:    []string{"llama"},
+		},
+		{
+			name:              "no allowed logins",
+			grantedPrincipals: []string{"shark", "goose", "llama"},
+		},
+		{
+			name:          "no granted logins",
+			allowedLogins: []string{"shark", "goose", "llama"},
+		},
+	}
+
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			identity := &tlsca.Identity{Principals: test.grantedPrincipals}
+
+			logins, err := calculateSSHLogins(identity, test.allowedLogins)
+			require.NoError(t, err)
+			require.Empty(t, cmp.Diff(logins, test.expectedLogins, cmpopts.SortSlices(func(a, b string) bool {
+				return strings.Compare(a, b) < 0
+			})))
+		})
+	}
+}
+
+func TestCalculateAppLogins(t *testing.T) {
+	cases := []struct {
+		name           string
+		allowedLogins  []string
+		expectedLogins []string
+		loginGetter    loginGetterFunc
+	}{
+		{
+			name:           "allowed logins",
+			allowedLogins:  []string{"llama", "fish", "dog"},
+			expectedLogins: []string{"llama", "fish", "dog"},
+			loginGetter: func(_ services.AccessCheckable) ([]string, error) {
+				return nil, nil
+			},
+		},
+		{
+			name: "no allowed logins",
+			loginGetter: func(_ services.AccessCheckable) ([]string, error) {
+				return nil, nil
+			},
+		},
+		{
+			name:           "no allowed logins with fallback",
+			expectedLogins: []string{"apple", "banana"},
+			loginGetter: func(_ services.AccessCheckable) ([]string, error) {
+				return []string{"apple", "banana"}, nil
+			},
+		},
+	}
+
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			logins, err := calculateAppLogins(test.loginGetter, &types.AppServerV3{}, test.allowedLogins)
+			require.NoError(t, err)
+			require.Empty(t, cmp.Diff(logins, test.expectedLogins, cmpopts.SortSlices(func(a, b string) bool {
+				return strings.Compare(a, b) < 0
+			})))
+		})
+	}
+}
+
+type loginGetterFunc func(resource services.AccessCheckable) ([]string, error)
+
+func (f loginGetterFunc) GetAllowedLoginsForResource(resource services.AccessCheckable) ([]string, error) {
+	return f(resource)
+}
+
+func TestWebSocketClosedBeforeSSHSessionCreated(t *testing.T) {
+	t.Parallel()
+	s := newWebSuiteWithConfig(t, webSuiteConfig{disableDiskBasedRecording: true})
+
+	ctx, cancel := context.WithCancel(s.ctx)
+	t.Cleanup(cancel)
+
+	pack := s.authPack(t, "foo")
+
+	req := TerminalRequest{
+		Server: s.node.ID(),
+		Login:  pack.login,
+		Term: session.TerminalParams{
+			W: 100,
+			H: 100,
+		},
+	}
+
+	data, err := json.Marshal(req)
+	require.NoError(t, err)
+
+	u := url.URL{
+		Host:   s.webServer.Listener.Addr().String(),
+		Scheme: client.WSS,
+		Path:   "/v1/webapi/sites/-current-/connect/ws",
+	}
+
+	q := u.Query()
+	q.Set("params", string(data))
+	u.RawQuery = q.Encode()
+
+	header := http.Header{}
+	header.Add("Origin", "http://localhost")
+	for _, cookie := range pack.cookies {
+		header.Add("Cookie", cookie.String())
+	}
+
+	dialer := websocket.Dialer{
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true,
+		},
+	}
+
+	ws, resp, err := dialer.Dial(u.String(), header)
+	if err != nil {
+		var sb strings.Builder
+		sb.WriteString("websocket dial")
+		if resp != nil {
+			fmt.Fprintf(&sb, "; status code %v;", resp.StatusCode)
+			fmt.Fprintf(&sb, "headers: %v; body: ", resp.Header)
+			io.Copy(&sb, resp.Body)
+		}
+		require.NoError(t, err, sb.String())
+	}
+	require.NoError(t, resp.Body.Close())
+
+	require.NoError(t, makeAuthReqOverWS(ws, pack.session.Token))
+
+	wsClosedChan := make(chan struct{})
+
+	// Create a stream that closes the web socket when the server writes the session metadata
+	// to the client. At this point, the SSH connection to the target should be in flight but
+	// not yet established.
+	stream := terminal.NewStream(ctx, terminal.StreamConfig{
+		WS:     ws,
+		Logger: utils.NewSlogLoggerForTests(),
+		Handlers: map[string]terminal.WSHandlerFunc{
+			defaults.WebsocketSessionMetadata: func(ctx context.Context, envelope terminal.Envelope) {
+				if envelope.Type != defaults.WebsocketSessionMetadata {
+					return
+				}
+
+				var sessResp siteSessionGenerateResponse
+				if err := json.Unmarshal([]byte(envelope.Payload), &sessResp); err != nil {
+					return
+				}
+
+				assert.NoError(t, ws.WriteControl(websocket.CloseMessage, nil, time.Now().Add(time.Second)))
+				close(wsClosedChan)
+			},
+		},
+	})
+	t.Cleanup(func() { require.NoError(t, stream.Close()) })
+
+	// Set a read deadline to unblock ReadAll below in the event of a bug
+	// preventing the ws from closing above.
+	require.NoError(t, stream.SetReadDeadline(time.Now().Add(30*time.Second)))
+
+	// Wait for the web socket to be closed above.
+	select {
+	case <-wsClosedChan:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for session metadata")
+	}
+
+	// Validate that the SSH connection is terminated in response to the WS closing.
+	require.Eventually(t, func() bool {
+		return s.node.ActiveConnections() == 0
+	}, 10*time.Second, 100*time.Millisecond)
+
+	// Validate that reading nothing was permitted.
+	out, err := io.ReadAll(stream)
+	require.NoError(t, err)
+	require.Empty(t, out)
+}
+
+func TestUnstartedServerShutdown(t *testing.T) {
+	t.Parallel()
+	s := newWebSuite(t)
+	srv, err := NewServer(ServerConfig{
+		Server:  &http.Server{},
+		Handler: s.webHandler,
+	})
+
+	require.NoError(t, err)
+
+	// Shutdown the server before starting it shouldn't panic.
+	require.NoError(t, srv.Shutdown(context.Background()))
+}
+
+func Test_setEntitlementsWithLegacyLogic(t *testing.T) {
+	tests := []struct {
+		name            string
+		config          *webclient.WebConfig
+		clusterFeatures authproto.Features
+		expected        *webclient.WebConfig
+	}{
+		{
+			name:   "sets entitlements",
+			config: &webclient.WebConfig{},
+			clusterFeatures: authproto.Features{
+				AccessControls: false,
+				AccessGraph:    false,
+				AccessList: &clientproto.AccessListFeature{
+					CreateLimit: 10,
+				},
+				AccessMonitoring: &clientproto.AccessMonitoringFeature{
+					Enabled:             false,
+					MaxReportRangeLimit: 20,
+				},
+				AccessMonitoringConfigured: false,
+				AccessRequests: &clientproto.AccessRequestsFeature{
+					MonthlyRequestLimit: 30,
+				},
+				AdvancedAccessWorkflows: false,
+				App:                     false,
+				Assist:                  false,
+				AutomaticUpgrades:       false,
+				Cloud:                   false,
+				CustomTheme:             "theme",
+				DB:                      false,
+				Desktop:                 false,
+				DeviceTrust: &clientproto.DeviceTrustFeature{
+					Enabled:           false,
+					DevicesUsageLimit: 40,
+				},
+				ExternalAuditStorage:   false,
+				FeatureHiding:          false,
+				HSM:                    false,
+				IdentityGovernance:     false,
+				IsStripeManaged:        false,
+				IsUsageBased:           false,
+				JoinActiveSessions:     false,
+				Kubernetes:             false,
+				MobileDeviceManagement: false,
+				OIDC:                   false,
+				Plugins:                false,
+				Policy:                 nil,
+				ProductType:            0,
+				Questionnaire:          false,
+				RecoveryCodes:          false,
+				SAML:                   false,
+				SupportType:            0,
+				// since present, becomes source of truth  for feature enablement
+				Entitlements: map[string]*authproto.EntitlementInfo{
+					string(entitlements.AccessLists):            {Enabled: true, Limit: 99},
+					string(entitlements.AccessMonitoring):       {Enabled: true, Limit: 99},
+					string(entitlements.AccessRequests):         {Enabled: true, Limit: 99},
+					string(entitlements.App):                    {Enabled: true, Limit: 99},
+					string(entitlements.CloudAuditLogRetention): {Enabled: true, Limit: 99},
+					string(entitlements.DB):                     {Enabled: true, Limit: 99},
+					string(entitlements.Desktop):                {Enabled: true, Limit: 99},
+					string(entitlements.DeviceTrust):            {Enabled: true, Limit: 99},
+					string(entitlements.ExternalAuditStorage):   {Enabled: true, Limit: 99},
+					string(entitlements.FeatureHiding):          {Enabled: true, Limit: 99},
+					string(entitlements.HSM):                    {Enabled: true, Limit: 99},
+					string(entitlements.Identity):               {Enabled: true, Limit: 99},
+					string(entitlements.JoinActiveSessions):     {Enabled: true, Limit: 99},
+					string(entitlements.K8s):                    {Enabled: true, Limit: 99},
+					string(entitlements.MobileDeviceManagement): {Enabled: true, Limit: 99},
+					string(entitlements.OIDC):                   {Enabled: true, Limit: 99},
+					string(entitlements.OktaSCIM):               {Enabled: true, Limit: 99},
+					string(entitlements.OktaUserSync):           {Enabled: true, Limit: 99},
+					string(entitlements.Policy):                 {Enabled: true, Limit: 99},
+					string(entitlements.SAML):                   {Enabled: true, Limit: 99},
+					string(entitlements.SessionLocks):           {Enabled: true, Limit: 99},
+					string(entitlements.UpsellAlert):            {Enabled: true, Limit: 99},
+					string(entitlements.UsageReporting):         {Enabled: true, Limit: 99},
+					string(entitlements.LicenseAutoUpdate):      {Enabled: true, Limit: 99},
+				},
+			},
+			expected: &webclient.WebConfig{
+				Auth:                           webclient.WebConfigAuthSettings{},
+				AutomaticUpgrades:              false,
+				AutomaticUpgradesTargetVersion: "",
+				CanJoinSessions:                false,
+				CustomTheme:                    "",
+				Edition:                        "",
+				IsCloud:                        false,
+				IsDashboard:                    false,
+				IsStripeManaged:                false,
+				IsTeam:                         false,
+				IsUsageBasedBilling:            false,
+				PlayableDatabaseProtocols:      nil,
+				PremiumSupport:                 false,
+				ProxyClusterName:               "",
+				Questionnaire:                  false,
+				RecoveryCodesEnabled:           false,
+				TunnelPublicAddress:            "",
+				UI:                             webclient.UIConfig{},
+				// set by the equivalent entitlement value
+				AccessRequests:           true,
+				ExternalAuditStorage:     true,
+				HideInaccessibleFeatures: true,
+				IsIGSEnabled:             true,
+				IsPolicyEnabled:          true,
+				JoinActiveSessions:       true,
+				MobileDeviceManagement:   true,
+				OIDC:                     true,
+				SAML:                     true,
+				TrustedDevices:           true,
+				FeatureLimits: webclient.FeatureLimits{
+					AccessListCreateLimit:               99,
+					AccessMonitoringMaxReportRangeLimit: 99,
+					AccessRequestMonthlyRequestLimit:    99,
+				},
+				Entitlements: map[string]webclient.EntitlementInfo{
+					string(entitlements.AccessLists):            {Enabled: true, Limit: 99},
+					string(entitlements.AccessMonitoring):       {Enabled: true, Limit: 99},
+					string(entitlements.AccessRequests):         {Enabled: true, Limit: 99},
+					string(entitlements.App):                    {Enabled: true, Limit: 99},
+					string(entitlements.CloudAuditLogRetention): {Enabled: true, Limit: 99},
+					string(entitlements.DB):                     {Enabled: true, Limit: 99},
+					string(entitlements.Desktop):                {Enabled: true, Limit: 99},
+					string(entitlements.DeviceTrust):            {Enabled: true, Limit: 99},
+					string(entitlements.ExternalAuditStorage):   {Enabled: true, Limit: 99},
+					string(entitlements.FeatureHiding):          {Enabled: true, Limit: 99},
+					string(entitlements.HSM):                    {Enabled: true, Limit: 99},
+					string(entitlements.Identity):               {Enabled: true, Limit: 99},
+					string(entitlements.JoinActiveSessions):     {Enabled: true, Limit: 99},
+					string(entitlements.K8s):                    {Enabled: true, Limit: 99},
+					string(entitlements.MobileDeviceManagement): {Enabled: true, Limit: 99},
+					string(entitlements.OIDC):                   {Enabled: true, Limit: 99},
+					string(entitlements.OktaSCIM):               {Enabled: true, Limit: 99},
+					string(entitlements.OktaUserSync):           {Enabled: true, Limit: 99},
+					string(entitlements.Policy):                 {Enabled: true, Limit: 99},
+					string(entitlements.SAML):                   {Enabled: true, Limit: 99},
+					string(entitlements.SessionLocks):           {Enabled: true, Limit: 99},
+					string(entitlements.UpsellAlert):            {Enabled: true, Limit: 99},
+					string(entitlements.UsageReporting):         {Enabled: true, Limit: 99},
+					string(entitlements.LicenseAutoUpdate):      {Enabled: true, Limit: 99},
+				},
+			},
+		},
+		{
+			name:   "sets legacy features when no entitlements are present (Identity true)",
+			config: &webclient.WebConfig{},
+			clusterFeatures: authproto.Features{
+				AccessControls:             false,
+				AccessGraph:                false,
+				AccessMonitoringConfigured: false,
+				AdvancedAccessWorkflows:    false,
+				App:                        false,
+				Assist:                     false,
+				AutomaticUpgrades:          false,
+				Cloud:                      false,
+				CustomTheme:                "",
+				DB:                         false,
+				Desktop:                    false,
+				HSM:                        false,
+				IsStripeManaged:            false,
+				IsUsageBased:               false,
+				Kubernetes:                 false,
+				Plugins:                    false,
+				ProductType:                0,
+				Questionnaire:              false,
+				RecoveryCodes:              false,
+				SupportType:                0,
+				// not present
+				Entitlements: nil,
+				// will set equivalent entitlement values
+				ExternalAuditStorage:   true,
+				FeatureHiding:          true,
+				IdentityGovernance:     true,
+				JoinActiveSessions:     true,
+				MobileDeviceManagement: true,
+				OIDC:                   true,
+				SAML:                   true,
+				AccessRequests: &clientproto.AccessRequestsFeature{
+					MonthlyRequestLimit: 88,
+				},
+				AccessList: &clientproto.AccessListFeature{
+					CreateLimit: 88,
+				},
+				AccessMonitoring: &clientproto.AccessMonitoringFeature{
+					Enabled:             true,
+					MaxReportRangeLimit: 88,
+				},
+				DeviceTrust: &clientproto.DeviceTrustFeature{
+					Enabled:           true,
+					DevicesUsageLimit: 88,
+				},
+				Policy: &clientproto.PolicyFeature{
+					Enabled: true,
+				},
+			},
+			expected: &webclient.WebConfig{
+				Auth:                           webclient.WebConfigAuthSettings{},
+				AutomaticUpgrades:              false,
+				AutomaticUpgradesTargetVersion: "",
+				CanJoinSessions:                false,
+				CustomTheme:                    "",
+				Edition:                        "",
+				IsCloud:                        false,
+				IsDashboard:                    false,
+				IsStripeManaged:                false,
+				IsTeam:                         false,
+				IsUsageBasedBilling:            false,
+				PlayableDatabaseProtocols:      nil,
+				PremiumSupport:                 false,
+				ProxyClusterName:               "",
+				Questionnaire:                  false,
+				RecoveryCodesEnabled:           false,
+				TunnelPublicAddress:            "",
+				UI:                             webclient.UIConfig{},
+				// set to legacy feature
+				AccessRequests:           true,
+				ExternalAuditStorage:     true,
+				HideInaccessibleFeatures: true,
+				IsIGSEnabled:             true,
+				IsPolicyEnabled:          true,
+				JoinActiveSessions:       true,
+				MobileDeviceManagement:   true,
+				OIDC:                     true,
+				SAML:                     true,
+				TrustedDevices:           true,
+				FeatureLimits: webclient.FeatureLimits{
+					AccessListCreateLimit:               88,
+					AccessMonitoringMaxReportRangeLimit: 88,
+					AccessRequestMonthlyRequestLimit:    88,
+				},
+				Entitlements: map[string]webclient.EntitlementInfo{
+					// no equivalent legacy feature; defaults to false
+					string(entitlements.App):                    {Enabled: false},
+					string(entitlements.CloudAuditLogRetention): {Enabled: false},
+					string(entitlements.DB):                     {Enabled: false},
+					string(entitlements.Desktop):                {Enabled: false},
+					string(entitlements.HSM):                    {Enabled: false},
+					string(entitlements.K8s):                    {Enabled: false},
+					string(entitlements.UpsellAlert):            {Enabled: false},
+					string(entitlements.UsageReporting):         {Enabled: false},
+					string(entitlements.LicenseAutoUpdate):      {Enabled: false},
+
+					// set to equivalent legacy feature
+					string(entitlements.ExternalAuditStorage):   {Enabled: true},
+					string(entitlements.FeatureHiding):          {Enabled: true},
+					string(entitlements.Identity):               {Enabled: true},
+					string(entitlements.JoinActiveSessions):     {Enabled: true},
+					string(entitlements.MobileDeviceManagement): {Enabled: true},
+					string(entitlements.OIDC):                   {Enabled: true},
+					string(entitlements.Policy):                 {Enabled: true},
+					string(entitlements.SAML):                   {Enabled: true},
+					// set to legacy feature "IsIGSEnabled"; true so set true and clear limits
+					string(entitlements.AccessLists):      {Enabled: true},
+					string(entitlements.AccessMonitoring): {Enabled: true},
+					string(entitlements.AccessRequests):   {Enabled: true},
+					string(entitlements.DeviceTrust):      {Enabled: true},
+					string(entitlements.OktaSCIM):         {Enabled: true},
+					string(entitlements.OktaUserSync):     {Enabled: true},
+					string(entitlements.SessionLocks):     {Enabled: true},
+				},
+			},
+		},
+		{
+			name:   "sets legacy features when no entitlements are present (Identity false)",
+			config: &webclient.WebConfig{},
+			clusterFeatures: authproto.Features{
+				AccessControls:             false,
+				AccessGraph:                false,
+				AccessMonitoringConfigured: false,
+				AdvancedAccessWorkflows:    false,
+				App:                        false,
+				Assist:                     false,
+				AutomaticUpgrades:          false,
+				Cloud:                      false,
+				CustomTheme:                "",
+				DB:                         false,
+				Desktop:                    false,
+				HSM:                        false,
+				IsStripeManaged:            false,
+				IsUsageBased:               false,
+				Kubernetes:                 false,
+				Plugins:                    false,
+				ProductType:                0,
+				Questionnaire:              false,
+				RecoveryCodes:              false,
+				SupportType:                0,
+				// not present
+				Entitlements: nil,
+				// will set equivalent entitlement values
+				ExternalAuditStorage:   true,
+				FeatureHiding:          true,
+				IdentityGovernance:     false,
+				JoinActiveSessions:     true,
+				MobileDeviceManagement: true,
+				OIDC:                   true,
+				SAML:                   true,
+				AccessRequests: &clientproto.AccessRequestsFeature{
+					MonthlyRequestLimit: 88,
+				},
+				AccessList: &clientproto.AccessListFeature{
+					CreateLimit: 88,
+				},
+				AccessMonitoring: &clientproto.AccessMonitoringFeature{
+					Enabled:             true,
+					MaxReportRangeLimit: 88,
+				},
+				DeviceTrust: &clientproto.DeviceTrustFeature{
+					Enabled:           true,
+					DevicesUsageLimit: 88,
+				},
+				Policy: &clientproto.PolicyFeature{
+					Enabled: true,
+				},
+			},
+			expected: &webclient.WebConfig{
+				Auth:                           webclient.WebConfigAuthSettings{},
+				AutomaticUpgrades:              false,
+				AutomaticUpgradesTargetVersion: "",
+				CanJoinSessions:                false,
+				CustomTheme:                    "",
+				Edition:                        "",
+				IsCloud:                        false,
+				IsDashboard:                    false,
+				IsStripeManaged:                false,
+				IsTeam:                         false,
+				IsUsageBasedBilling:            false,
+				PlayableDatabaseProtocols:      nil,
+				PremiumSupport:                 false,
+				ProxyClusterName:               "",
+				Questionnaire:                  false,
+				RecoveryCodesEnabled:           false,
+				TunnelPublicAddress:            "",
+				UI:                             webclient.UIConfig{},
+				// set to legacy feature
+				AccessRequests:           true,
+				ExternalAuditStorage:     true,
+				HideInaccessibleFeatures: true,
+				IsIGSEnabled:             false,
+				IsPolicyEnabled:          true,
+				JoinActiveSessions:       true,
+				MobileDeviceManagement:   true,
+				OIDC:                     true,
+				SAML:                     true,
+				TrustedDevices:           true,
+				FeatureLimits: webclient.FeatureLimits{
+					AccessListCreateLimit:               88,
+					AccessMonitoringMaxReportRangeLimit: 88,
+					AccessRequestMonthlyRequestLimit:    88,
+				},
+				Entitlements: map[string]webclient.EntitlementInfo{
+					// no equivalent legacy feature; defaults to false
+					string(entitlements.App):                    {Enabled: false},
+					string(entitlements.CloudAuditLogRetention): {Enabled: false},
+					string(entitlements.DB):                     {Enabled: false},
+					string(entitlements.Desktop):                {Enabled: false},
+					string(entitlements.HSM):                    {Enabled: false},
+					string(entitlements.K8s):                    {Enabled: false},
+					string(entitlements.UpsellAlert):            {Enabled: false},
+					string(entitlements.UsageReporting):         {Enabled: false},
+
+					// set to equivalent legacy feature
+					string(entitlements.ExternalAuditStorage):   {Enabled: true},
+					string(entitlements.FeatureHiding):          {Enabled: true},
+					string(entitlements.Identity):               {Enabled: false},
+					string(entitlements.JoinActiveSessions):     {Enabled: true},
+					string(entitlements.MobileDeviceManagement): {Enabled: true},
+					string(entitlements.OIDC):                   {Enabled: true},
+					string(entitlements.Policy):                 {Enabled: true},
+					string(entitlements.SAML):                   {Enabled: true},
+					// set to legacy feature "IsIGSEnabled"; false so set value and keep limits
+					string(entitlements.AccessLists):       {Enabled: true, Limit: 88},
+					string(entitlements.AccessMonitoring):  {Enabled: true, Limit: 88},
+					string(entitlements.AccessRequests):    {Enabled: true, Limit: 88},
+					string(entitlements.DeviceTrust):       {Enabled: true, Limit: 88},
+					string(entitlements.OktaSCIM):          {Enabled: false},
+					string(entitlements.OktaUserSync):      {Enabled: false},
+					string(entitlements.SessionLocks):      {Enabled: false},
+					string(entitlements.LicenseAutoUpdate): {Enabled: false},
+				},
+			},
+		},
+		{
+			name: "retains non-feature field values",
+			config: &webclient.WebConfig{
+				Auth: webclient.WebConfigAuthSettings{
+					LocalAuthEnabled:  true,
+					AllowPasswordless: true,
+					MOTD:              "some-message",
+				},
+				PlayableDatabaseProtocols: []string{"play-able"},
+				UI: webclient.UIConfig{
+					ScrollbackLines: 10,
+					ShowResources:   "foo",
+				},
+				Edition:                        "edition",
+				TunnelPublicAddress:            "0000",
+				AutomaticUpgradesTargetVersion: "99",
+				CustomTheme:                    "theme",
+				CanJoinSessions:                true,
+				IsCloud:                        true,
+				RecoveryCodesEnabled:           true,
+				IsDashboard:                    true,
+				IsUsageBasedBilling:            true,
+				AutomaticUpgrades:              true,
+				Questionnaire:                  true,
+				IsStripeManaged:                true,
+				PremiumSupport:                 true,
+			},
+			clusterFeatures: authproto.Features{
+				DeviceTrust:      &clientproto.DeviceTrustFeature{},
+				AccessRequests:   &clientproto.AccessRequestsFeature{},
+				AccessList:       &clientproto.AccessListFeature{},
+				AccessMonitoring: &clientproto.AccessMonitoringFeature{},
+				Policy:           &clientproto.PolicyFeature{},
+			},
+			expected: &webclient.WebConfig{
+				Auth: webclient.WebConfigAuthSettings{
+					LocalAuthEnabled:  true,
+					AllowPasswordless: true,
+					MOTD:              "some-message",
+				},
+				PlayableDatabaseProtocols: []string{"play-able"},
+				UI: webclient.UIConfig{
+					ScrollbackLines: 10,
+					ShowResources:   "foo",
+				},
+				Edition:                        "edition",
+				TunnelPublicAddress:            "0000",
+				AutomaticUpgradesTargetVersion: "99",
+				CustomTheme:                    "theme",
+				CanJoinSessions:                true,
+				IsCloud:                        true,
+				RecoveryCodesEnabled:           true,
+				IsDashboard:                    true,
+				IsUsageBasedBilling:            true,
+				AutomaticUpgrades:              true,
+				Questionnaire:                  true,
+				IsStripeManaged:                true,
+				PremiumSupport:                 true,
+				// Default; not under test
+				ProxyClusterName:         "",
+				FeatureLimits:            webclient.FeatureLimits{},
+				IsTeam:                   false,
+				HideInaccessibleFeatures: false,
+				IsIGSEnabled:             false,
+				IsPolicyEnabled:          false,
+				ExternalAuditStorage:     false,
+				JoinActiveSessions:       false,
+				AccessRequests:           false,
+				TrustedDevices:           false,
+				OIDC:                     false,
+				SAML:                     false,
+				MobileDeviceManagement:   false,
+				Entitlements: map[string]webclient.EntitlementInfo{
+					string(entitlements.AccessLists):            {Enabled: true}, // AccessLists had no previous behavior from an enablement perspective; so we default to true
+					string(entitlements.AccessMonitoring):       {Enabled: false},
+					string(entitlements.AccessRequests):         {Enabled: false},
+					string(entitlements.App):                    {Enabled: false},
+					string(entitlements.CloudAuditLogRetention): {Enabled: false},
+					string(entitlements.DB):                     {Enabled: false},
+					string(entitlements.Desktop):                {Enabled: false},
+					string(entitlements.DeviceTrust):            {Enabled: false},
+					string(entitlements.ExternalAuditStorage):   {Enabled: false},
+					string(entitlements.FeatureHiding):          {Enabled: false},
+					string(entitlements.HSM):                    {Enabled: false},
+					string(entitlements.Identity):               {Enabled: false},
+					string(entitlements.JoinActiveSessions):     {Enabled: false},
+					string(entitlements.K8s):                    {Enabled: false},
+					string(entitlements.MobileDeviceManagement): {Enabled: false},
+					string(entitlements.OIDC):                   {Enabled: false},
+					string(entitlements.OktaSCIM):               {Enabled: false},
+					string(entitlements.OktaUserSync):           {Enabled: false},
+					string(entitlements.Policy):                 {Enabled: false},
+					string(entitlements.SAML):                   {Enabled: false},
+					string(entitlements.SessionLocks):           {Enabled: false},
+					string(entitlements.UpsellAlert):            {Enabled: false},
+					string(entitlements.UsageReporting):         {Enabled: false},
+					string(entitlements.LicenseAutoUpdate):      {Enabled: false},
+				},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			setEntitlementsWithLegacyLogic(tt.config, tt.clusterFeatures)
+
+			assert.Equal(t, tt.expected, tt.config)
+		})
+	}
 }

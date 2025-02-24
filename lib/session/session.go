@@ -1,18 +1,20 @@
 /*
-Copyright 2015-2018 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 // Package session is used for bookkeeping of SSH interactive sessions
 // that happen in realtime across the teleport cluster
@@ -52,23 +54,27 @@ func (s *ID) Check() error {
 
 // ParseID parses ID and checks if it's correct.
 func ParseID(id string) (*ID, error) {
-	_, err := uuid.Parse(id)
+	parsed, err := uuid.Parse(id)
 	if err != nil {
-		return nil, trace.BadParameter("%v not a valid UUID", id)
+		return nil, trace.BadParameter("%v is not a valid UUID", id)
 	}
-	uid := ID(id)
+	// use the parsed UUID to build the ID instead of the string that
+	// was passed in. id is user controlled and uuid.Parse accepts
+	// several UUID formats that are not supported correctly across
+	// Teleport. (uuid.UUID).String always uses the same format that
+	// is supported by Teleport everywhere, so use that.
+	uid := ID(parsed.String())
 	return &uid, nil
 }
 
 // NewID returns new session ID. The session ID is based on UUIDv4.
 func NewID() ID {
-	return ID(uuid.New().String())
+	return ID(uuid.NewString())
 }
 
-// Session is an interactive collaboration session that represents one
-// or many sessions started by the teleport user.
+// Session is a session of any kind (SSH, Kubernetes, Desktop, etc)
 type Session struct {
-	// Kind describes what kind of session this is e.g. ssh or kubernetes.
+	// Kind describes what kind of session this is e.g. ssh or k8s.
 	Kind types.SessionKind `json:"kind"`
 	// ID is a unique session identifier
 	ID ID `json:"id"`
@@ -104,6 +110,34 @@ type Session struct {
 	DatabaseName string `json:"database_name"`
 	// AppName is the name of the app being accessed.
 	AppName string `json:"app_name"`
+	// Owner is the name of the session owner, ie the one who created the session.
+	Owner string `json:"owner"`
+	// Moderated is true if the session requires moderation (only relevant for Kind = ssh/k8s).
+	Moderated bool `json:"moderated"`
+	// Command is the command that was executed to start the session.
+	Command string `json:"command"`
+}
+
+// FileTransferRequestParams contain parameters for requesting a file transfer
+type FileTransferRequestParams struct {
+	// Download is true if the request is a download, false if it is an upload
+	Download bool `json:"direction"`
+	// Location is location of file to download, or where to put an upload
+	Location string `json:"location"`
+	// Filename is the name of the file to be uploaded
+	Filename string `json:"filename"`
+	// Requester is the authenticated Teleport user who requested the file transfer
+	Requester string `json:"requester"`
+	// Approvers is a list of teleport users who have approved the file transfer request
+	Approvers []Party `json:"approvers"`
+}
+
+// FileTransferDecisionParams contains parameters for approving or denying a file transfer request
+type FileTransferDecisionParams struct {
+	// RequestID is the ID of the request being responded to
+	RequestID string `json:"requestId"`
+	// Approved is true if the response approves a file transfer request
+	Approved bool `json:"approved"`
 }
 
 // Participants returns the usernames of the current session participants.
@@ -115,7 +149,7 @@ func (s *Session) Participants() []string {
 	return participants
 }
 
-// RemoveParty helper allows to remove a party by it's ID from the
+// RemoveParty helper allows to remove a party by its ID from the
 // session's list. Returns 'false' if pid couldn't be found
 func (s *Session) RemoveParty(pid ID) bool {
 	for i := range s.Parties {
@@ -218,7 +252,7 @@ func NewTerminalParamsFromUint32(w uint32, h uint32) (*TerminalParams, error) {
 // NewTerminalParamsFromInt returns new terminal parameters from int width and height
 func NewTerminalParamsFromInt(w int, h int) (*TerminalParams, error) {
 	if w > maxSize || w < minSize {
-		return nil, trace.BadParameter("bad witdth")
+		return nil, trace.BadParameter("bad width")
 	}
 	if h > maxSize || h < minSize {
 		return nil, trace.BadParameter("bad height")

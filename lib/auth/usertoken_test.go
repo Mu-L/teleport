@@ -1,18 +1,20 @@
 /*
-Copyright 2020 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package auth
 
@@ -20,7 +22,7 @@ import (
 	"context"
 	"encoding/base32"
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 	"testing"
 	"time"
 
@@ -34,7 +36,8 @@ import (
 	"github.com/gravitational/teleport/api/constants"
 	"github.com/gravitational/teleport/api/types"
 	apievents "github.com/gravitational/teleport/api/types/events"
-	"github.com/gravitational/teleport/api/types/webauthn"
+	wanpb "github.com/gravitational/teleport/api/types/webauthn"
+	"github.com/gravitational/teleport/lib/auth/authclient"
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/events"
 	"github.com/gravitational/teleport/lib/events/eventstest"
@@ -44,7 +47,7 @@ import (
 func TestCreateResetPasswordToken(t *testing.T) {
 	t.Parallel()
 	srv := newTestTLSServer(t)
-	mockEmitter := &eventstest.MockEmitter{}
+	mockEmitter := &eventstest.MockRecorderEmitter{}
 	srv.Auth().emitter = mockEmitter
 
 	// Configure cluster and user for MFA, registering various devices.
@@ -53,7 +56,7 @@ func TestCreateResetPasswordToken(t *testing.T) {
 	pass := mfa.Password
 
 	ctx := context.Background()
-	req := CreateUserTokenRequest{
+	req := authclient.CreateUserTokenRequest{
 		Name: username,
 		TTL:  time.Hour,
 	}
@@ -64,9 +67,9 @@ func TestCreateResetPasswordToken(t *testing.T) {
 	require.Equal(t, token.GetURL(), "https://<proxyhost>:3080/web/reset/"+token.GetName())
 
 	event := mockEmitter.LastEvent()
-	require.Equal(t, event.GetType(), events.ResetPasswordTokenCreateEvent)
-	require.Equal(t, event.(*apievents.UserTokenCreate).Name, username)
-	require.Equal(t, event.(*apievents.UserTokenCreate).User, teleport.UserSystem)
+	require.Equal(t, events.ResetPasswordTokenCreateEvent, event.GetType())
+	require.Equal(t, username, event.(*apievents.UserTokenCreate).Name)
+	require.Equal(t, teleport.UserSystem, event.(*apievents.UserTokenCreate).User)
 
 	// verify that user has no MFA devices
 	devs, err := srv.Auth().Services.GetMFADevices(ctx, username, false)
@@ -74,7 +77,7 @@ func TestCreateResetPasswordToken(t *testing.T) {
 	require.Empty(t, devs)
 
 	// verify that password was reset
-	err = srv.Auth().checkPasswordWOToken(username, []byte(pass))
+	err = srv.Auth().checkPasswordWOToken(ctx, username, []byte(pass))
 	require.Error(t, err)
 
 	// create another reset token for the same user
@@ -91,57 +94,58 @@ func TestCreateResetPasswordToken(t *testing.T) {
 func TestCreateResetPasswordTokenErrors(t *testing.T) {
 	t.Parallel()
 	srv := newTestTLSServer(t)
+	ctx := context.Background()
 
 	username := "joe@example.com"
-	_, _, err := CreateUserAndRole(srv.Auth(), username, []string{username})
+	_, _, err := CreateUserAndRole(srv.Auth(), username, []string{username}, nil)
 	require.NoError(t, err)
 
 	type testCase struct {
 		desc string
-		req  CreateUserTokenRequest
+		req  authclient.CreateUserTokenRequest
 	}
 
 	testCases := []testCase{
 		{
 			desc: "Reset Password: TTL < 0",
-			req: CreateUserTokenRequest{
+			req: authclient.CreateUserTokenRequest{
 				Name: username,
 				TTL:  -1,
 			},
 		},
 		{
 			desc: "Reset Password: TTL > max",
-			req: CreateUserTokenRequest{
+			req: authclient.CreateUserTokenRequest{
 				Name: username,
 				TTL:  defaults.MaxChangePasswordTokenTTL + time.Hour,
 			},
 		},
 		{
 			desc: "Reset Password: empty user name",
-			req: CreateUserTokenRequest{
+			req: authclient.CreateUserTokenRequest{
 				TTL: time.Hour,
 			},
 		},
 		{
 			desc: "Reset Password: user does not exist",
-			req: CreateUserTokenRequest{
+			req: authclient.CreateUserTokenRequest{
 				Name: "doesnotexist@example.com",
 				TTL:  time.Hour,
 			},
 		},
 		{
 			desc: "Invite: TTL > max",
-			req: CreateUserTokenRequest{
+			req: authclient.CreateUserTokenRequest{
 				Name: username,
 				TTL:  defaults.MaxSignupTokenTTL + time.Hour,
-				Type: UserTokenTypeResetPasswordInvite,
+				Type: authclient.UserTokenTypeResetPasswordInvite,
 			},
 		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.desc, func(t *testing.T) {
-			_, err := srv.Auth().CreateResetPasswordToken(context.TODO(), tc.req)
+			_, err := srv.Auth().CreateResetPasswordToken(ctx, tc.req)
 			require.Error(t, err)
 		})
 	}
@@ -172,8 +176,8 @@ func TestFormatAccountName(t *testing.T) {
 				proxies: []types.Server{
 					&types.ServerV2{
 						Spec: types.ServerSpecV2{
-							PublicAddr: "foo",
-							Version:    "bar",
+							PublicAddrs: []string{"foo"},
+							Version:     "bar",
 						},
 					},
 				},
@@ -225,12 +229,12 @@ func TestUserTokenSecretsCreationSettings(t *testing.T) {
 	srv := newTestTLSServer(t)
 
 	username := "joe@example.com"
-	_, _, err := CreateUserAndRole(srv.Auth(), username, []string{username})
+	_, _, err := CreateUserAndRole(srv.Auth(), username, []string{username}, nil)
 	require.NoError(t, err)
 
 	ctx := context.Background()
 
-	req := CreateUserTokenRequest{
+	req := authclient.CreateUserTokenRequest{
 		Name: username,
 		TTL:  time.Hour,
 	}
@@ -259,13 +263,13 @@ func TestUserTokenCreationSettings(t *testing.T) {
 	srv := newTestTLSServer(t)
 
 	username := "joe@example.com"
-	_, _, err := CreateUserAndRole(srv.Auth(), username, []string{username})
+	_, _, err := CreateUserAndRole(srv.Auth(), username, []string{username}, nil)
 	require.NoError(t, err)
 
-	req := CreateUserTokenRequest{
+	req := authclient.CreateUserTokenRequest{
 		Name: username,
 		TTL:  time.Hour,
-		Type: UserTokenTypeResetPasswordInvite,
+		Type: authclient.UserTokenTypeResetPasswordInvite,
 	}
 
 	token, err := srv.Auth().newUserToken(req)
@@ -280,8 +284,8 @@ func TestUserTokenCreationSettings(t *testing.T) {
 func TestCreatePrivilegeToken(t *testing.T) {
 	t.Parallel()
 	srv := newTestTLSServer(t)
-	fakeClock := srv.Clock().(clockwork.FakeClock)
-	mockEmitter := &eventstest.MockEmitter{}
+	fakeClock := srv.Clock().(*clockwork.FakeClock)
+	mockEmitter := &eventstest.MockRecorderEmitter{}
 	srv.Auth().emitter = mockEmitter
 	ctx := context.Background()
 
@@ -302,7 +306,7 @@ func TestCreatePrivilegeToken(t *testing.T) {
 		SecondFactor: constants.SecondFactorOTP,
 	})
 	require.NoError(t, err)
-	err = srv.Auth().SetAuthPreference(ctx, ap)
+	_, err = srv.Auth().UpsertAuthPreference(ctx, ap)
 	require.NoError(t, err)
 
 	tests := []struct {
@@ -312,14 +316,14 @@ func TestCreatePrivilegeToken(t *testing.T) {
 	}{
 		{
 			name:      "privilege exception token",
-			tokenType: UserTokenTypePrivilegeException,
+			tokenType: authclient.UserTokenTypePrivilegeException,
 			getReq: func() *proto.CreatePrivilegeTokenRequest {
 				return &proto.CreatePrivilegeTokenRequest{}
 			},
 		},
 		{
 			name:      "privilege token",
-			tokenType: UserTokenTypePrivilege,
+			tokenType: authclient.UserTokenTypePrivilege,
 			getReq: func() *proto.CreatePrivilegeTokenRequest {
 				// Upsert a TOTP device to authn with.
 				otpSecret := base32.StdEncoding.EncodeToString([]byte("def456"))
@@ -350,10 +354,10 @@ func TestCreatePrivilegeToken(t *testing.T) {
 
 			// Test events emitted.
 			event := mockEmitter.LastEvent()
-			require.Equal(t, event.GetType(), events.PrivilegeTokenCreateEvent)
-			require.Equal(t, event.GetCode(), events.PrivilegeTokenCreateCode)
-			require.Equal(t, event.(*apievents.UserTokenCreate).Name, username)
-			require.Equal(t, event.(*apievents.UserTokenCreate).User, username)
+			require.Equal(t, events.PrivilegeTokenCreateEvent, event.GetType())
+			require.Equal(t, events.PrivilegeTokenCreateCode, event.GetCode())
+			require.Equal(t, username, event.(*apievents.UserTokenCreate).Name)
+			require.Equal(t, username, event.(*apievents.UserTokenCreate).User)
 
 			// Test token expires after designated time.
 			fakeClock.Advance(defaults.PrivilegeTokenTTL)
@@ -377,7 +381,7 @@ func TestCreatePrivilegeToken_WithLock(t *testing.T) {
 		},
 	})
 	require.NoError(t, err)
-	err = srv.Auth().SetAuthPreference(ctx, ap)
+	_, err = srv.Auth().UpsertAuthPreference(ctx, ap)
 	require.NoError(t, err)
 
 	tests := []struct {
@@ -399,7 +403,7 @@ func TestCreatePrivilegeToken_WithLock(t *testing.T) {
 			getReq: func() *proto.CreatePrivilegeTokenRequest {
 				return &proto.CreatePrivilegeTokenRequest{
 					ExistingMFAResponse: &proto.MFAAuthenticateResponse{Response: &proto.MFAAuthenticateResponse_Webauthn{
-						Webauthn: &webauthn.CredentialAssertionResponse{},
+						Webauthn: &wanpb.CredentialAssertionResponse{},
 					}},
 				}
 			},
@@ -425,14 +429,14 @@ func TestCreatePrivilegeToken_WithLock(t *testing.T) {
 
 				// Test last attempt returns locked error.
 				if i == defaults.MaxLoginAttempts {
-					require.Equal(t, err.Error(), MaxFailedAttemptsErrMsg)
+					require.Equal(t, MaxFailedAttemptsErrMsg, err.Error())
 				} else {
-					require.NotEqual(t, err.Error(), MaxFailedAttemptsErrMsg)
+					require.NotEqual(t, MaxFailedAttemptsErrMsg, err.Error())
 				}
 			}
 
 			// Test user is locked.
-			user, err := srv.Auth().GetUser(username, false)
+			user, err := srv.Auth().GetUser(ctx, username, false)
 			require.NoError(t, err)
 			require.True(t, user.GetStatus().IsLocked)
 			require.False(t, user.GetStatus().LockExpires.IsZero())

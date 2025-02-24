@@ -1,24 +1,25 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-	http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package githubactions
 
 import (
-	"github.com/gravitational/trace"
-	"github.com/mitchellh/mapstructure"
+	workloadidentityv1pb "github.com/gravitational/teleport/api/gen/proto/go/teleport/workloadidentity/v1"
 )
 
 // GitHub Workload Identity
@@ -40,8 +41,13 @@ import (
 // Valuable reference:
 // - https://github.com/actions/toolkit/blob/main/packages/core/src/oidc-utils.ts
 // - https://docs.github.com/en/actions/deployment/security-hardening-your-deployments/configuring-openid-connect-in-cloud-providers
+//
+// The GitHub Issuer's well-known OIDC document is at
+// https://token.actions.githubusercontent.com/.well-known/openid-configuration
+// For GitHub Enterprise Servers, this will be at
+// https://$HOSTNAME/_services/token/.well-known/openid-configuration
 
-const IssuerURL = "https://token.actions.githubusercontent.com"
+const DefaultIssuerHost = "token.actions.githubusercontent.com"
 
 // IDTokenClaims is the structure of claims contained within a Github issued
 // ID token.
@@ -94,20 +100,23 @@ type IDTokenClaims struct {
 	Workflow string `json:"workflow"`
 }
 
-// JoinAuditAttributes returns a series of attributes that can be inserted into
-// audit events related to a specific join.
-func (c *IDTokenClaims) JoinAuditAttributes() (map[string]interface{}, error) {
-	res := map[string]interface{}{}
-	d, err := mapstructure.NewDecoder(&mapstructure.DecoderConfig{
-		TagName: "json",
-		Result:  &res,
-	})
-	if err != nil {
-		return nil, trace.Wrap(err)
+// JoinAttrs returns the protobuf representation of the attested identity.
+// This is used for auditing and for evaluation of WorkloadIdentity rules and
+// templating.
+func (c *IDTokenClaims) JoinAttrs() *workloadidentityv1pb.JoinAttrsGitHub {
+	attrs := &workloadidentityv1pb.JoinAttrsGitHub{
+		Sub:             c.Sub,
+		Actor:           c.Actor,
+		Environment:     c.Environment,
+		Ref:             c.Ref,
+		RefType:         c.RefType,
+		Repository:      c.Repository,
+		RepositoryOwner: c.RepositoryOwner,
+		Workflow:        c.Workflow,
+		EventName:       c.EventName,
+		Sha:             c.SHA,
+		RunId:           c.RunID,
 	}
 
-	if err := d.Decode(c); err != nil {
-		return nil, trace.Wrap(err)
-	}
-	return res, nil
+	return attrs
 }

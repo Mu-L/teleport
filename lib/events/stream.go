@@ -1,18 +1,20 @@
 /*
-Copyright 2020 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package events
 
@@ -22,16 +24,15 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"log/slog"
 	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
-	log "github.com/sirupsen/logrus"
 
 	apievents "github.com/gravitational/teleport/api/types/events"
 	"github.com/gravitational/teleport/api/utils/retryutils"
@@ -54,16 +55,9 @@ const (
 	// MaxProtoMessageSizeBytes is maximum protobuf marshaled message size
 	MaxProtoMessageSizeBytes = 64 * 1024
 
-	// MaxUploadParts is the maximum allowed number of parts in a multi-part upload
-	// on Amazon S3.
-	MaxUploadParts = 10000
-
 	// MinUploadPartSizeBytes is the minimum allowed part size when uploading a part to
 	// Amazon S3.
 	MinUploadPartSizeBytes = 1024 * 1024 * 5
-
-	// ReservedParts is the amount of parts reserved by default
-	ReservedParts = 100
 
 	// ProtoStreamV1 is a version of the binary protocol
 	ProtoStreamV1 = 1
@@ -92,6 +86,10 @@ type ProtoStreamerConfig struct {
 	MinUploadBytes int64
 	// ConcurrentUploads sets concurrent uploads per stream
 	ConcurrentUploads int
+	// ForceFlush is used in tests to force a flush of an in-progress slice. Note that
+	// sending on this channel just forces a single flush for whichever upload happens
+	// to receive the signal first, so this may not be suitable for concurrent tests.
+	ForceFlush chan struct{}
 }
 
 // CheckAndSetDefaults checks and sets streamer defaults
@@ -140,6 +138,7 @@ func (s *ProtoStreamer) CreateAuditStreamForUpload(ctx context.Context, sid sess
 		Uploader:          s.cfg.Uploader,
 		MinUploadBytes:    s.cfg.MinUploadBytes,
 		ConcurrentUploads: s.cfg.ConcurrentUploads,
+		ForceFlush:        s.cfg.ForceFlush,
 	})
 }
 
@@ -190,6 +189,10 @@ type ProtoStreamConfig struct {
 	// after which streamer flushes the data to the uploader
 	// to avoid data loss
 	InactivityFlushPeriod time.Duration
+	// ForceFlush is used in tests to force a flush of an in-progress slice. Note that
+	// sending on this channel just forces a single flush for whichever upload happens
+	// to receive the signal first, so this may not be suitable for concurrent tests.
+	ForceFlush chan struct{}
 	// Clock is used to override time in tests
 	Clock clockwork.Clock
 	// ConcurrentUploads sets concurrent uploads per stream
@@ -314,7 +317,7 @@ func NewProtoStream(cfg ProtoStreamConfig) (*ProtoStream, error) {
 	// Start writer events receiver.
 	go func() {
 		if err := writer.receiveAndUpload(); err != nil {
-			log.WithError(err).Debug("slice writer ended with error")
+			slog.DebugContext(cancelCtx, "slice writer ended with error", "error", err)
 			stream.setCancelError(err)
 		}
 
@@ -384,16 +387,20 @@ func (s *ProtoStream) Done() <-chan struct{} {
 	return s.cancelCtx.Done()
 }
 
-// EmitAuditEvent emits a single audit event to the stream
-func (s *ProtoStream) EmitAuditEvent(ctx context.Context, event apievents.AuditEvent) error {
+// RecordEvent emits a single audit event to the stream
+func (s *ProtoStream) RecordEvent(ctx context.Context, pe apievents.PreparedSessionEvent) error {
+	event := pe.GetAuditEvent()
+	messageSize := event.Size()
+	if messageSize > MaxProtoMessageSizeBytes {
+		event = event.TrimToMaxSize(MaxProtoMessageSizeBytes)
+		if event.Size() > MaxProtoMessageSizeBytes {
+			return trace.BadParameter("record size %v exceeds max message size of %v bytes", messageSize, MaxProtoMessageSizeBytes)
+		}
+	}
+
 	oneof, err := apievents.ToOneOf(event)
 	if err != nil {
 		return trace.Wrap(err)
-	}
-
-	messageSize := oneof.Size()
-	if messageSize > MaxProtoMessageSizeBytes {
-		return trace.BadParameter("record size %v exceeds max message size of %v bytes", messageSize, MaxProtoMessageSizeBytes)
 	}
 
 	start := time.Now()
@@ -401,7 +408,7 @@ func (s *ProtoStream) EmitAuditEvent(ctx context.Context, event apievents.AuditE
 	case s.eventsCh <- protoEvent{index: event.GetIndex(), oneof: oneof}:
 		diff := time.Since(start)
 		if diff > 100*time.Millisecond {
-			log.Debugf("[SLOW] EmitAuditEvent took %v.", diff)
+			slog.DebugContext(ctx, "[SLOW] RecordEvent took", "duration", diff)
 		}
 		return nil
 	case <-s.cancelCtx.Done():
@@ -519,7 +526,7 @@ func (w *sliceWriter) receiveAndUpload() error {
 			return nil
 		case <-w.proto.completeCtx.Done():
 			// if present, send remaining data for upload
-			if w.current != nil {
+			if w.current != nil && !w.current.isEmpty() {
 				// mark that the current part is last (last parts are allowed to be
 				// smaller than the certain size, otherwise the padding
 				// have to be added (this is due to S3 API limits)
@@ -541,6 +548,12 @@ func (w *sliceWriter) receiveAndUpload() error {
 
 			delete(w.activeUploads, part.Number)
 			w.updateCompletedParts(*part, upload.lastEventIndex)
+		case <-w.proto.cfg.ForceFlush:
+			if w.current != nil {
+				if err := w.startUploadCurrentSlice(); err != nil {
+					return trace.Wrap(err)
+				}
+			}
 		case <-flushCh:
 			now := clock.Now().UTC()
 			inactivityPeriod := now.Sub(lastEvent)
@@ -552,16 +565,16 @@ func (w *sliceWriter) receiveAndUpload() error {
 				// there is no need to schedule a timer until the next
 				// event occurs, set the timer channel to nil
 				flushCh = nil
-				if w.current != nil {
-					log.Debugf("Inactivity timer ticked at %v, inactivity period: %v exceeded threshold and have data. Flushing.", now, inactivityPeriod)
+				if w.current != nil && !w.current.isEmpty() {
+					slog.DebugContext(w.proto.completeCtx, "Inactivity timer ticked and exceeded threshold and have data. Flushing.", "tick", now, "inactivity_period", inactivityPeriod)
 					if err := w.startUploadCurrentSlice(); err != nil {
 						return trace.Wrap(err)
 					}
 				} else {
-					log.Debugf("Inactivity timer ticked at %v, inactivity period: %v exceeded threshold but have no data. Nothing to do.", now, inactivityPeriod)
+					slog.DebugContext(w.proto.completeCtx, "Inactivity timer ticked and exceeded threshold but have no data. Nothing to do.", "tick", now, "inactivity_period", inactivityPeriod)
 				}
 			} else {
-				log.Debugf("Inactivity timer ticked at %v, inactivity period: %v have not exceeded threshold. Set timer to tick after %v.", now, inactivityPeriod, w.proto.cfg.InactivityFlushPeriod-inactivityPeriod)
+				slog.DebugContext(w.proto.completeCtx, "Inactivity timer ticked and did not exceeded threshold. Resetting ticker.", "tick", now, "inactivity_period", inactivityPeriod, "next_tick", w.proto.cfg.InactivityFlushPeriod-inactivityPeriod)
 				flushCh = clock.After(w.proto.cfg.InactivityFlushPeriod - inactivityPeriod)
 			}
 		case event := <-w.proto.eventsCh:
@@ -572,7 +585,7 @@ func (w *sliceWriter) receiveAndUpload() error {
 				flushCh = clock.After(w.proto.cfg.InactivityFlushPeriod)
 			}
 			if err := w.submitEvent(event); err != nil {
-				log.WithError(err).Error("Lost event.")
+				slog.ErrorContext(w.proto.cancelCtx, "Lost event.", "error", err)
 				// Failure on `newSlice` indicates that the streamer won't be
 				// able to process events. Close the streamer and set the
 				// returned error so that event emitters can proceed.
@@ -622,6 +635,7 @@ func (b *bufferCloser) Close() error {
 
 func (w *sliceWriter) newSlice() (*slice, error) {
 	w.lastPartNumber++
+	// This buffer will be returned to the pool by slice.Close
 	buffer := w.proto.cfg.BufferPool.Get()
 	buffer.Reset()
 	// reserve bytes for version header
@@ -629,6 +643,8 @@ func (w *sliceWriter) newSlice() (*slice, error) {
 
 	err := w.proto.cfg.Uploader.ReserveUploadPart(w.proto.cancelCtx, w.proto.cfg.Upload, w.lastPartNumber)
 	if err != nil {
+		// Return the unused buffer to the pool.
+		w.proto.cfg.BufferPool.Put(buffer)
 		return nil, trace.ConnectionProblem(err, uploaderReservePartErrorMessage)
 	}
 
@@ -648,7 +664,7 @@ func (w *sliceWriter) submitEvent(event protoEvent) error {
 		}
 	}
 
-	return w.current.emitAuditEvent(event)
+	return w.current.recordEvent(event)
 }
 
 // completeStream waits for in-flight uploads to finish
@@ -659,10 +675,11 @@ func (w *sliceWriter) completeStream() {
 		case upload := <-w.completedUploadsC:
 			part, err := upload.getPart()
 			if err != nil {
-				log.WithError(err).
-					WithField("upload", w.proto.cfg.Upload.ID).
-					WithField("session", w.proto.cfg.Upload.SessionID).
-					Warning("Failed to upload part")
+				slog.WarnContext(w.proto.cancelCtx, "Failed to upload part",
+					"error", err,
+					"upload", w.proto.cfg.Upload.ID,
+					"session", w.proto.cfg.Upload.SessionID,
+				)
 				continue
 			}
 			w.updateCompletedParts(*part, upload.lastEventIndex)
@@ -678,10 +695,11 @@ func (w *sliceWriter) completeStream() {
 		err := w.proto.cfg.Uploader.CompleteUpload(w.proto.cancelCtx, w.proto.cfg.Upload, w.completedParts)
 		w.proto.setCompleteResult(err)
 		if err != nil {
-			log.WithError(err).
-				WithField("upload", w.proto.cfg.Upload.ID).
-				WithField("session", w.proto.cfg.Upload.SessionID).
-				Warning("Failed to complete upload")
+			slog.WarnContext(w.proto.cancelCtx, "Failed to complete upload",
+				"error", err,
+				"upload", w.proto.cfg.Upload.ID,
+				"session", w.proto.cfg.Upload.SessionID,
+			)
 		}
 	}
 }
@@ -704,7 +722,7 @@ func (w *sliceWriter) startUpload(partNumber int64, slice *slice) (*activeUpload
 	go func() {
 		defer func() {
 			if err := slice.Close(); err != nil {
-				log.WithError(err).Warningf("Failed to close slice.")
+				slog.WarnContext(w.proto.cancelCtx, "Failed to close slice.", "error", err)
 			}
 		}()
 
@@ -720,23 +738,41 @@ func (w *sliceWriter) startUpload(partNumber int64, slice *slice) (*activeUpload
 			<-w.semUploads
 		}()
 
+		log := slog.With(
+			"part", partNumber,
+			"upload", w.proto.cfg.Upload.ID,
+			"session", w.proto.cfg.Upload.SessionID,
+		)
+
 		var retry retryutils.Retry
+
+		// create reader once before the retry loop. in the event of an error, the reader must
+		// be reset via Seek rather than recreated.
+		reader, err := slice.reader()
+		if err != nil {
+			activeUpload.setError(err)
+			return
+		}
+
 		for i := 0; i < defaults.MaxIterationLimit; i++ {
-			reader, err := slice.reader()
-			if err != nil {
-				activeUpload.setError(err)
-				return
-			}
+			log := log.With("attempt", i)
+
 			part, err := w.proto.cfg.Uploader.UploadPart(w.proto.cancelCtx, w.proto.cfg.Upload, partNumber, reader)
 			if err == nil {
 				activeUpload.setPart(*part)
 				return
 			}
+
+			log.WarnContext(w.proto.cancelCtx, "failed to upload part", "error", err)
+
 			// upload is not found is not a transient error, so abort the operation
 			if errors.Is(trace.Unwrap(err), context.Canceled) || trace.IsNotFound(err) {
+				log.InfoContext(w.proto.cancelCtx, "aborting part upload")
 				activeUpload.setError(err)
 				return
 			}
+			log.InfoContext(w.proto.cancelCtx, "will retry part upload")
+
 			// retry is created on the first upload error
 			if retry == nil {
 				var rerr error
@@ -750,13 +786,16 @@ func (w *sliceWriter) startUpload(partNumber int64, slice *slice) (*activeUpload
 				}
 			}
 			retry.Inc()
+
+			// reset reader to the beginning of the slice so it can be re-read
 			if _, err := reader.Seek(0, 0); err != nil {
 				activeUpload.setError(err)
 				return
 			}
+
 			select {
 			case <-retry.After():
-				log.WithError(err).Debugf("Part upload failed, retrying after backoff.")
+				log.DebugContext(w.proto.cancelCtx, "Back off period for retry has passed. Retrying", "error", err)
 			case <-w.proto.cancelCtx.Done():
 				return
 			}
@@ -809,10 +848,12 @@ type slice struct {
 	buffer         *bytes.Buffer
 	isLast         bool
 	lastEventIndex int64
+	eventCount     uint64
 }
 
-// reader returns a reader for the bytes written,
-// no writes should be done after this method is called
+// reader returns a reader for the bytes written, no writes should be done after this
+// method is called and this method should be called at most once per slice, otherwise
+// the resulting recording will be corrupted.
 func (s *slice) reader() (io.ReadSeeker, error) {
 	if err := s.writer.Close(); err != nil {
 		return nil, trace.Wrap(err)
@@ -822,9 +863,10 @@ func (s *slice) reader() (io.ReadSeeker, error) {
 	// non last slices should be at least min upload bytes (as limited by S3 API spec)
 	if !s.isLast && wroteBytes < s.proto.cfg.MinUploadBytes {
 		paddingBytes = s.proto.cfg.MinUploadBytes - wroteBytes
-		if _, err := s.buffer.ReadFrom(utils.NewRepeatReader(byte(0), int(paddingBytes))); err != nil {
-			return nil, trace.Wrap(err)
-		}
+		s.buffer.Grow(int(paddingBytes))
+		padding := s.buffer.AvailableBuffer()[:paddingBytes]
+		clear(padding)
+		s.buffer.Write(padding)
 	}
 	data := s.buffer.Bytes()
 	// when the slice was created, the first bytes were reserved
@@ -849,10 +891,18 @@ func (s *slice) shouldUpload() bool {
 	return int64(s.buffer.Len()) >= s.proto.cfg.MinUploadBytes
 }
 
-// emitAuditEvent emits a single audit event to the stream
-func (s *slice) emitAuditEvent(event protoEvent) error {
+// isEmpty returns true if the slice hasn't had any events written to
+// it yet.
+func (s *slice) isEmpty() bool {
+	return s.eventCount == 0
+}
+
+// recordEvent emits a single session event to the stream
+func (s *slice) recordEvent(event protoEvent) error {
 	bytes := s.proto.cfg.SlicePool.Get()
 	defer s.proto.cfg.SlicePool.Put(bytes)
+
+	s.eventCount++
 
 	messageSize := event.oneof.Size()
 	recordSize := ProtoStreamV1RecordHeaderSize + messageSize
@@ -861,6 +911,7 @@ func (s *slice) emitAuditEvent(event protoEvent) error {
 		return trace.BadParameter(
 			"error in buffer allocation, expected size to be >= %v, got %v", recordSize, len(bytes))
 	}
+
 	binary.BigEndian.PutUint32(bytes, uint32(messageSize))
 	_, err := event.oneof.MarshalTo(bytes[Int32Size:])
 	if err != nil {
@@ -887,10 +938,10 @@ func NewProtoReader(r io.Reader) *ProtoReader {
 	}
 }
 
-// AuditReader provides method to read
-// audit events one by one
-type AuditReader interface {
-	// Read reads audit events
+// SessionReader provides method to read
+// session events one by one
+type SessionReader interface {
+	// Read reads session events
 	Read(context.Context) (apievents.AuditEvent, error)
 }
 
@@ -935,8 +986,8 @@ type ProtoReaderStats struct {
 }
 
 // ToFields returns a copy of the stats to be used as log fields
-func (p ProtoReaderStats) ToFields() log.Fields {
-	return log.Fields{
+func (p ProtoReaderStats) ToFields() map[string]any {
+	return map[string]any{
 		"skipped-events":      p.SkippedEvents,
 		"out-of-order-events": p.OutOfOrderEvents,
 		"total-events":        p.TotalEvents,
@@ -1010,7 +1061,7 @@ func (r *ProtoReader) Read(ctx context.Context) (apievents.AuditEvent, error) {
 			_, err := io.ReadFull(r.reader, r.sizeBytes[:Int64Size])
 			if err != nil {
 				// reached the end of the stream
-				if err == io.EOF {
+				if errors.Is(err, io.EOF) {
 					r.state = protoReaderStateEOF
 					return nil, err
 				}
@@ -1045,9 +1096,23 @@ func (r *ProtoReader) Read(ctx context.Context) (apievents.AuditEvent, error) {
 			// message and the message itself
 			_, err := io.ReadFull(r.gzipReader, r.sizeBytes[:Int32Size])
 			if err != nil {
-				if err != io.EOF {
+				if !errors.Is(err, io.EOF) {
 					return nil, r.setError(trace.ConvertSystemError(err))
 				}
+
+				// due to a bug in older versions of teleport it was possible that padding
+				// bytes would end up inside of the gzip section of the archive. we should
+				// skip any dangling data in the gzip secion.
+				n, err := io.CopyBuffer(io.Discard, r.gzipReader.inner, r.messageBytes[:])
+				if err != nil {
+					return nil, r.setError(trace.ConvertSystemError(err))
+				}
+
+				if n != 0 {
+					// log the number of bytes that were skipped
+					slog.DebugContext(ctx, "skipped dangling data in session recording section", "length", n)
+				}
+
 				// reached the end of the current part, but not necessarily
 				// the end of the stream
 				if err := r.gzipReader.Close(); err != nil {
@@ -1111,253 +1176,13 @@ func (r *ProtoReader) ReadAll(ctx context.Context) ([]apievents.AuditEvent, erro
 	for {
 		event, err := r.Read(ctx)
 		if err != nil {
-			if err == io.EOF {
+			if errors.Is(err, io.EOF) {
 				return events, nil
 			}
 			return nil, trace.Wrap(err)
 		}
 		events = append(events, event)
 	}
-}
-
-// NewMemoryUploader returns a new memory uploader implementing multipart
-// upload
-func NewMemoryUploader(eventsC ...chan UploadEvent) *MemoryUploader {
-	up := &MemoryUploader{
-		mtx:     &sync.RWMutex{},
-		uploads: make(map[string]*MemoryUpload),
-		objects: make(map[session.ID][]byte),
-	}
-	if len(eventsC) != 0 {
-		up.eventsC = eventsC[0]
-	}
-	return up
-}
-
-// MemoryUploader uploads all bytes to memory, used in tests
-type MemoryUploader struct {
-	mtx     *sync.RWMutex
-	uploads map[string]*MemoryUpload
-	objects map[session.ID][]byte
-	eventsC chan UploadEvent
-
-	Clock clockwork.Clock
-}
-
-// MemoryUpload is used in tests
-type MemoryUpload struct {
-	// id is the upload ID
-	id string
-	// parts is the upload parts
-	parts map[int64][]byte
-	// sessionID is the session ID associated with the upload
-	sessionID session.ID
-	//completed specifies upload as completed
-	completed bool
-	// Initiated contains the timestamp of when the upload
-	// was initiated, not always initialized
-	Initiated time.Time
-}
-
-func (m *MemoryUploader) trySendEvent(event UploadEvent) {
-	if m.eventsC == nil {
-		return
-	}
-	select {
-	case m.eventsC <- event:
-	default:
-	}
-}
-
-// Reset resets all state, removes all uploads and objects
-func (m *MemoryUploader) Reset() {
-	m.mtx.Lock()
-	defer m.mtx.Unlock()
-	m.uploads = make(map[string]*MemoryUpload)
-	m.objects = make(map[session.ID][]byte)
-}
-
-// CreateUpload creates a multipart upload
-func (m *MemoryUploader) CreateUpload(ctx context.Context, sessionID session.ID) (*StreamUpload, error) {
-	m.mtx.Lock()
-	defer m.mtx.Unlock()
-	upload := &StreamUpload{
-		ID:        uuid.New().String(),
-		SessionID: sessionID,
-	}
-	if m.Clock != nil {
-		upload.Initiated = m.Clock.Now()
-	}
-	m.uploads[upload.ID] = &MemoryUpload{
-		id:        upload.ID,
-		sessionID: sessionID,
-		parts:     make(map[int64][]byte),
-		Initiated: upload.Initiated,
-	}
-	return upload, nil
-}
-
-// CompleteUpload completes the upload
-func (m *MemoryUploader) CompleteUpload(ctx context.Context, upload StreamUpload, parts []StreamPart) error {
-	m.mtx.Lock()
-	defer m.mtx.Unlock()
-	up, ok := m.uploads[upload.ID]
-	if !ok {
-		return trace.NotFound("upload not found")
-	}
-	if up.completed {
-		return trace.BadParameter("upload already completed")
-	}
-	// verify that all parts have been uploaded
-	var result []byte
-	partsSet := make(map[int64]bool, len(parts))
-	for _, part := range parts {
-		partsSet[part.Number] = true
-		data, ok := up.parts[part.Number]
-		if !ok {
-			return trace.NotFound("part %v has not been uploaded", part.Number)
-		}
-		result = append(result, data...)
-	}
-	// exclude parts that are not requested to be completed
-	for number := range up.parts {
-		if !partsSet[number] {
-			delete(up.parts, number)
-		}
-	}
-	m.objects[upload.SessionID] = result
-	up.completed = true
-	m.trySendEvent(UploadEvent{SessionID: string(upload.SessionID), UploadID: upload.ID})
-	return nil
-}
-
-// UploadPart uploads part and returns the part
-func (m *MemoryUploader) UploadPart(ctx context.Context, upload StreamUpload, partNumber int64, partBody io.ReadSeeker) (*StreamPart, error) {
-	data, err := io.ReadAll(partBody)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	m.mtx.Lock()
-	defer m.mtx.Unlock()
-	up, ok := m.uploads[upload.ID]
-	if !ok {
-		return nil, trace.NotFound("upload %q is not found", upload.ID)
-	}
-	up.parts[partNumber] = data
-	return &StreamPart{Number: partNumber}, nil
-}
-
-// ListUploads lists uploads that have been initiated but not completed with
-// earlier uploads returned first.
-func (m *MemoryUploader) ListUploads(ctx context.Context) ([]StreamUpload, error) {
-	m.mtx.RLock()
-	defer m.mtx.RUnlock()
-	uploads := make([]StreamUpload, 0, len(m.uploads))
-	for id, upload := range m.uploads {
-		uploads = append(uploads, StreamUpload{
-			ID:        id,
-			SessionID: upload.sessionID,
-			Initiated: upload.Initiated,
-		})
-	}
-	sort.Slice(uploads, func(i, j int) bool {
-		return uploads[i].Initiated.Before(uploads[j].Initiated)
-	})
-	return uploads, nil
-}
-
-// GetParts returns upload parts uploaded up to date, sorted by part number
-func (m *MemoryUploader) GetParts(uploadID string) ([][]byte, error) {
-	m.mtx.RLock()
-	defer m.mtx.RUnlock()
-
-	up, ok := m.uploads[uploadID]
-	if !ok {
-		return nil, trace.NotFound("upload %q is not found", uploadID)
-	}
-
-	partNumbers := make([]int64, 0, len(up.parts))
-	sortedParts := make([][]byte, 0, len(up.parts))
-	for partNumber := range up.parts {
-		partNumbers = append(partNumbers, partNumber)
-	}
-	sort.Slice(partNumbers, func(i, j int) bool {
-		return partNumbers[i] < partNumbers[j]
-	})
-	for _, partNumber := range partNumbers {
-		sortedParts = append(sortedParts, up.parts[partNumber])
-	}
-	return sortedParts, nil
-}
-
-// ListParts returns all uploaded parts for the completed upload in sorted order
-func (m *MemoryUploader) ListParts(ctx context.Context, upload StreamUpload) ([]StreamPart, error) {
-	m.mtx.RLock()
-	defer m.mtx.RUnlock()
-
-	up, ok := m.uploads[upload.ID]
-	if !ok {
-		return nil, trace.NotFound("upload %v is not found", upload.ID)
-	}
-
-	partNumbers := make([]int64, 0, len(up.parts))
-	sortedParts := make([]StreamPart, 0, len(up.parts))
-	for partNumber := range up.parts {
-		partNumbers = append(partNumbers, partNumber)
-	}
-	sort.Slice(partNumbers, func(i, j int) bool {
-		return partNumbers[i] < partNumbers[j]
-	})
-	for _, partNumber := range partNumbers {
-		sortedParts = append(sortedParts, StreamPart{Number: partNumber})
-	}
-	return sortedParts, nil
-}
-
-// Upload uploads session tarball and returns URL with uploaded file
-// in case of success.
-func (m *MemoryUploader) Upload(ctx context.Context, sessionID session.ID, readCloser io.Reader) (string, error) {
-	m.mtx.Lock()
-	defer m.mtx.Unlock()
-	_, ok := m.objects[sessionID]
-	if ok {
-		return "", trace.AlreadyExists("session %q already exists", sessionID)
-	}
-	data, err := io.ReadAll(readCloser)
-	if err != nil {
-		return "", trace.ConvertSystemError(err)
-	}
-	m.objects[sessionID] = data
-	return string(sessionID), nil
-}
-
-// Download downloads session tarball and writes it to writer
-func (m *MemoryUploader) Download(ctx context.Context, sessionID session.ID, writer io.WriterAt) error {
-	m.mtx.RLock()
-	defer m.mtx.RUnlock()
-
-	data, ok := m.objects[sessionID]
-	if !ok {
-		return trace.NotFound("session %q is not found", sessionID)
-	}
-	_, err := io.Copy(writer.(io.Writer), bytes.NewReader(data))
-	if err != nil {
-		return trace.ConvertSystemError(err)
-	}
-	return nil
-}
-
-// GetUploadMetadata gets the session upload metadata
-func (m *MemoryUploader) GetUploadMetadata(sid session.ID) UploadMetadata {
-	return UploadMetadata{
-		URL:       "memory",
-		SessionID: sid,
-	}
-}
-
-// ReserveUploadPart reserves an upload part.
-func (m *MemoryUploader) ReserveUploadPart(ctx context.Context, upload StreamUpload, partNumber int64) error {
-	return nil
 }
 
 // isReserveUploadPartError identifies uploader reserve part errors.

@@ -1,32 +1,39 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-	http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package azure
 
 import (
 	"context"
+	"fmt"
+	"log/slog"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/arm"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/runtime"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
-	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v3"
-	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/containerservice/armcontainerservice/v2"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v6"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/containerservice/armcontainerservice/v6"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/msi/armmsi"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/mysql/armmysql"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/mysql/armmysqlflexibleservers"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/postgresql/armpostgresql"
-	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/redis/armredis/v2"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/postgresql/armpostgresqlflexibleservers"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/redis/armredis/v3"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/redisenterprise/armredisenterprise"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/sql/armsql"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/subscription/armsubscription"
@@ -506,9 +513,40 @@ func (m *ARMComputeMock) NewListPager(resourceGroup string, _ *armcompute.Virtua
 	})
 }
 
+func (m *ARMComputeMock) NewListAllPager(_ *armcompute.VirtualMachinesClientListAllOptions) *runtime.Pager[armcompute.VirtualMachinesClientListAllResponse] {
+	var vms []*armcompute.VirtualMachine
+	for _, resourceGroupVMs := range m.VirtualMachines {
+		vms = append(vms, resourceGroupVMs...)
+	}
+	return runtime.NewPager(runtime.PagingHandler[armcompute.VirtualMachinesClientListAllResponse]{
+		More: func(page armcompute.VirtualMachinesClientListAllResponse) bool {
+			return page.NextLink != nil && len(*page.NextLink) > 0
+		},
+		Fetcher: func(ctx context.Context, page *armcompute.VirtualMachinesClientListAllResponse) (armcompute.VirtualMachinesClientListAllResponse, error) {
+			return armcompute.VirtualMachinesClientListAllResponse{
+				VirtualMachineListResult: armcompute.VirtualMachineListResult{
+					Value: vms,
+				},
+			}, nil
+		},
+	})
+}
+
 func (m *ARMComputeMock) Get(_ context.Context, _ string, _ string, _ *armcompute.VirtualMachinesClientGetOptions) (armcompute.VirtualMachinesClientGetResponse, error) {
 	return armcompute.VirtualMachinesClientGetResponse{
 		VirtualMachine: m.GetResult,
+	}, m.GetErr
+}
+
+// ARMComputeScaleSetMock mocks armcompute.VirtualMachineScaleSetVMsClient.
+type ARMScaleSetMock struct {
+	GetResult armcompute.VirtualMachineScaleSetVM
+	GetErr    error
+}
+
+func (m *ARMScaleSetMock) Get(ctx context.Context, resourceGroupName string, vmScaleSetName string, instanceID string, options *armcompute.VirtualMachineScaleSetVMsClientGetOptions) (armcompute.VirtualMachineScaleSetVMsClientGetResponse, error) {
+	return armcompute.VirtualMachineScaleSetVMsClientGetResponse{
+		VirtualMachineScaleSetVM: m.GetResult,
 	}, m.GetErr
 }
 
@@ -564,4 +602,127 @@ func (m *ARMSQLManagedServerMock) NewListByResourceGroupPager(resourceGroupName 
 			},
 		}, nil
 	})
+}
+
+type ARMMySQLFlexServerMock struct {
+	NoAuth  bool
+	Servers []*armmysqlflexibleservers.Server
+}
+
+func (m *ARMMySQLFlexServerMock) NewListPager(_ *armmysqlflexibleservers.ServersClientListOptions) *runtime.Pager[armmysqlflexibleservers.ServersClientListResponse] {
+	return newPagerHelper(m.NoAuth, func() (armmysqlflexibleservers.ServersClientListResponse, error) {
+		return armmysqlflexibleservers.ServersClientListResponse{
+			ServerListResult: armmysqlflexibleservers.ServerListResult{
+				Value: m.Servers,
+			},
+		}, nil
+	})
+}
+
+func (m *ARMMySQLFlexServerMock) NewListByResourceGroupPager(group string, _ *armmysqlflexibleservers.ServersClientListByResourceGroupOptions) *runtime.Pager[armmysqlflexibleservers.ServersClientListByResourceGroupResponse] {
+	return newPagerHelper(m.NoAuth, func() (armmysqlflexibleservers.ServersClientListByResourceGroupResponse, error) {
+		var servers []*armmysqlflexibleservers.Server
+		for _, server := range m.Servers {
+			id, err := arm.ParseResourceID(StringVal(server.ID))
+			if err != nil {
+				return armmysqlflexibleservers.ServersClientListByResourceGroupResponse{}, trace.Wrap(err)
+			}
+			if group == id.ResourceGroupName {
+				servers = append(servers, server)
+			}
+		}
+		if len(servers) == 0 {
+			return armmysqlflexibleservers.ServersClientListByResourceGroupResponse{}, trace.NotFound("no resources found")
+		}
+		return armmysqlflexibleservers.ServersClientListByResourceGroupResponse{
+			ServerListResult: armmysqlflexibleservers.ServerListResult{
+				Value: servers,
+			},
+		}, nil
+	})
+}
+
+type ARMPostgresFlexServerMock struct {
+	NoAuth  bool
+	Servers []*armpostgresqlflexibleservers.Server
+}
+
+func (m *ARMPostgresFlexServerMock) NewListPager(_ *armpostgresqlflexibleservers.ServersClientListOptions) *runtime.Pager[armpostgresqlflexibleservers.ServersClientListResponse] {
+	return newPagerHelper(m.NoAuth, func() (armpostgresqlflexibleservers.ServersClientListResponse, error) {
+		return armpostgresqlflexibleservers.ServersClientListResponse{
+			ServerListResult: armpostgresqlflexibleservers.ServerListResult{
+				Value: m.Servers,
+			},
+		}, nil
+	})
+}
+
+func (m *ARMPostgresFlexServerMock) NewListByResourceGroupPager(group string, _ *armpostgresqlflexibleservers.ServersClientListByResourceGroupOptions) *runtime.Pager[armpostgresqlflexibleservers.ServersClientListByResourceGroupResponse] {
+	return newPagerHelper(m.NoAuth, func() (armpostgresqlflexibleservers.ServersClientListByResourceGroupResponse, error) {
+		var servers []*armpostgresqlflexibleservers.Server
+		for _, server := range m.Servers {
+			id, err := arm.ParseResourceID(StringVal(server.ID))
+			if err != nil {
+				return armpostgresqlflexibleservers.ServersClientListByResourceGroupResponse{}, trace.Wrap(err)
+			}
+			if group == id.ResourceGroupName {
+				servers = append(servers, server)
+			}
+		}
+		if len(servers) == 0 {
+			return armpostgresqlflexibleservers.ServersClientListByResourceGroupResponse{}, trace.NotFound("no resources found")
+		}
+		return armpostgresqlflexibleservers.ServersClientListByResourceGroupResponse{
+			ServerListResult: armpostgresqlflexibleservers.ServerListResult{
+				Value: servers,
+			},
+		}, nil
+	})
+}
+
+// ARMUserAssignedIdentitiesMock implements ARMUserAssignedIdentities.
+type ARMUserAssignedIdentitiesMock struct {
+	identitiesMap map[string]armmsi.Identity
+}
+
+// NewARMUserAssignedIdentitiesMock creates a new ARMUserAssignedIdentitiesMock.
+func NewARMUserAssignedIdentitiesMock(identities ...armmsi.Identity) *ARMUserAssignedIdentitiesMock {
+	identitiesMap := make(map[string]armmsi.Identity)
+	for _, identity := range identities {
+		id, err := arm.ParseResourceID(*identity.ID)
+		if err == nil {
+			identitiesMap[id.ResourceGroupName+"+"+id.Name] = identity
+		} else {
+			slog.With("error", err).WarnContext(context.Background(), "Failed to add identity to mock.")
+		}
+	}
+	return &ARMUserAssignedIdentitiesMock{
+		identitiesMap: identitiesMap,
+	}
+}
+
+func (m *ARMUserAssignedIdentitiesMock) Get(ctx context.Context, resourceGroupName, resourceName string, options *armmsi.UserAssignedIdentitiesClientGetOptions) (armmsi.UserAssignedIdentitiesClientGetResponse, error) {
+	if m == nil || m.identitiesMap == nil {
+		return armmsi.UserAssignedIdentitiesClientGetResponse{}, trace.AccessDenied("access denied")
+	}
+
+	identity, found := m.identitiesMap[resourceGroupName+"+"+resourceName]
+	if !found {
+		return armmsi.UserAssignedIdentitiesClientGetResponse{}, trace.NotFound("%s of group %s not found", resourceName, resourceGroupName)
+	}
+	return armmsi.UserAssignedIdentitiesClientGetResponse{
+		Identity: identity,
+	}, nil
+}
+
+// NewUserAssignedIdentity creates an armmsi.Identity.
+func NewUserAssignedIdentity(subscription, resourceGroupName, resourceName, clientID string) armmsi.Identity {
+	id := fmt.Sprintf("/subscriptions/%s/resourcegroups/%s/providers/Microsoft.ManagedIdentity/userAssignedIdentities/%s", subscription, resourceGroupName, resourceName)
+	return armmsi.Identity{
+		ID:   &id,
+		Name: &resourceName,
+		Properties: &armmsi.UserAssignedIdentityProperties{
+			ClientID: &clientID,
+		},
+	}
 }

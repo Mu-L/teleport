@@ -13,18 +13,23 @@ run-name: Skip Build on Mac OS
 
 on:
   pull_request:
+  merge_group:
     paths-ignore:
+      - '.github/workflows/build-macos.yaml'
       - '**.go'
       - 'go.mod'
       - 'go.sum'
       - '**.rs'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - 'build.assets/Makefile'
+      - 'build.assets/Dockerfile*'
+      - 'Makefile'
 
 jobs:
   build:
-    name: Skipped
-    runs-on: macos-12
+    name: Build on Mac OS
+    runs-on: ubuntu-latest
 
     permissions:
       contents: none

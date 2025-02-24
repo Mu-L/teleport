@@ -22,8 +22,6 @@ import (
 	"time"
 
 	"github.com/gravitational/trace"
-
-	"github.com/gravitational/teleport/api/defaults"
 )
 
 // WebSessionsGetter provides access to web sessions
@@ -63,10 +61,14 @@ type WebSession interface {
 	SetUser(string)
 	// GetPub is returns public certificate signed by auth server
 	GetPub() []byte
-	// GetPriv returns private OpenSSH key used to auth with SSH nodes
-	GetPriv() []byte
-	// SetPriv sets private key
-	SetPriv([]byte)
+	// GetSSHPriv returns private SSH key used to auth with SSH nodes.
+	GetSSHPriv() []byte
+	// SetSSHPriv sets SSH private key.
+	SetSSHPriv([]byte)
+	// GetTLSPriv returns private TLS key.
+	GetTLSPriv() []byte
+	// SetTLSPriv sets TLS private key.
+	SetTLSPriv([]byte)
 	// GetTLSCert returns PEM encoded TLS certificate associated with session
 	GetTLSCert() []byte
 	// GetBearerToken is a special bearer token used for additional
@@ -92,6 +94,27 @@ type WebSession interface {
 	SetConsumedAccessRequestID(string)
 	// GetConsumedAccessRequestID returns the ID of the access request from which additional roles to assume were obtained.
 	GetConsumedAccessRequestID() string
+	// SetSAMLSession sets the SAML session data. Is considered secret.
+	SetSAMLSession(*SAMLSessionData)
+	// GetSAMLSession gets the SAML session data. Is considered secret.
+	GetSAMLSession() *SAMLSessionData
+	// SetDeviceWebToken sets the session's DeviceWebToken.
+	// The token is considered a secret.
+	SetDeviceWebToken(*DeviceWebToken)
+	// GetDeviceWebToken returns the session's DeviceWebToken, if any.
+	// The token is considered a secret.
+	GetDeviceWebToken() *DeviceWebToken
+	// GetHasDeviceExtensions returns the HasDeviceExtensions value.
+	// If true the session's TLS and SSH certificates are augmented with device
+	// extensions.
+	GetHasDeviceExtensions() bool
+	// SetTrustedDeviceRequirement sets the session's trusted device requirement.
+	// See [TrustedDeviceRequirement].
+	SetTrustedDeviceRequirement(r TrustedDeviceRequirement)
+	// GetTrustedDeviceRequirement returns the session's trusted device
+	// requirement.
+	// See [TrustedDeviceRequirement].
+	GetTrustedDeviceRequirement() TrustedDeviceRequirement
 }
 
 // NewWebSession returns new instance of the web session based on the V2 spec
@@ -155,14 +178,14 @@ func (ws *WebSessionV2) GetMetadata() Metadata {
 	return ws.Metadata
 }
 
-// GetResourceID gets ResourceID
-func (ws *WebSessionV2) GetResourceID() int64 {
-	return ws.Metadata.GetID()
+// GetRevision returns the revision
+func (ws *WebSessionV2) GetRevision() string {
+	return ws.Metadata.GetRevision()
 }
 
-// SetResourceID sets ResourceID
-func (ws *WebSessionV2) SetResourceID(id int64) {
-	ws.Metadata.SetID(id)
+// SetRevision sets the revision
+func (ws *WebSessionV2) SetRevision(rev string) {
+	ws.Metadata.SetRevision(rev)
 }
 
 // GetIdleTimeout returns the max idle timeout duration.
@@ -170,10 +193,14 @@ func (ws *WebSessionV2) GetIdleTimeout() time.Duration {
 	return ws.Spec.IdleTimeout.Duration()
 }
 
-// WithoutSecrets returns copy of the object but without secrets
+// WithoutSecrets returns a copy of the WebSession without secrets.
 func (ws *WebSessionV2) WithoutSecrets() WebSession {
-	ws.Spec.Priv = nil
-	return ws
+	cp := *ws
+	cp.Spec.Priv = nil
+	cp.Spec.TLSPriv = nil
+	cp.Spec.SAMLSession = nil
+	cp.Spec.DeviceWebToken = nil
+	return &cp
 }
 
 // SetConsumedAccessRequestID sets the ID of the access request from which additional roles to assume were obtained.
@@ -184,6 +211,46 @@ func (ws *WebSessionV2) SetConsumedAccessRequestID(requestID string) {
 // GetConsumedAccessRequestID returns the ID of the access request from which additional roles to assume were obtained.
 func (ws *WebSessionV2) GetConsumedAccessRequestID() string {
 	return ws.Spec.ConsumedAccessRequestID
+}
+
+// SetSAMLSession sets the SAML session data. Is considered secret.
+func (ws *WebSessionV2) SetSAMLSession(samlSession *SAMLSessionData) {
+	ws.Spec.SAMLSession = samlSession
+}
+
+// GetSAMLSession gets the SAML session data. Is considered secret.
+func (ws *WebSessionV2) GetSAMLSession() *SAMLSessionData {
+	return ws.Spec.SAMLSession
+}
+
+// SetDeviceWebToken sets the session's DeviceWebToken.
+// The token is considered a secret.
+func (ws *WebSessionV2) SetDeviceWebToken(webToken *DeviceWebToken) {
+	ws.Spec.DeviceWebToken = webToken
+}
+
+// GetDeviceWebToken returns the session's DeviceWebToken, if any.
+// The token is considered a secret.
+func (ws *WebSessionV2) GetDeviceWebToken() *DeviceWebToken {
+	return ws.Spec.DeviceWebToken
+}
+
+// GetHasDeviceExtensions returns the HasDeviceExtensions value.
+// If true the session's TLS and SSH certificates are augmented with device
+// extensions.
+func (ws *WebSessionV2) GetHasDeviceExtensions() bool {
+	return ws.Spec.HasDeviceExtensions
+}
+
+// SetTrustedDeviceRequirement sets the session's trusted device requirement.
+func (ws *WebSessionV2) SetTrustedDeviceRequirement(r TrustedDeviceRequirement) {
+	ws.Spec.TrustedDeviceRequirement = r
+}
+
+// GetTrustedDeviceRequirement returns the session's trusted device
+// requirement.
+func (ws *WebSessionV2) GetTrustedDeviceRequirement() TrustedDeviceRequirement {
+	return ws.Spec.TrustedDeviceRequirement
 }
 
 // setStaticFields sets static resource header and metadata fields.
@@ -198,7 +265,6 @@ func (ws *WebSessionV2) CheckAndSetDefaults() error {
 	if err := ws.Metadata.CheckAndSetDefaults(); err != nil {
 		return trace.Wrap(err)
 	}
-
 	if ws.Spec.User == "" {
 		return trace.BadParameter("missing User")
 	}
@@ -239,14 +305,30 @@ func (ws *WebSessionV2) GetPub() []byte {
 	return ws.Spec.Pub
 }
 
-// GetPriv returns private OpenSSH key used to auth with SSH nodes
-func (ws *WebSessionV2) GetPriv() []byte {
+// GetSSHPriv returns private SSH key.
+func (ws *WebSessionV2) GetSSHPriv() []byte {
 	return ws.Spec.Priv
 }
 
-// SetPriv sets private key
-func (ws *WebSessionV2) SetPriv(priv []byte) {
+// SetSSHPriv sets private SSH key.
+func (ws *WebSessionV2) SetSSHPriv(priv []byte) {
 	ws.Spec.Priv = priv
+}
+
+// GetTLSPriv returns private TLS key.
+func (ws *WebSessionV2) GetTLSPriv() []byte {
+	// TODO(nklaassen): DELETE IN 18.0.0 when all auth servers are writing web session TLS key.
+	if ws.Spec.TLSPriv == nil {
+		// An older auth instance may have written this web session before the
+		// SSH and TLS keys were split.
+		return ws.Spec.Priv
+	}
+	return ws.Spec.TLSPriv
+}
+
+// SetTLSPriv sets private TLS key.
+func (ws *WebSessionV2) SetTLSPriv(priv []byte) {
+	ws.Spec.TLSPriv = priv
 }
 
 // GetBearerToken gets a special bearer token used for additional
@@ -310,33 +392,18 @@ func (r *GetSnowflakeSessionRequest) Check() error {
 	return nil
 }
 
-// CreateAppSessionRequest contains the parameters needed to request
-// creating an application web session.
-type CreateAppSessionRequest struct {
-	// Username is the identity of the user requesting the session.
-	Username string `json:"username"`
-	// PublicAddr is the public address of the application.
-	PublicAddr string `json:"public_addr"`
-	// ClusterName is the name of the cluster within which the application is running.
-	ClusterName string `json:"cluster_name"`
-	// AWSRoleARN is AWS role this the user wants to assume.
-	AWSRoleARN string `json:"aws_role_arn"`
-	// AzureIdentity is Azure identity this the user wants to assume.
-	AzureIdentity string `json:"azure_identity"`
+// GetSAMLIdPSessionRequest contains the parameters to request a SAML IdP
+// session.
+type GetSAMLIdPSessionRequest struct {
+	// SessionID is the session ID of the SAML IdP session.
+	SessionID string
 }
 
 // Check validates the request.
-func (r CreateAppSessionRequest) Check() error {
-	if r.Username == "" {
-		return trace.BadParameter("username missing")
+func (r *GetSAMLIdPSessionRequest) Check() error {
+	if r.SessionID == "" {
+		return trace.BadParameter("session ID missing")
 	}
-	if r.PublicAddr == "" {
-		return trace.BadParameter("public address missing")
-	}
-	if r.ClusterName == "" {
-		return trace.BadParameter("cluster name missing")
-	}
-
 	return nil
 }
 
@@ -351,6 +418,29 @@ type CreateSnowflakeSessionRequest struct {
 	TokenTTL time.Duration
 }
 
+// CreateSAMLIdPSessionRequest contains the parameters needed to request
+// creating a SAML IdP session.
+type CreateSAMLIdPSessionRequest struct {
+	// SessionID is the identifier for the session.
+	SessionID string
+	// Username is the identity of the user requesting the session.
+	Username string `json:"username"`
+	// SAMLSession is the session data associated with the SAML IdP session.
+	SAMLSession *SAMLSessionData `json:"saml_session"`
+}
+
+// Check validates the request.
+func (r CreateSAMLIdPSessionRequest) Check() error {
+	if r.Username == "" {
+		return trace.BadParameter("username missing")
+	}
+	if r.SAMLSession == nil {
+		return trace.BadParameter("saml session missing")
+	}
+
+	return nil
+}
+
 // DeleteAppSessionRequest are the parameters used to request removal of
 // an application web session.
 type DeleteAppSessionRequest struct {
@@ -360,6 +450,12 @@ type DeleteAppSessionRequest struct {
 // DeleteSnowflakeSessionRequest are the parameters used to request removal of
 // a Snowflake web session.
 type DeleteSnowflakeSessionRequest struct {
+	SessionID string `json:"session_id"`
+}
+
+// DeleteSAMLIdPSessionRequest are the parameters used to request removal of
+// a SAML IdP session.
+type DeleteSAMLIdPSessionRequest struct {
 	SessionID string `json:"session_id"`
 }
 
@@ -456,14 +552,14 @@ func (r *WebTokenV3) SetName(name string) {
 	r.Metadata.Name = name
 }
 
-// GetResourceID returns the token resource ID
-func (r *WebTokenV3) GetResourceID() int64 {
-	return r.Metadata.GetID()
+// GetRevision returns the revision
+func (r *WebTokenV3) GetRevision() string {
+	return r.Metadata.GetRevision()
 }
 
-// SetResourceID sets the token resource ID
-func (r *WebTokenV3) SetResourceID(id int64) {
-	r.Metadata.SetID(id)
+// SetRevision sets the revision
+func (r *WebTokenV3) SetRevision(rev string) {
+	r.Metadata.SetRevision(rev)
 }
 
 // GetToken returns the token value
@@ -525,43 +621,6 @@ func (r *WebTokenV3) CheckAndSetDefaults() error {
 func (r *WebTokenV3) String() string {
 	return fmt.Sprintf("WebToken(kind=%v,user=%v,token=%v,expires=%v)",
 		r.GetKind(), r.GetUser(), r.GetToken(), r.Expiry())
-}
-
-// CheckAndSetDefaults validates the request and sets defaults.
-func (r *NewWebSessionRequest) CheckAndSetDefaults() error {
-	if r.User == "" {
-		return trace.BadParameter("user name required")
-	}
-	if len(r.Roles) == 0 {
-		return trace.BadParameter("roles required")
-	}
-	if len(r.Traits) == 0 {
-		return trace.BadParameter("traits required")
-	}
-	if r.SessionTTL == 0 {
-		r.SessionTTL = defaults.CertDuration
-	}
-	return nil
-}
-
-// NewWebSessionRequest defines a request to create a new user
-// web session
-type NewWebSessionRequest struct {
-	// User specifies the user this session is bound to
-	User string
-	// Roles optionally lists additional user roles
-	Roles []string
-	// Traits optionally lists role traits
-	Traits map[string][]string
-	// SessionTTL optionally specifies the session time-to-live.
-	// If left unspecified, the default certificate duration is used.
-	SessionTTL time.Duration
-	// LoginTime is the time that this user recently logged in.
-	LoginTime time.Time
-	// AccessRequests contains the UUIDs of the access requests currently in use.
-	AccessRequests []string
-	// RequestedResourceIDs optionally lists requested resources
-	RequestedResourceIDs []ResourceID
 }
 
 // Check validates the request.

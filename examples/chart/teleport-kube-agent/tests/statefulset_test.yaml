@@ -7,8 +7,8 @@ tests:
     template: statefulset.yaml
     values:
       - ../.lint/stateful.yaml
-    elease:
-      isupgrade: true
+    release:
+      upgrade: true
     asserts:
       - isKind:
           of: StatefulSet
@@ -43,6 +43,19 @@ tests:
           value: pod
       - matchSnapshot:
           path: spec.template.spec
+
+  - it: sets StatefulSet annotations when specified
+    template: statefulset.yaml
+    values:
+      - ../.lint/stateful.yaml
+      - ../.lint/annotations.yaml
+    asserts:
+      - equal:
+          path: metadata.annotations.kubernetes\.io/deployment
+          value: test-annotation
+      - equal:
+          path: metadata.annotations.kubernetes\.io/deployment-different
+          value: 3
 
   - it: sets Pod annotations when specified
     template: statefulset.yaml
@@ -179,43 +192,80 @@ tests:
       - matchSnapshot:
           path: spec.template.spec
 
-  - it: should set SecurityContext
+  - it: should set a restricted-friendly SecurityContext by default
     template: statefulset.yaml
     values:
       - ../.lint/stateful.yaml
+      - ../.lint/initcontainers.yaml
     asserts:
       - equal:
-          path: spec.template.spec.containers[0].securityContext.allowPrivilegeEscalation
-          value: false
-      - equal:
-          path: spec.template.spec.containers[0].securityContext.capabilities
+          path: spec.template.spec.containers[0].securityContext
           value:
-            drop:
-              - all
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 9807
+            seccompProfile:
+              type: RuntimeDefault
       - equal:
-          path: spec.template.spec.containers[0].securityContext.readOnlyRootFilesystem
-          value: true
-      - equal:
-          path: spec.template.spec.containers[0].securityContext.runAsNonRoot
-          value: true
-      - equal:
-          path: spec.template.spec.containers[0].securityContext.runAsUser
-          value: 9807
-      - matchSnapshot:
-          path: spec.template.spec
+          path: spec.template.spec.initContainers[0].securityContext
+          value:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 9807
+            seccompProfile:
+              type: RuntimeDefault
 
   - it: should set image and tag correctly
     template: statefulset.yaml
     values:
       - ../.lint/stateful.yaml
     set:
-      teleportVersionOverride: 8.3.4
+      teleportVersionOverride: 12.2.1
     asserts:
       - equal:
           path: spec.template.spec.containers[0].image
-          value: public.ecr.aws/gravitational/teleport:8.3.4
+          value: public.ecr.aws/gravitational/teleport-distroless:12.2.1
       - matchSnapshot:
           path: spec.template.spec
+
+  - it: should have only one container when no `extraContainers` is set in values
+    template: statefulset.yaml
+    set:
+      extraContainers: []
+      proxyAddr: helm-lint.example.com
+      kubeClusterName: helm-lint.example.com
+    asserts:
+      - isNotNull:
+          path: spec.template.spec.containers[0]
+      - isNull:
+          path: spec.template.spec.containers[1]
+
+  - it: should add one more container when `extraContainers` is set in values
+    template: statefulset.yaml
+    values:
+      - ../.lint/extra-containers.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[1]
+          value:
+            name: nscenter
+            command:
+              - /bin/bash
+              - -c
+              - sleep infinity & wait
+            image: praqma/network-multitool
+            imagePullPolicy: IfNotPresent
+            securityContext:
+              privileged: true
+              runAsNonRoot: false
 
   - it: should mount extraVolumes and extraVolumeMounts
     template: statefulset.yaml
@@ -372,7 +422,7 @@ tests:
   - it: should not add emptyDir for data when using StatefulSet
     template: statefulset.yaml
     release:
-      isupgrade: true
+      upgrade: true
     set:
       unitTestUpgrade: true
     values:
@@ -404,11 +454,11 @@ tests:
     values:
       - ../.lint/stateful.yaml
     set:
-       # unit test does not support lookup functions, so to test the behavior we use this undoc value 
+       # unit test does not support lookup functions, so to test the behavior we use this undoc value
        # https://github.com/helm/helm/issues/8137
        unitTestUpgrade: true
     release:
-      isupgrade: true
+      upgrade: true
     asserts:
       - isNotNull:
           path: spec.volumeClaimTemplates[0].spec
@@ -420,7 +470,7 @@ tests:
     values:
       - ../.lint/stateful.yaml
     set:
-       # unit test does not support lookup functions, so to test the behavior we use this undoc value 
+       # unit test does not support lookup functions, so to test the behavior we use this undoc value
        # https://github.com/helm/helm/issues/8137
        unitTestUpgrade: true
     release:
@@ -435,9 +485,9 @@ tests:
     values:
       - ../.lint/stateful.yaml
     release:
-      isupgrade: true
+      upgrade: true
     set:
-      # unit test does not support lookup functions, so to test the behavior we use this undoc value 
+      # unit test does not support lookup functions, so to test the behavior we use this undoc value
       # https://github.com/helm/helm/issues/8137
       unitTestUpgrade: true
 
@@ -455,17 +505,57 @@ tests:
     values:
       - ../.lint/stateful.yaml
     release:
-      isupgrade: true
+      upgrade: true
     set:
       storage:
         requests: 256Mi
-      # unit test does not support lookup functions, so to test the behavior we use this undoc value 
+      # unit test does not support lookup functions, so to test the behavior we use this undoc value
       # https://github.com/helm/helm/issues/8137
       unitTestUpgrade: true
     asserts:
       - equal:
           path: spec.volumeClaimTemplates[0].spec.resources.requests.storage
           value: 256Mi
+      - matchSnapshot:
+          path: spec.template.spec
+
+  - it: should mount jamfCredentialsSecret.name when role is jamf
+    template: statefulset.yaml
+    values:
+      - ../.lint/jamf-service.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: jamf-api-credentials
+            secret:
+              secretName: teleport-jamf-api-credentials
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            mountPath: /etc/teleport-jamf-api-credentials
+            name: jamf-api-credentials
+            readOnly: true
+      - matchSnapshot:
+          path: spec.template.spec
+
+  - it: should mount jamfCredentialsSecret if it already exists and when role is jamf
+    template: statefulset.yaml
+    values:
+      - ../.lint/jamf-service-existing-secret.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: jamf-api-credentials
+            secret:
+              secretName: existing-teleport-jamf-secret
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            mountPath: /etc/teleport-jamf-api-credentials
+            name: jamf-api-credentials
+            readOnly: true
       - matchSnapshot:
           path: spec.template.spec
 
@@ -525,7 +615,6 @@ tests:
       - matchSnapshot:
           path: spec.template.spec
 
-
   - it: should set serviceAccountName when set in values
     template: statefulset.yaml
     values:
@@ -565,6 +654,28 @@ tests:
       - matchSnapshot:
           path: spec.template.spec
 
+  - it: should set dnsConfig when set in values
+    template: statefulset.yaml
+    values:
+      - ../.lint/stateful.yaml
+      - ../.lint/dnsconfig.yaml
+    asserts:
+      - notEqual:
+          path: spec.template.spec.dnsConfig
+          value: null
+      - matchSnapshot:
+          path: spec.template.spec.dnsConfig
+
+  - it: should set dnsPolicy when set in values
+    template: statefulset.yaml
+    values:
+      - ../.lint/stateful.yaml
+      - ../.lint/dnsconfig.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.dnsPolicy
+          value: ClusterFirstWithHostNet
+
   - it: should install Statefulset when storage is disabled and mode is a Fresh Install
     template: statefulset.yaml
     release:
@@ -572,7 +683,7 @@ tests:
     values:
       - ../.lint/stateful.yaml
     set:
-      storage: 
+      storage:
         enabled: false
     asserts:
       - contains:
@@ -602,12 +713,12 @@ tests:
   - it: should generate Statefulset when storage is disabled and mode is a Upgrade
     template: statefulset.yaml
     release:
-      isupgrade: true
+      upgrade: true
     values:
       - ../.lint/stateful.yaml
     set:
-      unitTestUpgrade: false
-      storage: 
+      unitTestUpgrade: true
+      storage:
         enabled: false
     asserts:
       - contains:
@@ -633,3 +744,83 @@ tests:
           path: spec.volumeClaimTemplates
       - matchSnapshot:
           path: spec.template.spec
+
+  - it: sets by default a container security context
+    template: statefulset.yaml
+    values:
+      - ../.lint/initcontainers.yaml
+    asserts:
+      - matchSnapshot:
+          path: spec.template.spec.initContainers[0].securityContext
+      - matchSnapshot:
+          path: spec.template.spec.containers[0].securityContext
+
+  - it: sets no container security context when manually unset
+    template: statefulset.yaml
+    values:
+      - ../.lint/initcontainers.yaml
+      - ../.lint/security-context-empty.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.initContainers[0].securityContext
+          value: null
+      - equal:
+          path: spec.template.spec.containers[0].securityContext
+          value: null
+
+  - it: should enable maintenance schedule export when updater is enabled
+    template: statefulset.yaml
+    values:
+      - ../.lint/updater.yaml
+    set:
+      teleportVersionOverride: 13.4.5
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: TELEPORT_EXT_UPGRADER
+            value: kube
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: TELEPORT_EXT_UPGRADER_VERSION
+            value: 13.4.5
+
+  - it: should set the installation method environment variable
+    template: statefulset.yaml
+    values:
+      - ../.lint/stateful.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: TELEPORT_INSTALL_METHOD_HELM_KUBE_AGENT
+            value: "true"
+
+  - it: should set the hostAliases when specified
+    template: statefulset.yaml
+    values:
+      - ../.lint/stateful.yaml
+      - ../.lint/host-aliases.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.hostAliases
+          value:
+            - ip: "127.0.0.1"
+              hostnames:
+                - "foo.local"
+                - "bar.local"
+            - ip: "10.1.2.3"
+              hostnames:
+                - "foo.remote"
+                - "bar.remote"
+  - it: should set the terminationGracePeriodSeconds when specified
+    template: statefulset.yaml
+    values:
+      - ../.lint/stateful.yaml
+    set:
+      terminationGracePeriodSeconds: 3600
+    asserts:
+      - equal:
+          path: spec.template.spec.terminationGracePeriodSeconds
+          value: 3600

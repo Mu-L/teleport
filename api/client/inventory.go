@@ -18,13 +18,16 @@ package client
 
 import (
 	"context"
+	"errors"
 	"io"
+	"log/slog"
 	"sync"
 
 	"github.com/gravitational/trace"
-	"github.com/gravitational/trace/trail"
 
 	"github.com/gravitational/teleport/api/client/proto"
+	"github.com/gravitational/teleport/api/internalutils/stream"
+	"github.com/gravitational/teleport/api/types"
 )
 
 // DownstreamInventoryControlStream is the client/agent side of a bidirectional stream established
@@ -195,30 +198,53 @@ func (d downstreamPipeControlStream) Recv() <-chan proto.DownstreamInventoryMess
 // UpstreamInventoryHello, and the first message received must be a DownstreamInventoryHello.
 func (c *Client) InventoryControlStream(ctx context.Context) (DownstreamInventoryControlStream, error) {
 	cancelCtx, cancel := context.WithCancel(ctx)
-	stream, err := c.grpc.InventoryControlStream(cancelCtx, c.callOpts...)
+	stream, err := c.grpc.InventoryControlStream(cancelCtx)
 	if err != nil {
 		cancel()
-		return nil, trail.FromGRPC(err)
+		return nil, trace.Wrap(err)
 	}
 	return newDownstreamInventoryControlStream(stream, cancel), nil
 }
 
 func (c *Client) GetInventoryStatus(ctx context.Context, req proto.InventoryStatusRequest) (proto.InventoryStatusSummary, error) {
-	rsp, err := c.grpc.GetInventoryStatus(ctx, &req, c.callOpts...)
+	rsp, err := c.grpc.GetInventoryStatus(ctx, &req)
 	if err != nil {
-		return proto.InventoryStatusSummary{}, trail.FromGRPC(err)
+		return proto.InventoryStatusSummary{}, trace.Wrap(err)
 	}
 
 	return *rsp, nil
 }
 
 func (c *Client) PingInventory(ctx context.Context, req proto.InventoryPingRequest) (proto.InventoryPingResponse, error) {
-	rsp, err := c.grpc.PingInventory(ctx, &req, c.callOpts...)
+	rsp, err := c.grpc.PingInventory(ctx, &req)
 	if err != nil {
-		return proto.InventoryPingResponse{}, trail.FromGRPC(err)
+		return proto.InventoryPingResponse{}, trace.Wrap(err)
 	}
 
 	return *rsp, nil
+}
+
+func (c *Client) GetInstances(ctx context.Context, filter types.InstanceFilter) stream.Stream[types.Instance] {
+	// set up cancelable context so that Stream.Done can close the stream if the caller
+	// halts early.
+	ctx, cancel := context.WithCancel(ctx)
+
+	instances, err := c.grpc.GetInstances(ctx, &filter)
+	if err != nil {
+		cancel()
+		return stream.Fail[types.Instance](trace.Wrap(err))
+	}
+	return stream.Func[types.Instance](func() (types.Instance, error) {
+		instance, err := instances.Recv()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				// io.EOF signals that stream has completed successfully
+				return nil, io.EOF
+			}
+			return nil, trace.Wrap(err)
+		}
+		return instance, nil
+	}, cancel)
 }
 
 func newDownstreamInventoryControlStream(stream proto.AuthService_InventoryControlStreamClient, cancel context.CancelFunc) DownstreamInventoryControlStream {
@@ -259,8 +285,8 @@ func (i *downstreamICS) runRecvLoop(stream proto.AuthService_InventoryControlStr
 		oneOf, err := stream.Recv()
 		if err != nil {
 			// preserve EOF to help distinguish "ok" closure.
-			if !trace.IsEOF(err) {
-				err = trace.Errorf("inventory control stream closed: %v", trail.FromGRPC(err))
+			if !errors.Is(err, io.EOF) {
+				err = trace.Errorf("inventory control stream closed: %v", trace.Wrap(err))
 			}
 			i.CloseWithError(err)
 			return
@@ -273,9 +299,10 @@ func (i *downstreamICS) runRecvLoop(stream proto.AuthService_InventoryControlStr
 			msg = *oneOf.GetHello()
 		case oneOf.GetPing() != nil:
 			msg = *oneOf.GetPing()
+		case oneOf.GetUpdateLabels() != nil:
+			msg = *oneOf.GetUpdateLabels()
 		default:
-			// TODO: log unknown message variants once we have a better story around
-			// logging in api/* packages.
+			slog.WarnContext(stream.Context(), "received unknown downstream message", "message", oneOf)
 			continue
 		}
 
@@ -308,15 +335,23 @@ func (i *downstreamICS) runSendLoop(stream proto.AuthService_InventoryControlStr
 				oneOf.Msg = &proto.UpstreamInventoryOneOf_Pong{
 					Pong: &msg,
 				}
+			case proto.UpstreamInventoryAgentMetadata:
+				oneOf.Msg = &proto.UpstreamInventoryOneOf_AgentMetadata{
+					AgentMetadata: &msg,
+				}
+			case proto.UpstreamInventoryGoodbye:
+				oneOf.Msg = &proto.UpstreamInventoryOneOf_Goodbye{
+					Goodbye: &msg,
+				}
 			default:
 				sendMsg.errC <- trace.BadParameter("cannot send unexpected upstream msg type: %T", msg)
 				continue
 			}
-			err := trail.FromGRPC(stream.Send(&oneOf))
+			err := stream.Send(&oneOf)
 			sendMsg.errC <- err
 			if err != nil {
 				// preserve EOF errors
-				if !trace.IsEOF(err) {
+				if !errors.Is(err, io.EOF) {
 					err = trace.Errorf("upstream send failed: %v", err)
 				}
 				i.CloseWithError(err)
@@ -330,6 +365,10 @@ func (i *downstreamICS) runSendLoop(stream proto.AuthService_InventoryControlStr
 }
 
 func (i *downstreamICS) Send(ctx context.Context, msg proto.UpstreamInventoryMessage) error {
+	if err := ctx.Err(); err != nil {
+		return trace.Wrap(err)
+	}
+
 	errC := make(chan error, 1)
 	select {
 	case i.sendC <- upstreamSend{msg: msg, errC: errC}:
@@ -337,16 +376,16 @@ func (i *downstreamICS) Send(ctx context.Context, msg proto.UpstreamInventoryMes
 		case err := <-errC:
 			return trace.Wrap(err)
 		case <-ctx.Done():
-			return trace.Errorf("inventory control msg send result skipped: %v", ctx.Err())
+			return trace.Errorf("inventory control msg send result skipped: %w", ctx.Err())
 		}
 	case <-ctx.Done():
-		return trace.Errorf("inventory control msg not sent: %v", ctx.Err())
+		return trace.Errorf("inventory control msg not sent: %w", ctx.Err())
 	case <-i.Done():
 		err := i.Error()
 		if err == nil {
 			return trace.Errorf("inventory control stream externally closed during send")
 		}
-		return trace.Errorf("inventory control msg not sent: %v", err)
+		return trace.Errorf("inventory control msg not sent: %w", err)
 	}
 }
 
@@ -386,7 +425,7 @@ func (i *downstreamICS) Error() error {
 }
 
 // NewUpstreamInventoryControlStream wraps the server-side control stream handle. For use as part of the internals
-// of the auth server's GRPC API implementation.
+// of the auth server's gRPC API implementation.
 func NewUpstreamInventoryControlStream(stream proto.AuthService_InventoryControlStreamServer, peerAddr string) UpstreamInventoryControlStream {
 	ics := &upstreamICS{
 		sendC:    make(chan downstreamSend),
@@ -425,8 +464,8 @@ func (i *upstreamICS) runRecvLoop(stream proto.AuthService_InventoryControlStrea
 		oneOf, err := stream.Recv()
 		if err != nil {
 			// preserve eof errors
-			if !trace.IsEOF(err) {
-				err = trace.Errorf("inventory control stream recv failed: %v", trail.FromGRPC(err))
+			if !errors.Is(err, io.EOF) {
+				err = trace.Errorf("inventory control stream recv failed: %v", trace.Wrap(err))
 			}
 			i.CloseWithError(err)
 			return
@@ -441,9 +480,12 @@ func (i *upstreamICS) runRecvLoop(stream proto.AuthService_InventoryControlStrea
 			msg = *oneOf.GetHeartbeat()
 		case oneOf.GetPong() != nil:
 			msg = *oneOf.GetPong()
+		case oneOf.GetAgentMetadata() != nil:
+			msg = *oneOf.GetAgentMetadata()
+		case oneOf.GetGoodbye() != nil:
+			msg = *oneOf.GetGoodbye()
 		default:
-			// TODO: log unknown message variants once we have a better story around
-			// logging in api/* packages.
+			slog.WarnContext(stream.Context(), "received unknown upstream message", "message", oneOf)
 			continue
 		}
 
@@ -472,15 +514,19 @@ func (i *upstreamICS) runSendLoop(stream proto.AuthService_InventoryControlStrea
 				oneOf.Msg = &proto.DownstreamInventoryOneOf_Ping{
 					Ping: &msg,
 				}
+			case proto.DownstreamInventoryUpdateLabels:
+				oneOf.Msg = &proto.DownstreamInventoryOneOf_UpdateLabels{
+					UpdateLabels: &msg,
+				}
 			default:
-				sendMsg.errC <- trace.BadParameter("cannot send unexpected upstream msg type: %T", msg)
+				sendMsg.errC <- trace.BadParameter("cannot send unexpected downstream msg type: %T", msg)
 				continue
 			}
-			err := trail.FromGRPC(stream.Send(&oneOf))
+			err := stream.Send(&oneOf)
 			sendMsg.errC <- err
 			if err != nil {
 				// preserve eof errors
-				if !trace.IsEOF(err) {
+				if !errors.Is(err, io.EOF) {
 					err = trace.Errorf("downstream send failed: %v", err)
 				}
 				i.CloseWithError(err)
@@ -494,6 +540,10 @@ func (i *upstreamICS) runSendLoop(stream proto.AuthService_InventoryControlStrea
 }
 
 func (i *upstreamICS) Send(ctx context.Context, msg proto.DownstreamInventoryMessage) error {
+	if err := ctx.Err(); err != nil {
+		return trace.Wrap(err)
+	}
+
 	errC := make(chan error, 1)
 	select {
 	case i.sendC <- downstreamSend{msg: msg, errC: errC}:
@@ -501,16 +551,16 @@ func (i *upstreamICS) Send(ctx context.Context, msg proto.DownstreamInventoryMes
 		case err := <-errC:
 			return trace.Wrap(err)
 		case <-ctx.Done():
-			return trace.Errorf("inventory control msg send result skipped: %v", ctx.Err())
+			return trace.Errorf("inventory control msg send result skipped: %w", ctx.Err())
 		}
 	case <-ctx.Done():
-		return trace.Errorf("inventory control msg not sent: %v", ctx.Err())
+		return trace.Errorf("inventory control msg not sent: %w", ctx.Err())
 	case <-i.Done():
 		err := i.Error()
 		if err == nil {
 			return trace.Errorf("inventory control stream externally closed during send")
 		}
-		return trace.Errorf("inventory control msg not sent: %v", err)
+		return trace.Errorf("inventory control msg not sent: %w", err)
 	}
 }
 

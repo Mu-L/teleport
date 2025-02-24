@@ -19,12 +19,13 @@ package retryutils
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
-	log "github.com/sirupsen/logrus"
 )
 
 // Retry is an interface that provides retry logic
@@ -185,15 +186,16 @@ func (r *Linear) For(ctx context.Context, retryFn func() error) error {
 		if err == nil {
 			return nil
 		}
-		if _, ok := trace.Unwrap(err).(*permanentRetryError); ok {
+		var permanentRetryError *permanentRetryError
+		if errors.As(trace.Unwrap(err), &permanentRetryError) {
 			return trace.Wrap(err)
 		}
-		log.Debugf("Will retry in %v: %v.", r.Duration(), err)
+		slog.DebugContext(ctx, "Waiting to retry operation again", "wait", r.Duration(), "error", err)
 		select {
 		case <-r.After():
 			r.Inc()
 		case <-ctx.Done():
-			return trace.LimitExceeded(ctx.Err().Error())
+			return trace.LimitExceeded("%s", ctx.Err())
 		}
 	}
 }
@@ -213,7 +215,7 @@ func (e *permanentRetryError) Error() string {
 	return e.err.Error()
 }
 
-// RetryFastFor retries a function repeatedly for a set amount of
+// RetryStaticFor retries a function repeatedly for a set amount of
 // time before returning an error.
 //
 // Intended mostly for tests.

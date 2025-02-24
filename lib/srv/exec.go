@@ -1,44 +1,49 @@
 /*
-Copyright 2015-2020 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package srv
 
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/gravitational/trace"
-	log "github.com/sirupsen/logrus"
 	"golang.org/x/crypto/ssh"
-	"golang.org/x/exp/slices"
 
 	"github.com/gravitational/teleport"
 	tracessh "github.com/gravitational/teleport/api/observability/tracing/ssh"
+	"github.com/gravitational/teleport/api/types"
 	apievents "github.com/gravitational/teleport/api/types/events"
 	"github.com/gravitational/teleport/lib/events"
 	"github.com/gravitational/teleport/lib/services"
+	"github.com/gravitational/teleport/lib/utils"
 )
 
 const (
@@ -74,6 +79,10 @@ type Exec interface {
 	// Wait will block while the command executes.
 	Wait() *ExecResult
 
+	// WaitForChild blocks until the child process has completed any required
+	// setup operations before proceeding with execution.
+	WaitForChild() error
+
 	// Continue will resume execution of the process after it completes its
 	// pre-processing routine (placed in a cgroup).
 	Continue()
@@ -93,9 +102,10 @@ func NewExecRequest(ctx *ServerContext, command string) (Exec, error) {
 		}, nil
 	}
 
-	// When in recording mode, return an *remoteExec which will execute the
-	// command on a remote host. This is used by in-memory forwarding nodes.
-	if services.IsRecordAtProxy(ctx.SessionRecordingConfig.GetMode()) {
+	// If this is a registered OpenSSH node or proxy recoding mode is
+	// enabled, execute the command on a remote host. This is used by
+	// in-memory forwarding nodes.
+	if types.IsOpenSSHNodeSubKind(ctx.ServerSubKind) || services.IsRecordAtProxy(ctx.SessionRecordingConfig.GetMode()) {
 		return &remoteExec{
 			ctx:     ctx,
 			command: command,
@@ -137,6 +147,8 @@ func (e *localExec) SetCommand(command string) {
 // Start launches the given command returns (nil, nil) if successful.
 // ExecResult is only used to communicate an error while launching.
 func (e *localExec) Start(ctx context.Context, channel ssh.Channel) (*ExecResult, error) {
+	logger := e.Ctx.Logger.With("command", e.GetCommand())
+
 	// Parse the command to see if it is scp.
 	err := e.transformSecureCopy()
 	if err != nil {
@@ -162,7 +174,7 @@ func (e *localExec) Start(ctx context.Context, channel ssh.Channel) (*ExecResult
 	// Start the command.
 	err = e.Cmd.Start()
 	if err != nil {
-		e.Ctx.Warningf("Local command %v failed to start: %v", e.GetCommand(), err)
+		logger.WarnContext(ctx, "Local command failed to start", "error", err)
 
 		// Emit the result of execution to the audit log
 		emitExecAuditEvent(e.Ctx, e.GetCommand(), err)
@@ -172,15 +184,21 @@ func (e *localExec) Start(ctx context.Context, channel ssh.Channel) (*ExecResult
 			Code:    exitCode(err),
 		}, trace.ConvertSystemError(err)
 	}
+	// Close our half of the write pipe since it is only to be used by the child process.
+	// Not closing prevents being signaled when the child closes its half.
+	if err := e.Ctx.readyw.Close(); err != nil {
+		logger.WarnContext(ctx, "Failed to close parent process ready signal write fd", "error", err)
+	}
+	e.Ctx.readyw = nil
 
 	go func() {
 		if _, err := io.Copy(inputWriter, channel); err != nil {
-			e.Ctx.Warnf("Failed to forward data from SSH channel to local command %q stdin: %v", e.GetCommand(), err)
+			logger.WarnContext(ctx, "Failed to forward data from SSH channel to local command", "error", err)
 		}
 		inputWriter.Close()
 	}()
 
-	e.Ctx.Infof("Started local command execution: %q", e.Command)
+	logger.InfoContext(ctx, "Started local command execution")
 
 	return nil, nil
 }
@@ -188,15 +206,15 @@ func (e *localExec) Start(ctx context.Context, channel ssh.Channel) (*ExecResult
 // Wait will block while the command executes.
 func (e *localExec) Wait() *ExecResult {
 	if e.Cmd.Process == nil {
-		e.Ctx.Error("No process.")
+		e.Ctx.Logger.ErrorContext(e.Ctx.CancelContext(), "No process")
 	}
 
 	// Block until the command is finished executing.
 	err := e.Cmd.Wait()
 	if err != nil {
-		e.Ctx.Debugf("Local command failed: %v.", err)
+		e.Ctx.Logger.DebugContext(e.Ctx.CancelContext(), "Local command failed", "error", err)
 	} else {
-		e.Ctx.Debugf("Local command successfully executed.")
+		e.Ctx.Logger.DebugContext(e.Ctx.CancelContext(), "Local command successfully executed")
 	}
 
 	// Emit the result of execution to the Audit Log.
@@ -208,6 +226,14 @@ func (e *localExec) Wait() *ExecResult {
 	}
 
 	return execResult
+}
+
+func (e *localExec) WaitForChild() error {
+	err := waitForSignal(e.Ctx.readyr, 20*time.Second)
+	closeErr := e.Ctx.readyr.Close()
+	// Set to nil so the close in the context doesn't attempt to re-close.
+	e.Ctx.readyr = nil
+	return trace.NewAggregate(err, closeErr)
 }
 
 // Continue will resume execution of the process after it completes its
@@ -229,21 +255,26 @@ func (e *localExec) String() string {
 }
 
 func (e *localExec) transformSecureCopy() error {
-	// split up command by space to grab the first word. if we don't have anything
-	// it's an interactive shell the user requested and not scp, return
-	args := strings.Split(e.GetCommand(), " ")
-	if len(args) == 0 {
-		return nil
-	}
-
-	// see the user is not requesting scp, return
-	_, f := filepath.Split(args[0])
-	if f != teleport.SCP {
-		return nil
-	}
-
-	if err := e.Ctx.CheckFileCopyingAllowed(); err != nil {
+	isSCPCmd, err := checkSCPAllowed(e.Ctx, e.GetCommand())
+	if err != nil {
+		e.Ctx.GetServer().EmitAuditEvent(e.Ctx.CancelContext(), &apievents.SFTP{
+			Metadata: apievents.Metadata{
+				Code: events.SCPDisallowedCode,
+				Type: events.SCPEvent,
+				Time: time.Now(),
+			},
+			UserMetadata:   e.Ctx.Identity.GetUserMetadata(),
+			ServerMetadata: e.Ctx.GetServer().TargetMetadata(),
+			Error:          err.Error(),
+		})
 		return trace.Wrap(err)
+	}
+	if !isSCPCmd {
+		return nil
+	}
+	_, scpArgs, ok := strings.Cut(e.GetCommand(), " ")
+	if !ok {
+		return nil
 	}
 
 	// for scp requests update the command to execute to launch teleport with
@@ -256,33 +287,50 @@ func (e *localExec) transformSecureCopy() error {
 		teleportBin,
 		e.Ctx.ServerConn.RemoteAddr().String(),
 		e.Ctx.ServerConn.LocalAddr().String(),
-		strings.Join(args[1:], " "))
+		scpArgs,
+	)
 
 	return nil
 }
 
-// waitForContinue will wait 10 seconds for the continue signal, if not
+// checkSCPAllowed will return false if the command is not a SCP command,
+// and if it is it will return true and potentially an error if file
+// copying is not allowed.
+func checkSCPAllowed(scx *ServerContext, command string) (bool, error) {
+	// split up command by space to grab the first word. if we don't have anything
+	// it's an interactive shell the user requested and not scp, return
+	args := strings.Split(command, " ")
+	if len(args) == 0 {
+		return false, nil
+	}
+	// see the user is not requesting scp, return
+	if _, f := filepath.Split(args[0]); f != teleport.SCP {
+		return false, nil
+	}
+
+	return true, trace.Wrap(scx.CheckFileCopyingAllowed())
+}
+
+// waitForSignal will wait 10 seconds for the other side of the pipe to signal, if not
 // received, it will stop waiting and exit.
-func waitForContinue(contfd *os.File) error {
+func waitForSignal(fd *os.File, timeout time.Duration) error {
 	waitCh := make(chan error, 1)
 	go func() {
-		// Reading from the continue file descriptor will block until it's closed. It
-		// won't be closed until the parent has placed it in a cgroup.
-		buf := make([]byte, 1)
-		_, err := contfd.Read(buf)
-		if err == io.EOF {
+		// Reading from the file descriptor will block until it's closed.
+		_, err := fd.Read(make([]byte, 1))
+		if errors.Is(err, io.EOF) {
 			err = nil
 		}
 		waitCh <- err
 	}()
 
-	// Wait for 10 seconds and then timeout if no continue signal has been sent.
-	timeout := time.NewTimer(10 * time.Second)
-	defer timeout.Stop()
+	// Timeout if no signal has been sent within the provided duration.
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
 
 	select {
-	case <-timeout.C:
-		return trace.BadParameter("timed out waiting for continue signal")
+	case <-timer.C:
+		return trace.LimitExceeded("timed out waiting for continue signal")
 	case err := <-waitCh:
 		return err
 	}
@@ -313,6 +361,20 @@ func (e *remoteExec) SetCommand(command string) {
 // Start launches the given command returns (nil, nil) if successful.
 // ExecResult is only used to communicate an error while launching.
 func (e *remoteExec) Start(ctx context.Context, ch ssh.Channel) (*ExecResult, error) {
+	if _, err := checkSCPAllowed(e.ctx, e.GetCommand()); err != nil {
+		e.ctx.GetServer().EmitAuditEvent(context.WithoutCancel(ctx), &apievents.SFTP{
+			Metadata: apievents.Metadata{
+				Code: events.SCPDisallowedCode,
+				Type: events.SCPEvent,
+				Time: time.Now(),
+			},
+			UserMetadata:   e.ctx.Identity.GetUserMetadata(),
+			ServerMetadata: e.ctx.GetServer().TargetMetadata(),
+			Error:          err.Error(),
+		})
+		return nil, trace.Wrap(err)
+	}
+
 	// hook up stdout/err the channel so the user can interact with the command
 	e.session.Stdout = ch
 	e.session.Stderr = ch.Stderr()
@@ -324,7 +386,7 @@ func (e *remoteExec) Start(ctx context.Context, ch ssh.Channel) (*ExecResult, er
 	go func() {
 		// copy from the channel (client) into stdin of the process
 		if _, err := io.Copy(inputWriter, ch); err != nil {
-			e.ctx.Warnf("Failed copying data from SSH channel to remote command stdin: %v", err)
+			e.ctx.Logger.WarnContext(ctx, "Failed copying data from SSH channel to remote command stdin", "error", err)
 		}
 		inputWriter.Close()
 	}()
@@ -342,9 +404,9 @@ func (e *remoteExec) Wait() *ExecResult {
 	// Block until the command is finished executing.
 	err := e.session.Wait()
 	if err != nil {
-		e.ctx.Debugf("Remote command failed: %v.", err)
+		e.ctx.Logger.DebugContext(e.ctx.CancelContext(), "Remote command failed", "error", err)
 	} else {
-		e.ctx.Debugf("Remote command successfully executed.")
+		e.ctx.Logger.DebugContext(e.ctx.CancelContext(), "Remote command successfully executed")
 	}
 
 	// Emit the result of execution to the Audit Log.
@@ -355,6 +417,8 @@ func (e *remoteExec) Wait() *ExecResult {
 		Code:    exitCode(err),
 	}
 }
+
+func (e *remoteExec) WaitForChild() error { return nil }
 
 // Continue does nothing for remote command execution.
 func (e *remoteExec) Continue() {}
@@ -371,17 +435,8 @@ func (e *remoteExec) PID() int {
 // instead of ctx.srv.
 func emitExecAuditEvent(ctx *ServerContext, cmd string, execErr error) {
 	// Create common fields for event.
-	serverMeta := apievents.ServerMetadata{
-		ServerID:        ctx.srv.HostUUID(),
-		ServerHostname:  ctx.srv.GetInfo().GetHostname(),
-		ServerNamespace: ctx.srv.GetNamespace(),
-	}
-
-	sessionMeta := apievents.SessionMetadata{
-		SessionID: string(ctx.SessionID()),
-		WithMFA:   ctx.Identity.Certificate.Extensions[teleport.CertExtensionMFAVerified],
-	}
-
+	serverMeta := ctx.GetServer().TargetMetadata()
+	sessionMeta := ctx.GetSessionMetadata()
 	userMeta := ctx.Identity.GetUserMetadata()
 
 	connectionMeta := apievents.ConnectionMetadata{
@@ -407,7 +462,7 @@ func emitExecAuditEvent(ctx *ServerContext, cmd string, execErr error) {
 	// Parse the exec command to find out if it was SCP or not.
 	path, action, isSCP, err := parseSecureCopy(cmd)
 	if err != nil {
-		log.Warnf("Unable to emit audit event: %v.", err)
+		ctx.Logger.WarnContext(ctx.srv.Context(), "Unable to parse scp command", "error", err)
 		return
 	}
 
@@ -442,7 +497,7 @@ func emitExecAuditEvent(ctx *ServerContext, cmd string, execErr error) {
 			}
 		}
 		if err := ctx.session.emitAuditEvent(ctx.srv.Context(), scpEvent); err != nil {
-			log.WithError(err).Warn("Failed to emit scp event.")
+			ctx.Logger.WarnContext(ctx.srv.Context(), "Failed to emit scp event", "error", err)
 		}
 	} else {
 		execEvent := &apievents.Exec{
@@ -462,7 +517,7 @@ func emitExecAuditEvent(ctx *ServerContext, cmd string, execErr error) {
 			execEvent.Code = events.ExecCode
 		}
 		if err := ctx.session.emitAuditEvent(ctx.srv.Context(), execEvent); err != nil {
-			log.WithError(err).Warn("Failed to emit exec event.")
+			ctx.Logger.WarnContext(ctx.srv.Context(), "Failed to emit exec event", "error", err)
 		}
 	}
 }
@@ -475,13 +530,13 @@ func getDefaultEnvPath(uid string, loginDefsPath string) string {
 	envRootPath := defaultEnvRootPath
 
 	// open file, if it doesn't exist return a default path and move on
-	f, err := os.Open(loginDefsPath)
+	f, err := utils.OpenFileAllowingUnsafeLinks(loginDefsPath)
 	if err != nil {
 		if uid == "0" {
-			log.Infof("Unable to open %q: %v: returning default su path: %q", loginDefsPath, err, defaultEnvRootPath)
+			slog.InfoContext(context.Background(), "Unable to open login.defs, returning default su path", "login_defs_path", loginDefsPath, "error", err, "default_path", defaultEnvRootPath)
 			return defaultEnvRootPath
 		}
-		log.Infof("Unable to open %q: %v: returning default path: %q", loginDefsPath, err, defaultEnvPath)
+		slog.InfoContext(context.Background(), "Unable to open login.defs, returning default path", "login_defs_path", loginDefsPath, "error", err, "default_path", defaultEnvPath)
 		return defaultEnvPath
 	}
 	defer f.Close()
@@ -512,10 +567,10 @@ func getDefaultEnvPath(uid string, loginDefsPath string) string {
 	err = scanner.Err()
 	if err != nil {
 		if uid == "0" {
-			log.Warnf("Unable to open %q: %v: returning default su path: %q", loginDefsPath, err, defaultEnvRootPath)
+			slog.WarnContext(context.Background(), "Unable to read login.defs, returning default su path", "login_defs_path", loginDefsPath, "error", err, "default_path", defaultEnvRootPath)
 			return defaultEnvRootPath
 		}
-		log.Warnf("Unable to read %q: %v: returning default path: %q", loginDefsPath, err, defaultEnvPath)
+		slog.WarnContext(context.Background(), "Unable to read login.defs, returning default path", "login_defs_path", loginDefsPath, "error", err, "default_path", defaultEnvPath)
 		return defaultEnvPath
 	}
 
@@ -541,7 +596,7 @@ func parseSecureCopy(path string) (string, string, bool, error) {
 		action = events.SCPActionUpload
 	}
 
-	// Exract the name of the Teleport executable on disk.
+	// Extract the name of the Teleport executable on disk.
 	teleportPath, err := os.Executable()
 	if err != nil {
 		return "", "", false, trace.Wrap(err)
@@ -566,20 +621,22 @@ func exitCode(err error) int {
 		return teleport.RemoteCommandSuccess
 	}
 
-	switch v := err.(type) {
+	var execExitErr *exec.ExitError
+	var sshExitErr *ssh.ExitError
+	switch {
 	// Local execution.
-	case *exec.ExitError:
-		waitStatus, ok := v.Sys().(syscall.WaitStatus)
+	case errors.As(err, &execExitErr):
+		waitStatus, ok := execExitErr.Sys().(syscall.WaitStatus)
 		if !ok {
 			return teleport.RemoteCommandFailure
 		}
 		return waitStatus.ExitStatus()
 	// Remote execution.
-	case *ssh.ExitError:
-		return v.ExitStatus()
+	case errors.As(err, &sshExitErr):
+		return sshExitErr.ExitStatus()
 	// An error occurred, but the type is unknown, return a generic 255 code.
 	default:
-		log.Debugf("Unknown error returned when executing command: %T: %v.", err, err)
+		slog.DebugContext(context.Background(), "Unknown error returned when executing command", "error", err)
 		return teleport.RemoteCommandFailure
 	}
 }

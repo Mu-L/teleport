@@ -1,18 +1,20 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package database
 
@@ -20,12 +22,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 
 	"github.com/gravitational/trace"
 	"github.com/jackc/pgconn"
 	"github.com/jackc/pgerrcode"
-	"github.com/sirupsen/logrus"
+
+	"github.com/gravitational/teleport/lib/defaults"
 )
 
 const (
@@ -37,17 +41,17 @@ const (
 type PostgresPinger struct{}
 
 // Ping connects to the database and issues a basic select statement to validate the connection.
-func (p *PostgresPinger) Ping(ctx context.Context, ping PingParams) error {
-	if err := ping.CheckAndSetDefaults(); err != nil {
+func (p *PostgresPinger) Ping(ctx context.Context, params PingParams) error {
+	if err := params.CheckAndSetDefaults(defaults.ProtocolPostgres); err != nil {
 		return trace.Wrap(err)
 	}
 
 	pgconnConfig, err := pgconn.ParseConfig(
 		fmt.Sprintf("postgres://%s@%s:%d/%s",
-			ping.Username,
-			ping.Host,
-			ping.Port,
-			ping.Database,
+			params.Username,
+			params.Host,
+			params.Port,
+			params.DatabaseName,
 		),
 	)
 	if err != nil {
@@ -61,7 +65,7 @@ func (p *PostgresPinger) Ping(ctx context.Context, ping PingParams) error {
 
 	defer func() {
 		if err := conn.Close(ctx); err != nil {
-			logrus.WithError(err).Info("failed to close connection in PostgresPinger.Ping")
+			slog.InfoContext(context.Background(), "failed to close connection in PostgresPinger.Ping", "error", err)
 		}
 	}()
 
@@ -77,14 +81,13 @@ func (p *PostgresPinger) Ping(ctx context.Context, ping PingParams) error {
 	return nil
 }
 
-// IsConnectionRefusedError checks whether the error is of type invalid database user.
-// This can happen when the user doesn't exist.
+// IsConnectionRefusedError checks whether the error is of type connection refused.
 func (p *PostgresPinger) IsConnectionRefusedError(err error) bool {
 	if err == nil {
 		return false
 	}
 
-	return strings.Contains(err.Error(), "connection refused (SQLSTATE )")
+	return strings.Contains(err.Error(), "connection refused (SQLSTATE")
 }
 
 // IsInvalidDatabaseUserError checks whether the error is of type invalid database user.

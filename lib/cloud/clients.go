@@ -1,18 +1,20 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package cloud
 
@@ -25,96 +27,48 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/arm"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
-	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/containerservice/armcontainerservice/v2"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/containerservice/armcontainerservice/v6"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/mysql/armmysql"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/postgresql/armpostgresql"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/subscription/armsubscription"
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/credentials/stscreds"
-	"github.com/aws/aws-sdk-go/aws/session"
-	awssession "github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/ec2"
-	"github.com/aws/aws-sdk-go/service/ec2/ec2iface"
-	"github.com/aws/aws-sdk-go/service/eks"
-	"github.com/aws/aws-sdk-go/service/eks/eksiface"
-	"github.com/aws/aws-sdk-go/service/elasticache"
-	"github.com/aws/aws-sdk-go/service/elasticache/elasticacheiface"
-	"github.com/aws/aws-sdk-go/service/iam"
-	"github.com/aws/aws-sdk-go/service/iam/iamiface"
-	"github.com/aws/aws-sdk-go/service/memorydb"
-	"github.com/aws/aws-sdk-go/service/memorydb/memorydbiface"
-	"github.com/aws/aws-sdk-go/service/rds"
-	"github.com/aws/aws-sdk-go/service/rds/rdsiface"
-	"github.com/aws/aws-sdk-go/service/redshift"
-	"github.com/aws/aws-sdk-go/service/redshift/redshiftiface"
-	"github.com/aws/aws-sdk-go/service/redshiftserverless"
-	"github.com/aws/aws-sdk-go/service/redshiftserverless/redshiftserverlessiface"
-	"github.com/aws/aws-sdk-go/service/secretsmanager"
-	"github.com/aws/aws-sdk-go/service/secretsmanager/secretsmanageriface"
-	"github.com/aws/aws-sdk-go/service/ssm"
-	"github.com/aws/aws-sdk-go/service/ssm/ssmiface"
-	"github.com/aws/aws-sdk-go/service/sts"
-	"github.com/aws/aws-sdk-go/service/sts/stsiface"
 	"github.com/gravitational/trace"
-	"github.com/sirupsen/logrus"
 	"google.golang.org/api/option"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
-	libcloudaws "github.com/gravitational/teleport/lib/cloud/aws"
 	"github.com/gravitational/teleport/lib/cloud/azure"
 	"github.com/gravitational/teleport/lib/cloud/gcp"
+	"github.com/gravitational/teleport/lib/cloud/imds"
+	awsimds "github.com/gravitational/teleport/lib/cloud/imds/aws"
+	azureimds "github.com/gravitational/teleport/lib/cloud/imds/azure"
+	gcpimds "github.com/gravitational/teleport/lib/cloud/imds/gcp"
 )
 
 // Clients provides interface for obtaining cloud provider clients.
 type Clients interface {
-	// GetGCPIAMClient returns GCP IAM client.
-	GetGCPIAMClient(context.Context) (*gcpcredentials.IamCredentialsClient, error)
-	// GetGCPSQLAdminClient returns GCP Cloud SQL Admin client.
-	GetGCPSQLAdminClient(context.Context) (gcp.SQLAdminClient, error)
 	// GetInstanceMetadataClient returns instance metadata client based on which
 	// cloud provider Teleport is running on, if any.
-	GetInstanceMetadataClient(ctx context.Context) (InstanceMetadata, error)
-	// GetGCPGKEClient returns GKE client.
-	GetGCPGKEClient(context.Context) (gcp.GKEClient, error)
-	// AWSClients is an interface for providing AWS API clients.
-	AWSClients
+	GetInstanceMetadataClient(ctx context.Context) (imds.Client, error)
+	// GCPClients is an interface for providing GCP API clients.
+	GCPClients
 	// AzureClients is an interface for Azure-specific API clients
 	AzureClients
 	// Closer closes all initialized clients.
 	io.Closer
 }
 
-// AWSClients is an interface for providing AWS API clients.
-type AWSClients interface {
-	// GetAWSSession returns AWS session for the specified region.
-	GetAWSSession(region string) (*awssession.Session, error)
-	// GetAWSSessionForRole returns AWS session for the specified role ARN.
-	GetAWSSessionForRole(ctx context.Context, region, roleARN string) (*awssession.Session, error)
-	// GetAWSRDSClient returns AWS RDS client for the specified region.
-	GetAWSRDSClient(region string) (rdsiface.RDSAPI, error)
-	// GetAWSRedshiftClient returns AWS Redshift client for the specified region.
-	GetAWSRedshiftClient(region string) (redshiftiface.RedshiftAPI, error)
-	// GetAWSRedshiftServerlessClient returns AWS Redshift Serverless client for the specified region.
-	GetAWSRedshiftServerlessClient(region string) (redshiftserverlessiface.RedshiftServerlessAPI, error)
-	// GetAWSRedshiftServerlessClientForRole returns AWS Redshift Serverless client for the specified region and role ARN.
-	GetAWSRedshiftServerlessClientForRole(ctx context.Context, region, roleARN string) (redshiftserverlessiface.RedshiftServerlessAPI, error)
-	// GetAWSElastiCacheClient returns AWS ElastiCache client for the specified region.
-	GetAWSElastiCacheClient(region string) (elasticacheiface.ElastiCacheAPI, error)
-	// GetAWSMemoryDBClient returns AWS MemoryDB client for the specified region.
-	GetAWSMemoryDBClient(region string) (memorydbiface.MemoryDBAPI, error)
-	// GetAWSSecretsManagerClient returns AWS Secrets Manager client for the specified region.
-	GetAWSSecretsManagerClient(region string) (secretsmanageriface.SecretsManagerAPI, error)
-	// GetAWSIAMClient returns AWS IAM client for the specified region.
-	GetAWSIAMClient(region string) (iamiface.IAMAPI, error)
-	// GetAWSSTSClient returns AWS STS client for the specified region.
-	GetAWSSTSClient(region string) (stsiface.STSAPI, error)
-	// GetAWSEC2Client returns AWS EC2 client for the specified region.
-	GetAWSEC2Client(region string) (ec2iface.EC2API, error)
-	// GetAWSSSMClient returns AWS SSM client for the specified region.
-	GetAWSSSMClient(region string) (ssmiface.SSMAPI, error)
-	// GetAWSEKSClient returns AWS EKS client for the specified region.
-	GetAWSEKSClient(region string) (eksiface.EKSAPI, error)
+// GCPClients is an interface for providing GCP API clients.
+type GCPClients interface {
+	// GetGCPIAMClient returns GCP IAM client.
+	GetGCPIAMClient(context.Context) (*gcpcredentials.IamCredentialsClient, error)
+	// GetGCPSQLAdminClient returns GCP Cloud SQL Admin client.
+	GetGCPSQLAdminClient(context.Context) (gcp.SQLAdminClient, error)
+	// GetGCPGKEClient returns GKE client.
+	GetGCPGKEClient(context.Context) (gcp.GKEClient, error)
+	// GetGCPProjectsClient returns Projects client.
+	GetGCPProjectsClient(context.Context) (gcp.ProjectsClient, error)
+	// GetGCPInstancesClient returns instances client.
+	GetGCPInstancesClient(context.Context) (gcp.InstancesClient, error)
 }
 
 // AzureClients is an interface for Azure-specific API clients
@@ -141,43 +95,135 @@ type AzureClients interface {
 	// GetAzureManagedSQLServerClient returns an Azure ManagedSQL Server client
 	// for the specified subscription.
 	GetAzureManagedSQLServerClient(subscription string) (azure.ManagedSQLServerClient, error)
+	// GetAzureMySQLFlexServersClient returns an Azure MySQL Flexible Server client for the
+	// specified subscription.
+	GetAzureMySQLFlexServersClient(subscription string) (azure.MySQLFlexServersClient, error)
+	// GetAzurePostgresFlexServersClient returns an Azure PostgreSQL Flexible Server client for the
+	// specified subscription.
+	GetAzurePostgresFlexServersClient(subscription string) (azure.PostgresFlexServersClient, error)
+	// GetAzureRunCommandClient returns an Azure Run Command client for the given subscription.
+	GetAzureRunCommandClient(subscription string) (azure.RunCommandClient, error)
 }
 
-// NewClients returns a new instance of cloud clients retriever.
-func NewClients() Clients {
-	return &cloudClients{
-		awsSessions: make(map[string]*awssession.Session),
-		azureClients: azureClients{
-			azureMySQLClients:            make(map[string]azure.DBServersClient),
-			azurePostgresClients:         make(map[string]azure.DBServersClient),
-			azureRedisClients:            azure.NewClientMap(azure.NewRedisClient),
-			azureRedisEnterpriseClients:  azure.NewClientMap(azure.NewRedisEnterpriseClient),
-			azureKubernetesClient:        make(map[string]azure.AKSClient),
-			azureVirtualMachinesClients:  azure.NewClientMap(azure.NewVirtualMachinesClient),
-			azureSQLServerClients:        azure.NewClientMap(azure.NewSQLClient),
-			azureManagedSQLServerClients: azure.NewClientMap(azure.NewManagedSQLClient),
-		},
+type clientConstructor[T any] func(context.Context) (T, error)
+
+// clientCache is a struct that holds a cloud client that will only be
+// initialized once.
+type clientCache[T any] struct {
+	makeClient clientConstructor[T]
+	client     T
+	err        error
+	once       sync.Once
+}
+
+// newClientCache creates a new client cache.
+func newClientCache[T any](makeClient clientConstructor[T]) *clientCache[T] {
+	return &clientCache[T]{makeClient: makeClient}
+}
+
+// GetClient gets the client, initializing it if necessary.
+func (c *clientCache[T]) GetClient(ctx context.Context) (T, error) {
+	c.once.Do(func() {
+		c.client, c.err = c.makeClient(ctx)
+	})
+	return c.client, trace.Wrap(c.err)
+}
+
+func newAzureClients() (*azureClients, error) {
+	azClients := &azureClients{
+		azureMySQLClients:     make(map[string]azure.DBServersClient),
+		azurePostgresClients:  make(map[string]azure.DBServersClient),
+		azureKubernetesClient: make(map[string]azure.AKSClient),
 	}
+	var err error
+	azClients.azureRedisClients, err = azure.NewClientMap(azure.NewRedisClient)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	azClients.azureRedisEnterpriseClients, err = azure.NewClientMap(azure.NewRedisEnterpriseClient)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	azClients.azureVirtualMachinesClients, err = azure.NewClientMap(azure.NewVirtualMachinesClient)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	azClients.azureSQLServerClients, err = azure.NewClientMap(azure.NewSQLClient)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	azClients.azureManagedSQLServerClients, err = azure.NewClientMap(azure.NewManagedSQLClient)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	azClients.azureMySQLFlexServersClients, err = azure.NewClientMap(azure.NewMySQLFlexServersClient)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	azClients.azurePostgresFlexServersClients, err = azure.NewClientMap(azure.NewPostgresFlexServersClient)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	azClients.azureRunCommandClients, err = azure.NewClientMap(azure.NewRunCommandClient)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	return azClients, nil
+}
+
+// ClientsOption allows setting options as functional arguments to cloudClients.
+type ClientsOption func(cfg *cloudClients)
+
+// NewClients returns a new instance of cloud clients retriever.
+func NewClients(opts ...ClientsOption) (Clients, error) {
+	azClients, err := newAzureClients()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	cloudClients := &cloudClients{
+		gcpClients: gcpClients{
+			gcpSQLAdmin:  newClientCache(gcp.NewSQLAdminClient),
+			gcpGKE:       newClientCache(gcp.NewGKEClient),
+			gcpProjects:  newClientCache(gcp.NewProjectsClient),
+			gcpInstances: newClientCache(gcp.NewInstancesClient),
+		},
+		azureClients: azClients,
+	}
+
+	for _, opt := range opts {
+		opt(cloudClients)
+	}
+
+	return cloudClients, nil
 }
 
 // cloudClients implements Clients
 var _ Clients = (*cloudClients)(nil)
 
 type cloudClients struct {
-	// awsSessions is a map of cached AWS sessions per region.
-	awsSessions map[string]*awssession.Session
+	// instanceMetadata is the cached instance metadata client.
+	instanceMetadata imds.Client
+	// gcpClients contains GCP-specific clients.
+	gcpClients
+	// azureClients contains Azure-specific clients.
+	*azureClients
+	// mtx is used for locking.
+	mtx sync.RWMutex
+}
+
+// gcpClients contains GCP-specific clients.
+type gcpClients struct {
 	// gcpIAM is the cached GCP IAM client.
 	gcpIAM *gcpcredentials.IamCredentialsClient
 	// gcpSQLAdmin is the cached GCP Cloud SQL Admin client.
-	gcpSQLAdmin gcp.SQLAdminClient
-	// instanceMetadata is the cached instance metadata client.
-	instanceMetadata InstanceMetadata
+	gcpSQLAdmin *clientCache[gcp.SQLAdminClient]
 	// gcpGKE is the cached GCP Cloud GKE client.
-	gcpGKE gcp.GKEClient
-	// azureClients contains Azure-specific clients.
-	azureClients
-	// mtx is used for locking.
-	mtx sync.RWMutex
+	gcpGKE *clientCache[gcp.GKEClient]
+	// gcpProjects is the cached GCP Cloud Projects client.
+	gcpProjects *clientCache[gcp.ProjectsClient]
+	// gcpInstances is the cached GCP instances client.
+	gcpInstances *clientCache[gcp.InstancesClient]
 }
 
 // azureClients contains Azure-specific clients.
@@ -203,149 +249,18 @@ type azureClients struct {
 	// azureManagedSQLServerClient is the cached Azure Managed SQL Server
 	// client.
 	azureManagedSQLServerClients azure.ClientMap[azure.ManagedSQLServerClient]
-}
-
-// GetAWSSession returns AWS session for the specified region.
-func (c *cloudClients) GetAWSSession(region string) (*awssession.Session, error) {
-	c.mtx.RLock()
-	if session, ok := c.awsSessions[region]; ok {
-		c.mtx.RUnlock()
-		return session, nil
-	}
-	c.mtx.RUnlock()
-	return c.initAWSSession(region)
-}
-
-// GetAWSSessionForRole returns AWS session for the specified role ARN.
-func (c *cloudClients) GetAWSSessionForRole(ctx context.Context, region, roleARN string) (*awssession.Session, error) {
-	defaultSession, err := c.GetAWSSession(region)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	// Make a credentials with AssumeRoleProvider and test it out.
-	cred := stscreds.NewCredentials(defaultSession, roleARN)
-	if _, err := cred.GetWithContext(ctx); err != nil {
-		return nil, trace.Wrap(libcloudaws.ConvertRequestFailureError(err))
-	}
-
-	// Create the session with the credentials and the provided AWS region.
-	config := aws.NewConfig().WithCredentials(cred).WithRegion(region)
-	roleSession, err := session.NewSession(config)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	// Do not cache sessions for other roles.
-	return roleSession, nil
-}
-
-// GetAWSRDSClient returns AWS RDS client for the specified region.
-func (c *cloudClients) GetAWSRDSClient(region string) (rdsiface.RDSAPI, error) {
-	session, err := c.GetAWSSession(region)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	return rds.New(session), nil
-}
-
-// GetAWSRedshiftClient returns AWS Redshift client for the specified region.
-func (c *cloudClients) GetAWSRedshiftClient(region string) (redshiftiface.RedshiftAPI, error) {
-	session, err := c.GetAWSSession(region)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	return redshift.New(session), nil
-}
-
-// GetAWSRedshiftServerlessClient returns AWS Redshift Serverless client for the specified region.
-func (c *cloudClients) GetAWSRedshiftServerlessClient(region string) (redshiftserverlessiface.RedshiftServerlessAPI, error) {
-	session, err := c.GetAWSSession(region)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	return redshiftserverless.New(session), nil
-}
-
-// GetAWSRedshiftServerlessClientForRole returns AWS Redshift Serverless client for the specified region and role ARN.
-func (c *cloudClients) GetAWSRedshiftServerlessClientForRole(ctx context.Context, region, roleARN string) (redshiftserverlessiface.RedshiftServerlessAPI, error) {
-	session, err := c.GetAWSSessionForRole(ctx, region, roleARN)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	return redshiftserverless.New(session), nil
-}
-
-// GetAWSElastiCacheClient returns AWS ElastiCache client for the specified region.
-func (c *cloudClients) GetAWSElastiCacheClient(region string) (elasticacheiface.ElastiCacheAPI, error) {
-	session, err := c.GetAWSSession(region)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	return elasticache.New(session), nil
-}
-
-// GetAWSMemoryDBClient returns AWS MemoryDB client for the specified region.
-func (c *cloudClients) GetAWSMemoryDBClient(region string) (memorydbiface.MemoryDBAPI, error) {
-	session, err := c.GetAWSSession(region)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	return memorydb.New(session), nil
-}
-
-// GetAWSSecretsManagerClient returns AWS Secrets Manager client for the specified region.
-func (c *cloudClients) GetAWSSecretsManagerClient(region string) (secretsmanageriface.SecretsManagerAPI, error) {
-	session, err := c.GetAWSSession(region)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	return secretsmanager.New(session), nil
-}
-
-// GetAWSIAMClient returns AWS IAM client for the specified region.
-func (c *cloudClients) GetAWSIAMClient(region string) (iamiface.IAMAPI, error) {
-	session, err := c.GetAWSSession(region)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	return iam.New(session), nil
-}
-
-// GetAWSSTSClient returns AWS STS client for the specified region.
-func (c *cloudClients) GetAWSSTSClient(region string) (stsiface.STSAPI, error) {
-	session, err := c.GetAWSSession(region)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	return sts.New(session), nil
-}
-
-// GetAWSEC2Client returns AWS EC2 client for the specified region.
-func (c *cloudClients) GetAWSEC2Client(region string) (ec2iface.EC2API, error) {
-	session, err := c.GetAWSSession(region)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	return ec2.New(session), nil
-}
-
-// GetAWSSSMClient returns AWS SSM client for the specified region.
-func (c *cloudClients) GetAWSSSMClient(region string) (ssmiface.SSMAPI, error) {
-	session, err := c.GetAWSSession(region)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	return ssm.New(session), nil
-}
-
-// GetAWSEKSClient returns AWS EKS client for the specified region.
-func (c *cloudClients) GetAWSEKSClient(region string) (eksiface.EKSAPI, error) {
-	session, err := c.GetAWSSession(region)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	return eks.New(session), nil
+	// azureMySQLFlexServersClients is the cached Azure MySQL Flexible Server
+	// client.
+	azureMySQLFlexServersClients azure.ClientMap[azure.MySQLFlexServersClient]
+	// azurePostgresFlexServersClients is the cached Azure PostgreSQL Flexible Server
+	// client.
+	azurePostgresFlexServersClients azure.ClientMap[azure.PostgresFlexServersClient]
+	// azureRunCommandClients contains the cached Azure Run Command clients.
+	azureRunCommandClients azure.ClientMap[azure.RunCommandClient]
+	// azureRoleDefinitionsClients contains the cached Azure Role Definitions clients.
+	azureRoleDefinitionsClients azure.ClientMap[azure.RoleDefinitionsClient]
+	// azureRoleAssignmentsClients contains the cached Azure Role Assignments clients.
+	azureRoleAssignmentsClients azure.ClientMap[azure.RoleAssignmentsClient]
 }
 
 // GetGCPIAMClient returns GCP IAM client.
@@ -361,17 +276,11 @@ func (c *cloudClients) GetGCPIAMClient(ctx context.Context) (*gcpcredentials.Iam
 
 // GetGCPSQLAdminClient returns GCP Cloud SQL Admin client.
 func (c *cloudClients) GetGCPSQLAdminClient(ctx context.Context) (gcp.SQLAdminClient, error) {
-	c.mtx.RLock()
-	if c.gcpSQLAdmin != nil {
-		defer c.mtx.RUnlock()
-		return c.gcpSQLAdmin, nil
-	}
-	c.mtx.RUnlock()
-	return c.initGCPSQLAdminClient(ctx)
+	return c.gcpSQLAdmin.GetClient(ctx)
 }
 
-// GetInstanceMetadata returns the instance metadata.
-func (c *cloudClients) GetInstanceMetadataClient(ctx context.Context) (InstanceMetadata, error) {
+// GetInstanceMetadataClient returns the instance metadata.
+func (c *cloudClients) GetInstanceMetadataClient(ctx context.Context) (imds.Client, error) {
 	c.mtx.RLock()
 	if c.instanceMetadata != nil {
 		defer c.mtx.RUnlock()
@@ -383,13 +292,17 @@ func (c *cloudClients) GetInstanceMetadataClient(ctx context.Context) (InstanceM
 
 // GetGCPGKEClient returns GKE client.
 func (c *cloudClients) GetGCPGKEClient(ctx context.Context) (gcp.GKEClient, error) {
-	c.mtx.RLock()
-	if c.gcpGKE != nil {
-		defer c.mtx.RUnlock()
-		return c.gcpGKE, nil
-	}
-	c.mtx.RUnlock()
-	return c.initGCPGKEClient(ctx)
+	return c.gcpGKE.GetClient(ctx)
+}
+
+// GetGCPProjectsClient returns Project client.
+func (c *cloudClients) GetGCPProjectsClient(ctx context.Context) (gcp.ProjectsClient, error) {
+	return c.gcpProjects.GetClient(ctx)
+}
+
+// GetGCPInstancesClient returns instances client.
+func (c *cloudClients) GetGCPInstancesClient(ctx context.Context) (gcp.InstancesClient, error) {
+	return c.gcpInstances.GetClient(ctx)
 }
 
 // GetAzureCredential returns default Azure token credential chain.
@@ -446,7 +359,7 @@ func (c *cloudClients) GetAzureRedisEnterpriseClient(subscription string) (azure
 	return c.azureRedisEnterpriseClients.Get(subscription, c.GetAzureCredential)
 }
 
-// GetAzureSubscriptionClient returns an Azure client for listing AKS clusters.
+// GetAzureKubernetesClient returns an Azure client for listing AKS clusters.
 func (c *cloudClients) GetAzureKubernetesClient(subscription string) (azure.AKSClient, error) {
 	c.mtx.RLock()
 	if client, ok := c.azureKubernetesClient[subscription]; ok {
@@ -474,6 +387,32 @@ func (c *cloudClients) GetAzureManagedSQLServerClient(subscription string) (azur
 	return c.azureManagedSQLServerClients.Get(subscription, c.GetAzureCredential)
 }
 
+// GetAzureMySQLFlexServersClient returns an Azure MySQL Flexible server client for listing MySQL Flexible servers.
+func (c *cloudClients) GetAzureMySQLFlexServersClient(subscription string) (azure.MySQLFlexServersClient, error) {
+	return c.azureMySQLFlexServersClients.Get(subscription, c.GetAzureCredential)
+}
+
+// GetAzurePostgresFlexServersClient returns an Azure PostgreSQL Flexible server client for listing PostgreSQL Flexible servers.
+func (c *cloudClients) GetAzurePostgresFlexServersClient(subscription string) (azure.PostgresFlexServersClient, error) {
+	return c.azurePostgresFlexServersClients.Get(subscription, c.GetAzureCredential)
+}
+
+// GetAzureRunCommandClient returns an Azure Run Command client for the given
+// subscription.
+func (c *cloudClients) GetAzureRunCommandClient(subscription string) (azure.RunCommandClient, error) {
+	return c.azureRunCommandClients.Get(subscription, c.GetAzureCredential)
+}
+
+// GetAzureRoleDefinitionsClient returns an Azure Role Definitions client
+func (c *cloudClients) GetAzureRoleDefinitionsClient(subscription string) (azure.RoleDefinitionsClient, error) {
+	return c.azureRoleDefinitionsClients.Get(subscription, c.GetAzureCredential)
+}
+
+// GetAzureRoleAssignmentsClient returns an Azure Role Assignments client
+func (c *cloudClients) GetAzureRoleAssignmentsClient(subscription string) (azure.RoleAssignmentsClient, error) {
+	return c.azureRoleAssignmentsClients.Get(subscription, c.GetAzureCredential)
+}
+
 // Close closes all initialized clients.
 func (c *cloudClients) Close() (err error) {
 	c.mtx.Lock()
@@ -485,33 +424,12 @@ func (c *cloudClients) Close() (err error) {
 	return trace.Wrap(err)
 }
 
-func (c *cloudClients) initAWSSession(region string) (*awssession.Session, error) {
-	c.mtx.Lock()
-	defer c.mtx.Unlock()
-	if session, ok := c.awsSessions[region]; ok { // If some other thead already got here first.
-		return session, nil
-	}
-	logrus.Debugf("Initializing AWS session for region %v.", region)
-	session, err := awssession.NewSessionWithOptions(awssession.Options{
-		SharedConfigState: awssession.SharedConfigEnable,
-		Config: aws.Config{
-			Region: aws.String(region),
-		},
-	})
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	c.awsSessions[region] = session
-	return session, nil
-}
-
 func (c *cloudClients) initGCPIAMClient(ctx context.Context) (*gcpcredentials.IamCredentialsClient, error) {
 	c.mtx.Lock()
 	defer c.mtx.Unlock()
 	if c.gcpIAM != nil { // If some other thread already got here first.
 		return c.gcpIAM, nil
 	}
-	logrus.Debug("Initializing GCP IAM client.")
 	gcpIAM, err := gcpcredentials.NewIamCredentialsClient(ctx)
 	if err != nil {
 		return nil, trace.Wrap(err)
@@ -520,43 +438,12 @@ func (c *cloudClients) initGCPIAMClient(ctx context.Context) (*gcpcredentials.Ia
 	return gcpIAM, nil
 }
 
-func (c *cloudClients) initGCPSQLAdminClient(ctx context.Context) (gcp.SQLAdminClient, error) {
-	c.mtx.Lock()
-	defer c.mtx.Unlock()
-	if c.gcpSQLAdmin != nil { // If some other thread already got here first.
-		return c.gcpSQLAdmin, nil
-	}
-	logrus.Debug("Initializing GCP Cloud SQL Admin client.")
-	gcpSQLAdmin, err := gcp.NewSQLAdminClient(ctx)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	c.gcpSQLAdmin = gcpSQLAdmin
-	return gcpSQLAdmin, nil
-}
-
-func (c *cloudClients) initGCPGKEClient(ctx context.Context) (gcp.GKEClient, error) {
-	c.mtx.Lock()
-	defer c.mtx.Unlock()
-	if c.gcpGKE != nil { // If some other thread already got here first.
-		return c.gcpGKE, nil
-	}
-	logrus.Debug("Initializing GCP Cloud GKE client.")
-	gcpGKE, err := gcp.NewGKEClient(ctx)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	c.gcpGKE = gcpGKE
-	return gcpGKE, nil
-}
-
 func (c *cloudClients) initAzureCredential() (azcore.TokenCredential, error) {
 	c.mtx.Lock()
 	defer c.mtx.Unlock()
 	if c.azureCredential != nil { // If some other thread already got here first.
 		return c.azureCredential, nil
 	}
-	logrus.Debug("Initializing Azure default credential chain.")
 	// TODO(gavin): if/when we support AzureChina/AzureGovernment, we will need to specify the cloud in these options
 	options := &azidentity.DefaultAzureCredentialOptions{}
 	cred, err := azidentity.NewDefaultAzureCredential(options)
@@ -579,7 +466,6 @@ func (c *cloudClients) initAzureMySQLClient(subscription string) (azure.DBServer
 		return client, nil
 	}
 
-	logrus.Debug("Initializing Azure MySQL servers client.")
 	// TODO(gavin): if/when we support AzureChina/AzureGovernment, we will need to specify the cloud in these options
 	options := &arm.ClientOptions{}
 	api, err := armmysql.NewServersClient(subscription, cred, options)
@@ -602,7 +488,6 @@ func (c *cloudClients) initAzurePostgresClient(subscription string) (azure.DBSer
 	if client, ok := c.azurePostgresClients[subscription]; ok { // If some other thread already got here first.
 		return client, nil
 	}
-	logrus.Debug("Initializing Azure Postgres servers client.")
 	// TODO(gavin): if/when we support AzureChina/AzureGovernment, we will need to specify the cloud in these options
 	options := &arm.ClientOptions{}
 	api, err := armpostgresql.NewServersClient(subscription, cred, options)
@@ -625,7 +510,6 @@ func (c *cloudClients) initAzureSubscriptionsClient() (*azure.SubscriptionClient
 	if c.azureSubscriptionsClient != nil { // If some other thread already got here first.
 		return c.azureSubscriptionsClient, nil
 	}
-	logrus.Debug("Initializing Azure subscriptions client.")
 	// TODO(gavin): if/when we support AzureChina/AzureGovernment,
 	// we will need to specify the cloud in these options
 	opts := &arm.ClientOptions{}
@@ -639,14 +523,33 @@ func (c *cloudClients) initAzureSubscriptionsClient() (*azure.SubscriptionClient
 }
 
 // initInstanceMetadata initializes the instance metadata client.
-func (c *cloudClients) initInstanceMetadata(ctx context.Context) (InstanceMetadata, error) {
+func (c *cloudClients) initInstanceMetadata(ctx context.Context) (imds.Client, error) {
 	c.mtx.Lock()
 	defer c.mtx.Unlock()
 	if c.instanceMetadata != nil { // If some other thread already got here first.
 		return c.instanceMetadata, nil
 	}
-	logrus.Debug("Initializing instance metadata client.")
-	client, err := DiscoverInstanceMetadata(ctx)
+
+	providers := []func(ctx context.Context) (imds.Client, error){
+		func(ctx context.Context) (imds.Client, error) {
+			clt, err := awsimds.NewInstanceMetadataClient(ctx)
+			return clt, trace.Wrap(err)
+		},
+		func(ctx context.Context) (imds.Client, error) {
+			return azureimds.NewInstanceMetadataClient(), nil
+		},
+		func(ctx context.Context) (imds.Client, error) {
+			instancesClient, err := gcp.NewInstancesClient(ctx)
+			if err != nil {
+				return nil, trace.Wrap(err)
+			}
+
+			clt, err := gcpimds.NewInstanceMetadataClient(instancesClient)
+			return clt, trace.Wrap(err)
+		},
+	}
+
+	client, err := DiscoverInstanceMetadata(ctx, providers)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -666,7 +569,6 @@ func (c *cloudClients) initAzureKubernetesClient(subscription string) (azure.AKS
 	if client, ok := c.azureKubernetesClient[subscription]; ok { // If some other thread already got here first.
 		return client, nil
 	}
-	logrus.Debug("Initializing Azure AKS client.")
 	// TODO(tigrato): if/when we support AzureChina/AzureGovernment, we will need to specify the cloud in these options
 	options := &arm.ClientOptions{}
 	api, err := armcontainerservice.NewManagedClustersClient(subscription, cred, options)
@@ -687,21 +589,11 @@ var _ Clients = (*TestCloudClients)(nil)
 
 // TestCloudClients are used in tests.
 type TestCloudClients struct {
-	RDS                     rdsiface.RDSAPI
-	RDSPerRegion            map[string]rdsiface.RDSAPI
-	Redshift                redshiftiface.RedshiftAPI
-	RedshiftServerless      redshiftserverlessiface.RedshiftServerlessAPI
-	ElastiCache             elasticacheiface.ElastiCacheAPI
-	MemoryDB                memorydbiface.MemoryDBAPI
-	SecretsManager          secretsmanageriface.SecretsManagerAPI
-	IAM                     iamiface.IAMAPI
-	STS                     stsiface.STSAPI
 	GCPSQL                  gcp.SQLAdminClient
 	GCPGKE                  gcp.GKEClient
-	EC2                     ec2iface.EC2API
-	SSM                     ssmiface.SSMAPI
-	InstanceMetadata        InstanceMetadata
-	EKS                     eksiface.EKSAPI
+	GCPProjects             gcp.ProjectsClient
+	GCPInstances            gcp.InstancesClient
+	InstanceMetadata        imds.Client
 	AzureMySQL              azure.DBServersClient
 	AzureMySQLPerSub        map[string]azure.DBServersClient
 	AzurePostgres           azure.DBServersClient
@@ -714,64 +606,11 @@ type TestCloudClients struct {
 	AzureVirtualMachines    azure.VirtualMachinesClient
 	AzureSQLServer          azure.SQLServerClient
 	AzureManagedSQLServer   azure.ManagedSQLServerClient
-}
-
-// GetAWSSession returns AWS session for the specified region.
-func (c *TestCloudClients) GetAWSSession(region string) (*awssession.Session, error) {
-	return nil, trace.NotImplemented("not implemented")
-}
-
-// GetAWSSessionForRole returns AWS session for the specified role ARN.
-func (c *TestCloudClients) GetAWSSessionForRole(ctx context.Context, region, roleARN string) (*awssession.Session, error) {
-	return nil, trace.NotImplemented("not implemented")
-}
-
-// GetAWSRDSClient returns AWS RDS client for the specified region.
-func (c *TestCloudClients) GetAWSRDSClient(region string) (rdsiface.RDSAPI, error) {
-	if len(c.RDSPerRegion) != 0 {
-		return c.RDSPerRegion[region], nil
-	}
-	return c.RDS, nil
-}
-
-// GetAWSRedshiftClient returns AWS Redshift client for the specified region.
-func (c *TestCloudClients) GetAWSRedshiftClient(region string) (redshiftiface.RedshiftAPI, error) {
-	return c.Redshift, nil
-}
-
-// GetAWSRedshiftServerlessClient returns AWS Redshift Serverless client for the specified region.
-func (c *TestCloudClients) GetAWSRedshiftServerlessClient(region string) (redshiftserverlessiface.RedshiftServerlessAPI, error) {
-	return c.RedshiftServerless, nil
-}
-
-// GetAWSRedshiftServerlessClientForRole returns AWS Redshift Serverless client for the specified region and role ARN.
-func (c *TestCloudClients) GetAWSRedshiftServerlessClientForRole(ctx context.Context, region, roleARN string) (redshiftserverlessiface.RedshiftServerlessAPI, error) {
-	return c.RedshiftServerless, nil
-}
-
-// GetAWSElastiCacheClient returns AWS ElastiCache client for the specified region.
-func (c *TestCloudClients) GetAWSElastiCacheClient(region string) (elasticacheiface.ElastiCacheAPI, error) {
-	return c.ElastiCache, nil
-}
-
-// GetAWSMemoryDBClient returns AWS MemoryDB client for the specified region.
-func (c *TestCloudClients) GetAWSMemoryDBClient(region string) (memorydbiface.MemoryDBAPI, error) {
-	return c.MemoryDB, nil
-}
-
-// GetAWSSecretsManagerClient returns AWS Secrets Manager client for the specified region.
-func (c *TestCloudClients) GetAWSSecretsManagerClient(region string) (secretsmanageriface.SecretsManagerAPI, error) {
-	return c.SecretsManager, nil
-}
-
-// GetAWSIAMClient returns AWS IAM client for the specified region.
-func (c *TestCloudClients) GetAWSIAMClient(region string) (iamiface.IAMAPI, error) {
-	return c.IAM, nil
-}
-
-// GetAWSSTSClient returns AWS STS client for the specified region.
-func (c *TestCloudClients) GetAWSSTSClient(region string) (stsiface.STSAPI, error) {
-	return c.STS, nil
+	AzureMySQLFlex          azure.MySQLFlexServersClient
+	AzurePostgresFlex       azure.PostgresFlexServersClient
+	AzureRunCommand         azure.RunCommandClient
+	AzureRoleDefinitions    azure.RoleDefinitionsClient
+	AzureRoleAssignments    azure.RoleAssignmentsClient
 }
 
 // GetGCPIAMClient returns GCP IAM client.
@@ -786,8 +625,8 @@ func (c *TestCloudClients) GetGCPSQLAdminClient(ctx context.Context) (gcp.SQLAdm
 	return c.GCPSQL, nil
 }
 
-// GetInstanceMetadata returns the instance metadata.
-func (c *TestCloudClients) GetInstanceMetadataClient(ctx context.Context) (InstanceMetadata, error) {
+// GetInstanceMetadataClient returns the instance metadata.
+func (c *TestCloudClients) GetInstanceMetadataClient(ctx context.Context) (imds.Client, error) {
 	return c.InstanceMetadata, nil
 }
 
@@ -796,14 +635,19 @@ func (c *TestCloudClients) GetGCPGKEClient(ctx context.Context) (gcp.GKEClient, 
 	return c.GCPGKE, nil
 }
 
+// GetGCPGKEClient returns GKE client.
+func (c *TestCloudClients) GetGCPProjectsClient(ctx context.Context) (gcp.ProjectsClient, error) {
+	return c.GCPProjects, nil
+}
+
+// GetGCPInstancesClient returns instances client.
+func (c *TestCloudClients) GetGCPInstancesClient(ctx context.Context) (gcp.InstancesClient, error) {
+	return c.GCPInstances, nil
+}
+
 // GetAzureCredential returns default Azure token credential chain.
 func (c *TestCloudClients) GetAzureCredential() (azcore.TokenCredential, error) {
 	return &azidentity.ChainedTokenCredential{}, nil
-}
-
-// GetAWSEC2Client returns AWS EC2 client for the specified region.
-func (c *TestCloudClients) GetAWSEC2Client(region string) (ec2iface.EC2API, error) {
-	return c.EC2, nil
 }
 
 // GetAzureMySQLClient returns an AzureMySQLClient for the specified subscription
@@ -812,11 +656,6 @@ func (c *TestCloudClients) GetAzureMySQLClient(subscription string) (azure.DBSer
 		return c.AzureMySQLPerSub[subscription], nil
 	}
 	return c.AzureMySQL, nil
-}
-
-// GetAWSEKSClient returns AWS EKS client for the specified region.
-func (c *TestCloudClients) GetAWSEKSClient(region string) (eksiface.EKSAPI, error) {
-	return c.EKS, nil
 }
 
 // GetAzurePostgresClient returns an AzurePostgresClient for the specified subscription
@@ -829,7 +668,7 @@ func (c *TestCloudClients) GetAzurePostgresClient(subscription string) (azure.DB
 
 // GetAzureKubernetesClient returns an AKS client for the specified subscription
 func (c *TestCloudClients) GetAzureKubernetesClient(subscription string) (azure.AKSClient, error) {
-	if len(c.AzurePostgresPerSub) != 0 {
+	if len(c.AzureAKSClientPerSub) != 0 {
 		return c.AzureAKSClientPerSub[subscription], nil
 	}
 	return c.AzureAKSClient, nil
@@ -838,11 +677,6 @@ func (c *TestCloudClients) GetAzureKubernetesClient(subscription string) (azure.
 // GetAzureSubscriptionClient returns an Azure SubscriptionClient
 func (c *TestCloudClients) GetAzureSubscriptionClient() (*azure.SubscriptionClient, error) {
 	return c.AzureSubscriptionClient, nil
-}
-
-// GetAWSSSMClient returns an AWS SSM client
-func (c *TestCloudClients) GetAWSSSMClient(region string) (ssmiface.SSMAPI, error) {
-	return c.SSM, nil
 }
 
 // GetAzureRedisClient returns an Azure Redis client for the given subscription.
@@ -870,6 +704,31 @@ func (c *TestCloudClients) GetAzureSQLServerClient(subscription string) (azure.S
 // SQL servers.
 func (c *TestCloudClients) GetAzureManagedSQLServerClient(subscription string) (azure.ManagedSQLServerClient, error) {
 	return c.AzureManagedSQLServer, nil
+}
+
+// GetAzureMySQLFlexServersClient returns an Azure MySQL Flexible server client for listing MySQL Flexible servers.
+func (c *TestCloudClients) GetAzureMySQLFlexServersClient(subscription string) (azure.MySQLFlexServersClient, error) {
+	return c.AzureMySQLFlex, nil
+}
+
+// GetAzurePostgresFlexServersClient returns an Azure PostgreSQL Flexible server client for listing PostgreSQL Flexible servers.
+func (c *TestCloudClients) GetAzurePostgresFlexServersClient(subscription string) (azure.PostgresFlexServersClient, error) {
+	return c.AzurePostgresFlex, nil
+}
+
+// GetAzureRunCommandClient returns an Azure Run Command client for the given subscription.
+func (c *TestCloudClients) GetAzureRunCommandClient(subscription string) (azure.RunCommandClient, error) {
+	return c.AzureRunCommand, nil
+}
+
+// GetAzureRoleDefinitionsClient returns an Azure Role Definitions client for the given subscription.
+func (c *TestCloudClients) GetAzureRoleDefinitionsClient(subscription string) (azure.RoleDefinitionsClient, error) {
+	return c.AzureRoleDefinitions, nil
+}
+
+// GetAzureRoleAssignmentsClient returns an Azure Role Assignments client for the given subscription.
+func (c *TestCloudClients) GetAzureRoleAssignmentsClient(subscription string) (azure.RoleAssignmentsClient, error) {
+	return c.AzureRoleAssignments, nil
 }
 
 // Close closes all initialized clients.
